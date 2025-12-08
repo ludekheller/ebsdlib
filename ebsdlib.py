@@ -18,10 +18,10 @@ from orilib import * # Orientations, quaternions, Euler angles
 from projlib import * # Stereographic projections
 from plotlib import * # Crystallographic plotting
 from crystlib import * # Crystallographic calculations
+from effelconst import  * #effective elastic constants calculations
 
 from crystals import Crystal
 from numpy import sqrt
-from effective_elastic_constants_functions import *
 from getphases import getPhases
 
 from matplotlib.path import Path

@@ -35,7 +35,7 @@ The library requires the following custom modules (ensure they are in your Pytho
 - `projlib`: Stereographic projection functions
 - `plotlib`: Crystallographic plotting utilities
 - `crystlib`: Crystallographic calculation functions
-- `effective_elastic_constants_functions`: Elastic constants calculations
+- `effelconst`: Elastic constants calculations
 - `getphases`: Phase identification utilities
 
 ### Installation

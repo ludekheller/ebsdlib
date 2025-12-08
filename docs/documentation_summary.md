@@ -280,7 +280,7 @@ Must be in Python path:
 - `projlib` - Stereographic projections
 - `plotlib` - Crystallographic plotting
 - `crystlib` - Crystal calculations
-- `effective_elastic_constants_functions`
+- `effelconst` - Effective elastic constants calculations
 - `getphases` - Phase identification
 
 ---

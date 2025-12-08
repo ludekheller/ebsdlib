@@ -70,7 +70,7 @@ The library requires several custom modules that must be in your Python path:
 2. **projlib**: Stereographic projection functions
 3. **plotlib**: Crystallographic plotting utilities
 4. **crystlib**: Crystallographic calculation functions
-5. **effective_elastic_constants_functions**: Elastic property calculations
+5. **effelconst**: Elastic property calculations
 6. **getphases**: Phase identification from EBSD data
 
 ### Setup Instructions
@@ -127,7 +127,7 @@ from projlib import *                     # Stereographic projections
 from plotlib import *                     # Plotting utilities
 from crystlib import *                    # Crystal calculations
 from crystals import Crystal              # Crystal definitions
-from effective_elastic_constants_functions import *
+from effelconst import  * #effective elastic constants calculations
 from getphases import getPhases           # Phase detection
 ```
 
