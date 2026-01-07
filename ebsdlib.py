@@ -498,7 +498,6 @@ def find_cluster_neighbors_with_lengths_and_boundaries_numba_roi(labels_2d, insi
 
 
 
-@njit
 def cluster_map_sample_to_crystal_numba_with_neighbors(X, Y, Q, sym_quats,
                                                                   neighbors, Sel,
                                                                   ang_thr=5.0,
@@ -538,7 +537,8 @@ def cluster_map_sample_to_crystal_numba_with_neighbors(X, Y, Q, sym_quats,
     labels = np.zeros(N, np.int32)
     cluster_id = 0
     dmax2 = dmax * dmax
-    stack = np.empty(N, np.int32)
+    stacksize = 5*N
+    stack = np.empty(stacksize, np.int32)
 
     com_x = np.zeros(N)
     com_y = np.zeros(N)
@@ -546,6 +546,8 @@ def cluster_map_sample_to_crystal_numba_with_neighbors(X, Y, Q, sym_quats,
 
     # --- 1. Flood-fill clustering within ROI ---
     for i in range(N):
+        #if i % 10000 == 0:
+        #    print("Clustering pixel ", i, " / ", N, end=',')
         if not Sel[i]:
             continue
         if labels[i] != 0:
@@ -554,7 +556,6 @@ def cluster_map_sample_to_crystal_numba_with_neighbors(X, Y, Q, sym_quats,
         sp = 0
         stack[sp] = i
         sp += 1
-
         while sp > 0:
             sp -= 1
             j = stack[sp]
@@ -584,9 +585,10 @@ def cluster_map_sample_to_crystal_numba_with_neighbors(X, Y, Q, sym_quats,
                     continue
                 ang = misori_sym_deg_quats(qj, Q[k], sym_quats)
                 if ang < ang_thr:
-                    stack[sp] = k
-                    sp += 1
-
+                    if sp < stacksize:  # Fixed: Check stack bounds before adding
+                        #print(f'{i}/{sp}',end=',')
+                        stack[sp] = k
+                        sp += 1
     # --- 2. Filter small clusters & compute COM ---
     new_idx = -np.ones(cluster_id, dtype=np.int32)
     n_clusters_new = 0
