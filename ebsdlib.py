@@ -14,15 +14,12 @@ from orix import plot
 from orix.quaternion import Orientation, Rotation, symmetry
 import copy
 import numpy as np
-from orilib import * # Orientations, quaternions, Euler angles
-from projlib import * # Stereographic projections
-from plotlib import * # Crystallographic plotting
-from crystlib import * # Crystallographic calculations
-from effelconst import  * #effective elastic constants calculations
+from crystlibs import * #importing orilib: Orientations, quaternions, Euler angles, projlib import: Stereographic projections, plotlib: Crystallographic plotting
+from effelconst import * #effective elastic constants calculations
+from getphases import getPhases
 
 from crystals import Crystal
 from numpy import sqrt
-from getphases import getPhases
 
 from matplotlib.path import Path
 import time
