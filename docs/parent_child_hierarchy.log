@@ -1,0 +1,133 @@
+This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2025/dev/Debian) (preloaded format=pdflatex 2025.12.16)  5 FEB 2026 10:51
+entering extended mode
+ restricted \write18 enabled.
+ %&-line parsing enabled.
+**parent_child_hierarchy.tex
+(./parent_child_hierarchy.tex
+LaTeX2e <2024-11-01> patch level 2
+L3 programming layer <2025-01-18>
+(/usr/share/texlive/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2024/06/29 v1.4n Standard LaTeX document class
+(/usr/share/texlive/texmf-dist/tex/latex/base/size10.clo
+File: size10.clo 2024/06/29 v1.4n Standard LaTeX file (size option)
+)
+\c@part=\count196
+\c@section=\count197
+\c@subsection=\count198
+\c@subsubsection=\count199
+\c@paragraph=\count266
+\c@subparagraph=\count267
+\c@figure=\count268
+\c@table=\count269
+\abovecaptionskip=\skip49
+\belowcaptionskip=\skip50
+\bibindent=\dimen141
+)
+(/usr/share/texlive/texmf-dist/tex/latex/base/inputenc.sty
+Package: inputenc 2024/02/08 v1.3d Input encoding file
+\inpenc@prehook=\toks17
+\inpenc@posthook=\toks18
+)
+(/usr/share/texlive/texmf-dist/tex/latex/fancyvrb/fancyvrb.sty
+Package: fancyvrb 2024/01/20 4.5c verbatim text (tvz,hv)
+
+(/usr/share/texlive/texmf-dist/tex/latex/graphics/keyval.sty
+Package: keyval 2022/05/29 v1.15 key=value parser (DPC)
+\KV@toks@=\toks19
+)
+\FV@CodeLineNo=\count270
+\FV@InFile=\read2
+\FV@TabBox=\box52
+\c@FancyVerbLine=\count271
+\FV@StepNumber=\count272
+\FV@OutFile=\write3
+)
+(/usr/share/texlive/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def
+File: l3backend-pdftex.def 2024-05-08 L3 backend support: PDF output (pdfTeX)
+\l__color_backend_stack_int=\count273
+\l__pdf_internal_box=\box53
+)
+(./parent_child_hierarchy.aux)
+\openout1 = `parent_child_hierarchy.aux'.
+
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 8.
+LaTeX Font Info:    ... okay on input line 8.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <12> on input line 9.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <8> on input line 9.
+LaTeX Font Info:    External font `cmex10' loaded for size
+(Font)              <6> on input line 9.
+
+Overfull \hbox (6.74446pt too wide) in paragraph at lines 51--51
+[]                              \OT1/cmtt/m/n/10 q_best_cluster \TS1/cmtt/m/n/1
+0 ^^Y \OT1/cmtt/m/n/10 array[8\TS1/cmtt/m/n/10 Ö\OT1/cmtt/m/n/10 4] <float64>[]
+ 
+ []
+
+
+Overfull \hbox (17.24313pt too wide) in paragraph at lines 51--51
+[]                              \OT1/cmtt/m/n/10 M_best_cluster \TS1/cmtt/m/n/1
+0 ^^Y \OT1/cmtt/m/n/10 array[8\TS1/cmtt/m/n/10 Ö\OT1/cmtt/m/n/10 3\TS1/cmtt/m/n
+/10 Ö\OT1/cmtt/m/n/10 3] <float64>[] 
+ []
+
+
+Overfull \hbox (6.74446pt too wide) in paragraph at lines 51--51
+[]                              \OT1/cmtt/m/n/10 q_best_cluster \TS1/cmtt/m/n/1
+0 ^^Y \OT1/cmtt/m/n/10 array[8\TS1/cmtt/m/n/10 Ö\OT1/cmtt/m/n/10 4] <float64>[]
+ 
+ []
+
+
+Overfull \hbox (17.24313pt too wide) in paragraph at lines 51--51
+[]                              \OT1/cmtt/m/n/10 M_best_cluster \TS1/cmtt/m/n/1
+0 ^^Y \OT1/cmtt/m/n/10 array[8\TS1/cmtt/m/n/10 Ö\OT1/cmtt/m/n/10 3\TS1/cmtt/m/n
+/10 Ö\OT1/cmtt/m/n/10 3] <float64>[] 
+ []
+
+
+
+[1
+
+{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}{/usr/share/texmf/fonts/enc/
+dvips/cm-super/cm-super-ts1.enc}]
+
+[2] (./parent_child_hierarchy.aux)
+ ***********
+LaTeX2e <2024-11-01> patch level 2
+L3 programming layer <2025-01-18>
+ ***********
+ ) 
+Here is how much of TeX's memory you used:
+ 932 strings out of 473197
+ 16659 string characters out of 5718604
+ 424717 words of memory out of 5000000
+ 24241 multiletter control sequences out of 15000+600000
+ 562337 words of font info for 48 fonts, out of 8000000 for 9000
+ 1141 hyphenation exceptions out of 8191
+ 42i,6n,51p,279b,277s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr
+/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr12.pfb></usr/share/
+texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr17.pfb></usr/share/texlive
+/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt10.pfb></usr/share/texmf/fonts/t
+ype1/public/cm-super/sftt1000.pfb>
+Output written on parent_child_hierarchy.pdf (2 pages, 66441 bytes).
+PDF statistics:
+ 37 PDF objects out of 1000 (max. 8388607)
+ 22 compressed objects within 1 object stream
+ 0 named destinations out of 1000 (max. 500000)
+ 1 words of extra memory for PDF output out of 10000 (max. 10000000)
+

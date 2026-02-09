@@ -1,0 +1,381 @@
+\documentclass[a4paper,10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{fancyvrb}
+%opening
+\title{Structure of the variable self.HP containing results of the habit plane analysis}
+\author{L. Heller}
+
+\begin{document}
+\maketitle
+\begin{verbatim}
+parent_cluster_id → dict [10 keys]
+     child_cluster_id → dict [4 keys]
+               parent_idx → int
+               child_idx → int
+               semi_roi_1 → dict [30 keys]
+                    G2Cryst_red → dict [2 keys]
+                         A → array[9×3×3] <float64>
+                         M → array[14×3×3] <float64>
+                    G2Cryst_red_avg → dict [2 keys]
+                         A → array[3×3] <float64>
+                         M → array[3×3] <float64>
+                    G2Sampl_red → dict [2 keys]
+                         A → array[9×3×3] <float64>
+                         M → array[14×3×3] <float64>
+                    G2Sampl_red_avg → dict [2 keys]
+                         A → array[3×3] <float64>
+                         M → array[3×3] <float64>
+                    <100>PF → dict [2 keys]
+                         A → array[3×27] <float64>
+                         M → array[3×42] <float64>
+                    <100>PF_avg → dict [2 keys]
+                         A → array[3×3] <float64>
+                         M → array[3×3] <float64>
+                    T_AM_ebsd → array[4×3×3] <float64>
+                    Closest Variant → int
+                    Closes equivalent G2Cryst → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Closes equivalent G2Cryst_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Theory G2Cryst → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Theory G2Cryst_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Theory <100>PF_avg → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Theory <100>PF_avg_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Theory <100>PF_avg_symop → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Theory <100>PF_avg_symop_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Martensite symop → array[3×3] <float64>
+                    Martensite symop_allvars → list [12 items]
+                         [0] → array[3×3] <float64>
+                    Closest Theory OR → array[3×3] <float64>
+                    Closest Theory OR_allvars → list [12 items]
+                         [0] → array[3×3] <float64>
+                    Exp OR → array[3×3] <float64>
+                    Exp OR_allvars → list [12 items]
+                         [0] → array[3×3] <float64>
+                    dR OR → Rotation
+                    dR OR_allvars → list [12 items]
+                         [0] → Rotation
+                    Misori OR → float
+                    Misori OR_allvars → list [12 items]
+                         [0] → float
+                    Transformation strain → list [3 items]
+                         [0] → dict [1 keys]
+                              along [1. 0. 0.] [-] → float
+                    Transformation strain_allvars → list [12 items]
+                         [0] → list [3 items]
+                              [0] → dict [1 keys]
+                                   along [1. 0. 0.] [-] → float
+                    OR → dict [3 keys]
+                         OR:A-M → array[3×3] <float64>
+                         axis → array[3] <float64>
+                         angle → float
+                    Interfaces → dict [10 keys]
+                         x → array[23] <float32>
+                         y → array[23] <float32>
+                         linfit → array[2] <float64>
+                         linfitnorm → array[2] <float64>
+                         interface_trace_sample → array[3] <float64>
+                         interfacenorm_trace_sample → array[3] <float64>
+                         interface_trace → dict [2 keys]
+                              A → array[3] <float64>
+                              M → array[3] <float64>
+                         interfacenorm_trace → dict [2 keys]
+                              A → array[3] <float64>
+                              M → array[3] <float64>
+                         HP_guess → dict [2 keys]
+                              A → dict [7 keys]
+                                   n_vec → array[10×3] <float64>
+                                   n_vec_sampl → array[10×3] <float64>
+                                   n_miller → array[10×3] <float64>
+                                   n_miller_family → array[10×3] <float64>
+                                   n_miller_normvec → array[10×3] <float64>
+                                   n_miller_normvec_sampl → array[10×3] <float64>
+                                   HPvsTrace_angle → array[10] <float64>
+                              M → dict [7 keys]
+                                   n_vec → array[15×3] <float64>
+                                   n_vec_sampl → array[15×3] <float64>
+                                   n_miller → array[15×3] <float64>
+                                   n_miller_family → array[15×3] <float64>
+                                   n_miller_normvec → array[15×3] <float64>
+                                   n_miller_normvec_sampl → array[15×3] <float64>
+                                   HPvsTrace_angle → array[15] <float64>
+                         HP_matches → dict [3 keys]
+                              Score → dict [5 keys]
+                                   low index habit plane → list [3 items]
+                                        [0] → float
+                                   mean misalignment → list [3 items]
+                                        [0] → float
+                                   number of corresponding directions → list [3 items]
+                                        [0] → int
+                                   overall → list [3 items]
+                                        [0] → float
+                                   fitcorresp → list [3 items]
+                                        [0] → str: 'yes'
+                              A → dict [2 keys]
+                                   Habit plane normal → dict [8 keys]
+                                        misalign → list [3 items]
+                                             [0] → float
+                                        n_vec → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_vec_sampl → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_family → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec_sampl → list [3 items]
+                                             [0] → array[3] <float64>
+                                        HPvsTrace_angle → list [3 items]
+                                             [0] → float
+                                   Habit plane direction → dict [8 keys]
+                                        misalign → list [3 items]
+                                             [0] → list [2 items]
+                                                  [0] → float
+                                        n_vec → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_vec_sampl → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_family → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec_sampl → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        HPvsTrace_angle → list [3 items]
+                                             [0] → array[2] <float64>
+                              M → dict [2 keys]
+                                   Habit plane normal → dict [8 keys]
+                                        misalign → list [3 items]
+                                             [0] → float
+                                        n_vec → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_vec_sampl → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_family → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec → list [3 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec_sampl → list [3 items]
+                                             [0] → array[3] <float64>
+                                        HPvsTrace_angle → list [3 items]
+                                             [0] → float
+                                   Habit plane direction → dict [8 keys]
+                                        misalign → list [3 items]
+                                             [0] → list [2 items]
+                                                  [0] → float
+                                        n_vec → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_vec_sampl → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_family → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec_sampl → list [3 items]
+                                             [0] → array[2×3] <float64>
+                                        HPvsTrace_angle → list [3 items]
+                                             [0] → array[2] <float64>
+               semi_roi_2 → dict [30 keys]
+                    G2Cryst_red → dict [2 keys]
+                         A → array[9×3×3] <float64>
+                         M → array[12×3×3] <float64>
+                    G2Cryst_red_avg → dict [2 keys]
+                         A → array[3×3] <float64>
+                         M → array[3×3] <float64>
+                    G2Sampl_red → dict [2 keys]
+                         A → array[9×3×3] <float64>
+                         M → array[12×3×3] <float64>
+                    G2Sampl_red_avg → dict [2 keys]
+                         A → array[3×3] <float64>
+                         M → array[3×3] <float64>
+                    <100>PF → dict [2 keys]
+                         A → array[3×27] <float64>
+                         M → array[3×36] <float64>
+                    <100>PF_avg → dict [2 keys]
+                         A → array[3×3] <float64>
+                         M → array[3×3] <float64>
+                    T_AM_ebsd → array[4×3×3] <float64>
+                    Closest Variant → int
+                    Closes equivalent G2Cryst → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Closes equivalent G2Cryst_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Theory G2Cryst → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Theory G2Cryst_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Theory <100>PF_avg → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Theory <100>PF_avg_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Theory <100>PF_avg_symop → dict [1 keys]
+                         M → array[3×3] <float64>
+                    Theory <100>PF_avg_symop_allvars → list [12 items]
+                         [0] → dict [1 keys]
+                              M → array[3×3] <float64>
+                    Martensite symop → array[3×3] <float64>
+                    Martensite symop_allvars → list [12 items]
+                         [0] → array[3×3] <float64>
+                    Closest Theory OR → array[3×3] <float64>
+                    Closest Theory OR_allvars → list [12 items]
+                         [0] → array[3×3] <float64>
+                    Exp OR → array[3×3] <float64>
+                    Exp OR_allvars → list [12 items]
+                         [0] → array[3×3] <float64>
+                    dR OR → Rotation
+                    dR OR_allvars → list [12 items]
+                         [0] → Rotation
+                    Misori OR → float
+                    Misori OR_allvars → list [12 items]
+                         [0] → float
+                    Transformation strain → list [3 items]
+                         [0] → dict [1 keys]
+                              along [1. 0. 0.] [-] → float
+                    Transformation strain_allvars → list [12 items]
+                         [0] → list [3 items]
+                              [0] → dict [1 keys]
+                                   along [1. 0. 0.] [-] → float
+                    OR → dict [3 keys]
+                         OR:A-M → array[3×3] <float64>
+                         axis → array[3] <float64>
+                         angle → float
+                    Interfaces → dict [10 keys]
+                         x → array[21] <float32>
+                         y → array[21] <float32>
+                         linfit → array[2] <float64>
+                         linfitnorm → array[2] <float64>
+                         interface_trace_sample → array[3] <float64>
+                         interfacenorm_trace_sample → array[3] <float64>
+                         interface_trace → dict [2 keys]
+                              A → array[3] <float64>
+                              M → array[3] <float64>
+                         interfacenorm_trace → dict [2 keys]
+                              A → array[3] <float64>
+                              M → array[3] <float64>
+                         HP_guess → dict [2 keys]
+                              A → dict [7 keys]
+                                   n_vec → array[11×3] <float64>
+                                   n_vec_sampl → array[11×3] <float64>
+                                   n_miller → array[11×3] <float64>
+                                   n_miller_family → array[11×3] <float64>
+                                   n_miller_normvec → array[11×3] <float64>
+                                   n_miller_normvec_sampl → array[11×3] <float64>
+                                   HPvsTrace_angle → array[11] <float64>
+                              M → dict [7 keys]
+                                   n_vec → array[15×3] <float64>
+                                   n_vec_sampl → array[15×3] <float64>
+                                   n_miller → array[15×3] <float64>
+                                   n_miller_family → array[15×3] <float64>
+                                   n_miller_normvec → array[15×3] <float64>
+                                   n_miller_normvec_sampl → array[15×3] <float64>
+                                   HPvsTrace_angle → array[15] <float64>
+                         HP_matches → dict [3 keys]
+                              Score → dict [5 keys]
+                                   low index habit plane → list [4 items]
+                                        [0] → float
+                                   mean misalignment → list [4 items]
+                                        [0] → float
+                                   number of corresponding directions → list [4 items]
+                                        [0] → int
+                                   overall → list [4 items]
+                                        [0] → float
+                                   fitcorresp → list [4 items]
+                                        [0] → str: 'yes'
+                              A → dict [2 keys]
+                                   Habit plane normal → dict [8 keys]
+                                        misalign → list [4 items]
+                                             [0] → float
+                                        n_vec → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_vec_sampl → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_family → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec_sampl → list [4 items]
+                                             [0] → array[3] <float64>
+                                        HPvsTrace_angle → list [4 items]
+                                             [0] → float
+                                   Habit plane direction → dict [8 keys]
+                                        misalign → list [4 items]
+                                             [0] → list [2 items]
+                                                  [0] → float
+                                        n_vec → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_vec_sampl → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_family → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec_sampl → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        HPvsTrace_angle → list [4 items]
+                                             [0] → array[2] <float64>
+                              M → dict [2 keys]
+                                   Habit plane normal → dict [8 keys]
+                                        misalign → list [4 items]
+                                             [0] → float
+                                        n_vec → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_vec_sampl → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_family → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec → list [4 items]
+                                             [0] → array[3] <float64>
+                                        n_miller_normvec_sampl → list [4 items]
+                                             [0] → array[3] <float64>
+                                        HPvsTrace_angle → list [4 items]
+                                             [0] → float
+                                   Habit plane direction → dict [8 keys]
+                                        misalign → list [4 items]
+                                             [0] → list [2 items]
+                                                  [0] → float
+                                        n_vec → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_vec_sampl → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_family → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        n_miller_normvec_sampl → list [4 items]
+                                             [0] → array[2×3] <float64>
+                                        HPvsTrace_angle → list [4 items]
+                                             [0] → array[2] <float64>
+\end{verbatim}
+
+
+
+\end{document}

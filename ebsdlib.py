@@ -16,7 +16,7 @@ from orix.vector import Vector3d
 from orix import plot
 import copy
 import numpy as np
-
+import matplotlib.pyplot as plt
 from matplotlib.widgets import PolygonSelector
 import matplotlib.path as mpltPath
 
@@ -40,7 +40,618 @@ _COS60 = 0.5  # cos(60deg)
 _SIN60 = 0.5 * 3.0**0.5  # sin(60deg)
 
 
+import h5py
+from scipy.spatial.transform import Rotation as ScipyRotation
 
+
+def save_to_hdf5(filename, data, key='data'):
+    """
+    Save data (dict or list of dicts) to HDF5.
+    
+    Parameters
+    ----------
+    filename : str
+        Output HDF5 filename
+    data : dict or list of dict
+        Data to save
+    key : str, optional
+        Root key name. Default is 'data'.
+    
+    Examples
+    --------
+    >>> # Single dictionary
+    >>> save_to_hdf5('data.h5', my_dict)
+    
+    >>> # List of dictionaries
+    >>> save_to_hdf5('data.h5', [dict1, dict2, dict3])
+    """
+    with h5py.File(filename, 'w') as f:
+        if isinstance(data, list):
+            # List of dictionaries
+            list_group = f.create_group(key)
+            list_group.attrs['type'] = 'list_of_dicts'
+            for i, item in enumerate(data):
+                if isinstance(item, dict):
+                    item_group = list_group.create_group(f'item_{i}')
+                    _write_dict(item_group, item)
+                else:
+                    raise ValueError(f"Item {i} in list is not a dictionary")
+        elif isinstance(data, dict):
+            # Single dictionary
+            f.attrs['type'] = 'single_dict'
+            _write_dict(f, data)
+        else:
+            raise ValueError("Data must be a dictionary or list of dictionaries")
+    
+    print(f"Saved to {filename}")
+
+
+def load_from_hdf5(filename):
+    """
+    Load data (dict or list of dicts) from HDF5.
+    
+    Parameters
+    ----------
+    filename : str
+        Input HDF5 filename
+    
+    Returns
+    -------
+    dict or list of dict
+        Loaded data
+    
+    Examples
+    --------
+    >>> # Load (automatically detects if single dict or list)
+    >>> data = load_from_hdf5('data.h5')
+    """
+    with h5py.File(filename, 'r') as f:
+        # Check if it's a single dict or list of dicts
+        if 'type' in f.attrs and f.attrs['type'] == 'single_dict':
+            # Single dictionary
+            return _read_dict(f)
+        else:
+            # Check for list of dicts
+            for key in f.keys():
+                item = f[key]
+                if isinstance(item, h5py.Group) and 'type' in item.attrs and item.attrs['type'] == 'list_of_dicts':
+                    # List of dictionaries
+                    result = []
+                    for i in range(len([k for k in item.keys() if k.startswith('item_')])):
+                        if f'item_{i}' in item:
+                            result.append(_read_dict(item[f'item_{i}']))
+                    return result
+            
+            # If no type attribute, assume single dict for backward compatibility
+            return _read_dict(f)
+
+
+def _write_dict(group, dictionary):
+    """Internal function to write a dictionary to an HDF5 group."""
+    for key, value in dictionary.items():
+        # Sanitize key
+        safe_key = str(key).replace('/', '_').replace(' ', '_')
+        
+        if isinstance(value, dict):
+            # Create subgroup for nested dict
+            subgroup = group.create_group(safe_key)
+            _write_dict(subgroup, value)
+            
+        elif isinstance(value, np.ndarray):
+            # Save numpy arrays
+            group.create_dataset(safe_key, data=value, compression='gzip')
+            
+        elif isinstance(value, list):
+            # Handle lists
+            if len(value) > 0:
+                if isinstance(value[0], dict):
+                    # List of dicts
+                    list_group = group.create_group(safe_key)
+                    list_group.attrs['list_type'] = 'dicts'
+                    for i, item in enumerate(value):
+                        item_group = list_group.create_group(f'item_{i}')
+                        _write_dict(item_group, item)
+                elif isinstance(value[0], np.ndarray):
+                    # List of arrays - try to stack
+                    try:
+                        stacked = np.stack(value)
+                        group.create_dataset(safe_key, data=stacked, compression='gzip')
+                    except:
+                        # Can't stack, save individually
+                        list_group = group.create_group(safe_key)
+                        list_group.attrs['list_type'] = 'arrays'
+                        for i, arr in enumerate(value):
+                            list_group.create_dataset(f'item_{i}', data=arr, compression='gzip')
+                elif hasattr(value[0], '__class__') and 'Rotation' in value[0].__class__.__name__:
+                    # List of Rotation objects
+                    list_group = group.create_group(safe_key)
+                    list_group.attrs['list_type'] = 'rotations'
+                    for i, rot in enumerate(value):
+                        _save_rotation_object(list_group, f'item_{i}', rot)
+                else:
+                    # Simple list - convert to array
+                    try:
+                        group.create_dataset(safe_key, data=np.array(value))
+                    except:
+                        group.attrs[safe_key] = str(value)
+            else:
+                # Empty list
+                group.attrs[safe_key] = '[]'
+                
+        elif hasattr(value, '__class__') and 'Rotation' in value.__class__.__name__:
+            # Handle any Rotation object
+            _save_rotation_object(group, safe_key, value)
+            
+        elif isinstance(value, (int, float, tuple, bool, np.bool, np.integer, np.floating)):
+            # Store as attribute for small scalars
+            group.attrs[safe_key] = value
+            
+        elif isinstance(value, str):
+            # Store strings as attributes
+            group.attrs[safe_key] = value
+            
+        elif value is None:
+            # Store None
+            group.attrs[safe_key] = 'None'
+            
+        else:
+            # Unknown type - store as string
+            print(f"Warning: Unknown type {type(value)} for key {key}, storing as string")
+            group.attrs[safe_key] = str(value)
+
+
+def _save_rotation_object(group, key, rotation):
+    """Internal function to save scipy or orix Rotation object."""
+    rotation_type = rotation.__class__.__module__ + '.' + rotation.__class__.__name__
+    
+    if 'orix' in rotation_type:
+        # orix Rotation - save as quaternions
+        quaternions = rotation.data
+        
+        rot_group = group.create_group(key)
+        rot_group.create_dataset('quaternions', data=quaternions, compression='gzip')
+        rot_group.attrs['type'] = 'orix.Rotation'
+        rot_group.attrs['shape'] = rotation.shape
+        
+    elif 'scipy' in rotation_type:
+        # scipy Rotation - save as quaternions
+        quaternions = rotation.as_quat()
+        
+        rot_group = group.create_group(key)
+        rot_group.create_dataset('quaternions', data=quaternions, compression='gzip')
+        rot_group.attrs['type'] = 'scipy.Rotation'
+        
+    else:
+        # Unknown rotation type - try to save as matrix
+        print(f"Warning: Unknown Rotation type {rotation_type}, trying to save as matrix")
+        try:
+            if hasattr(rotation, 'as_matrix'):
+                matrix = rotation.as_matrix()
+            elif hasattr(rotation, 'to_matrix'):
+                matrix = rotation.to_matrix()
+            else:
+                matrix = np.array(rotation)
+            
+            group.create_dataset(key, data=matrix, compression='gzip')
+            group[key].attrs['type'] = 'Rotation_matrix'
+        except Exception as e:
+            print(f"Error saving rotation: {e}")
+            group.attrs[key] = str(rotation)
+
+
+def _read_dict(group):
+    """Internal function to read a dictionary from an HDF5 group."""
+    # Try to import orix
+    try:
+        from orix.quaternion import Rotation as OrixRotation
+        has_orix = True
+    except ImportError:
+        has_orix = False
+    
+    result = {}
+    
+    # Load datasets (arrays) and groups
+    for key in group.keys():
+        item = group[key]
+        
+        if isinstance(item, h5py.Group):
+            # Check if it's a Rotation object
+            if 'type' in item.attrs:
+                rot_type = item.attrs['type']
+                
+                if rot_type == 'orix.Rotation':
+                    # Reconstruct orix Rotation
+                    quaternions = item['quaternions'][()]
+                    
+                    if has_orix:
+                        if 'shape' in item.attrs:
+                            shape = item.attrs['shape']
+                            result[key] = OrixRotation(quaternions).reshape(shape)
+                        else:
+                            result[key] = OrixRotation(quaternions)
+                    else:
+                        result[key] = quaternions
+                        
+                elif rot_type == 'scipy.Rotation':
+                    # Reconstruct scipy Rotation
+                    quaternions = item['quaternions'][()]
+                    result[key] = ScipyRotation.from_quat(quaternions)
+                    
+                elif rot_type == 'Rotation_matrix':
+                    result[key] = item[()]
+                    
+            # Check if it's a list with type annotation
+            elif 'list_type' in item.attrs:
+                list_type = item.attrs['list_type']
+                items = []
+                
+                for i in range(len([k for k in item.keys() if k.startswith('item_')])):
+                    if f'item_{i}' in item:
+                        sub_item = item[f'item_{i}']
+                        
+                        if list_type == 'dicts':
+                            items.append(_read_dict(sub_item))
+                        elif list_type == 'arrays':
+                            items.append(sub_item[()])
+                        elif list_type == 'rotations':
+                            # Reconstruct Rotation
+                            if 'type' in sub_item.attrs:
+                                rot_type = sub_item.attrs['type']
+                                if rot_type == 'orix.Rotation':
+                                    quaternions = sub_item['quaternions'][()]
+                                    if has_orix:
+                                        items.append(OrixRotation(quaternions))
+                                    else:
+                                        items.append(quaternions)
+                                elif rot_type == 'scipy.Rotation':
+                                    quaternions = sub_item['quaternions'][()]
+                                    items.append(ScipyRotation.from_quat(quaternions))
+                
+                result[key] = items
+                
+            # Check if it's a generic list of items (backward compatibility)
+            elif all(k.startswith('item_') for k in item.keys()):
+                items = []
+                for i in range(len([k for k in item.keys() if k.startswith('item_')])):
+                    if f'item_{i}' in item:
+                        sub_item = item[f'item_{i}']
+                        if isinstance(sub_item, h5py.Group):
+                            if 'type' in sub_item.attrs:
+                                # It's a Rotation
+                                rot_type = sub_item.attrs['type']
+                                if rot_type == 'orix.Rotation':
+                                    quaternions = sub_item['quaternions'][()]
+                                    if has_orix:
+                                        items.append(OrixRotation(quaternions))
+                                    else:
+                                        items.append(quaternions)
+                                elif rot_type == 'scipy.Rotation':
+                                    quaternions = sub_item['quaternions'][()]
+                                    items.append(ScipyRotation.from_quat(quaternions))
+                            else:
+                                # Regular nested dict
+                                items.append(_read_dict(sub_item))
+                        else:
+                            # Dataset
+                            items.append(sub_item[()])
+                result[key] = items
+            else:
+                # Regular nested dict
+                result[key] = _read_dict(item)
+        else:
+            # Dataset (array)
+            result[key] = item[()]
+    
+    # Load attributes (scalars, strings)
+    for key, value in group.attrs.items():
+        if key in ['type', 'list_type', 'shape']:  # Skip internal attributes
+            continue
+        if value == 'None':
+            result[key] = None
+        elif value == '[]':
+            result[key] = []
+        else:
+            result[key] = value
+    
+    return result
+
+
+# Convenience aliases (backward compatible)
+def save_dict_to_hdf5(filename, data):
+    """Backward compatible: save single dictionary to HDF5."""
+    save_to_hdf5(filename, data)
+
+
+def load_dict_from_hdf5(filename):
+    """Backward compatible: load from HDF5."""
+    return load_from_hdf5(filename)
+
+
+def print_dict_structure(obj, indent=0, name="root", max_depth=10, max_array_display=3,
+                        collapse_levels=None, collapse_levels_labels=None, 
+                        collapse_preset=None, current_path="", _skip_type_line=False,
+                        indent_size=2):  # NEW PARAMETER
+    """
+    Print dictionary structure with detailed type information.
+    
+    Parameters
+    ----------
+    obj : any
+        Object to analyze
+    indent : int
+        Indentation level (internal use)
+    name : str
+        Key name
+    max_depth : int, optional
+        Maximum nesting depth. Default is 10.
+    max_array_display : int, optional
+        Maximum array dimensions to show in detail. Default is 3.
+    collapse_levels : list of str or int, optional
+        Levels to collapse (show only first key).
+    collapse_levels_labels : list of str, optional
+        Labels for collapsed levels. Must have same length as collapse_levels.
+    collapse_preset : str, optional
+        Named preset for collapse_levels.
+    current_path : str
+        Current path in the structure (internal use)
+    _skip_type_line : bool
+        Internal parameter to avoid printing duplicate type lines
+    indent_size : int, optional
+        Number of spaces per indentation level. Default is 2.
+    
+    Examples
+    --------
+    >>> # Default 2 spaces per level
+    >>> print_dict_structure(hierarchy, collapse_levels=[0,1],
+    ...                      collapse_levels_labels=['parent_id', 'child_id'])
+    
+    >>> # Use 4 spaces per level (more readable)
+    >>> print_dict_structure(hierarchy, collapse_levels=[0,1],
+    ...                      collapse_levels_labels=['parent_id', 'child_id'],
+    ...                      indent_size=4)
+    
+    >>> # Use 1 space per level (compact)
+    >>> print_dict_structure(hierarchy, collapse_levels=[0,1],
+    ...                      collapse_levels_labels=['parent_id', 'child_id'],
+    ...                      indent_size=1)
+    """
+    # Preset definitions
+    COLLAPSE_PRESETS = {
+        'minimal': ([0], ['PARENT']),
+        'compact': ([0, 'children', 'parent_side', 'child_side'], 
+                   ['PARENT', 'CHILD', 'PARENT_SIDE', 'CHILD_SIDE']),
+        'interfaces': (['parent_side', 'child_side'], 
+                      ['PARENT_SIDE', 'CHILD_SIDE']),
+        'hierarchy': ([0, 'children', 'parent_side', 'child_side', 'semi_roi_1', 'semi_roi_2'],
+                     ['PARENT', 'CHILD', 'PARENT_SIDE', 'CHILD_SIDE', 'SEMI_ROI_1', 'SEMI_ROI_2']),
+        'sides_only': (['parent_side', 'child_side'], 
+                      ['PARENT_SIDE', 'CHILD_SIDE']),
+        'all_lists': ([0, 'children'], 
+                     ['PARENT', 'CHILD']),
+    }
+    
+    if collapse_preset is not None:
+        if collapse_preset in COLLAPSE_PRESETS:
+            preset_levels, preset_labels = COLLAPSE_PRESETS[collapse_preset]
+            if collapse_levels is None:
+                collapse_levels = preset_levels
+                collapse_levels_labels = preset_labels
+            else:
+                collapse_levels = list(collapse_levels) + list(preset_levels)
+                if collapse_levels_labels is None:
+                    collapse_levels_labels = [None] * len(collapse_levels)
+                else:
+                    collapse_levels_labels = list(collapse_levels_labels) + list(preset_labels)
+        else:
+            available = ', '.join(COLLAPSE_PRESETS.keys())
+            print(f"Warning: Unknown preset '{collapse_preset}'. Available: {available}")
+    
+    if collapse_levels_labels is not None and collapse_levels is not None:
+        if len(collapse_levels_labels) != len(collapse_levels):
+            raise ValueError(f"collapse_levels_labels length ({len(collapse_levels_labels)}) "
+                           f"must match collapse_levels length ({len(collapse_levels)})")
+    
+    # CHANGED: Use indent_size parameter
+    prefix = " " * (indent * indent_size)
+    
+    if indent > max_depth:
+        print(f"{prefix}... (max depth)")
+        return
+    
+    if current_path:
+        path = f"{current_path}/{name}"
+    else:
+        path = name
+    
+    # Check if this level should be collapsed
+    should_collapse = False
+    collapse_label = None
+    root_label_replacement = None
+    
+    if collapse_levels is not None:
+        for i, collapse_spec in enumerate(collapse_levels):
+            if isinstance(collapse_spec, int):
+                if indent == collapse_spec:
+                    should_collapse = True
+                    if collapse_levels_labels and i < len(collapse_levels_labels):
+                        if indent == 0:
+                            root_label_replacement = collapse_levels_labels[i]
+                        else:
+                            collapse_label = collapse_levels_labels[i]
+                    break
+            elif isinstance(collapse_spec, str):
+                if collapse_spec == name or collapse_spec in path:
+                    should_collapse = True
+                    if collapse_levels_labels and i < len(collapse_levels_labels):
+                        collapse_label = collapse_levels_labels[i]
+                    break
+    
+    if root_label_replacement is not None:
+        display_name = root_label_replacement
+    else:
+        display_name = name
+    
+    # Determine type and format
+    if isinstance(obj, dict):
+        if should_collapse and len(obj) > 0:
+            # COLLAPSED DICT
+            first_key = list(obj.keys())[0]
+            first_value = obj[first_key]
+            
+            # Determine the type info for the CHILD
+            if isinstance(first_value, dict):
+                type_info = f"dict [{len(first_value)} keys]"
+            elif isinstance(first_value, list):
+                type_info = f"list [{len(first_value)} items]"
+            elif isinstance(first_value, np.ndarray):
+                shape_str = "×".join(map(str, first_value.shape))
+                type_info = f"array[{shape_str}] <{first_value.dtype}>"
+            elif isinstance(first_value, (int, np.integer)):
+                type_info = "int"
+            elif isinstance(first_value, (float, np.floating)):
+                type_info = "float"
+            elif isinstance(first_value, str):
+                type_info = "str"
+            elif isinstance(first_value, bool):
+                type_info = "bool"
+            else:
+                type_info = type(first_value).__name__
+            
+            if root_label_replacement is not None:
+                effective_name = root_label_replacement
+            elif collapse_label:
+                effective_name = collapse_label
+            else:
+                effective_name = first_key
+            
+            print(f"{prefix}{effective_name} → {type_info}")
+            
+            if isinstance(first_value, (dict, list)):
+                print_dict_structure(first_value, indent + 1, name=effective_name, 
+                                   max_depth=max_depth, max_array_display=max_array_display,
+                                   collapse_levels=collapse_levels, 
+                                   collapse_levels_labels=collapse_levels_labels,
+                                   current_path=path, _skip_type_line=True,
+                                   indent_size=indent_size)  # ADDED
+        else:
+            # NOT COLLAPSED
+            if not _skip_type_line:
+                print(f"{prefix}{display_name} → dict [{len(obj)} keys]")
+            
+            for key in obj.keys():
+                print_dict_structure(obj[key], indent + 1, name=key, 
+                                   max_depth=max_depth, max_array_display=max_array_display,
+                                   collapse_levels=collapse_levels,
+                                   collapse_levels_labels=collapse_levels_labels,
+                                   current_path=path,
+                                   indent_size=indent_size)  # ADDED
+    
+    elif isinstance(obj, list):
+        if len(obj) == 0:
+            if not _skip_type_line:
+                print(f"{prefix}{display_name} → list [empty]")
+        else:
+            if should_collapse:
+                # COLLAPSED LIST
+                first_item = obj[0]
+                
+                # Determine the type info for the CHILD
+                if isinstance(first_item, dict):
+                    type_info = f"dict [{len(first_item)} keys]"
+                elif isinstance(first_item, list):
+                    type_info = f"list [{len(first_item)} items]"
+                elif isinstance(first_item, np.ndarray):
+                    shape_str = "×".join(map(str, first_item.shape))
+                    type_info = f"array[{shape_str}] <{first_item.dtype}>"
+                elif isinstance(first_item, (int, np.integer)):
+                    type_info = "int"
+                elif isinstance(first_item, (float, np.floating)):
+                    type_info = "float"
+                elif isinstance(first_item, str):
+                    type_info = "str"
+                elif isinstance(first_item, bool):
+                    type_info = "bool"
+                else:
+                    type_info = type(first_item).__name__
+                
+                if root_label_replacement is not None:
+                    effective_name = root_label_replacement
+                elif collapse_label:
+                    effective_name = collapse_label
+                else:
+                    effective_name = "[0]"
+                
+                print(f"{prefix}{effective_name} → {type_info}")
+                
+                if isinstance(first_item, (dict, list)):
+                    print_dict_structure(first_item, indent + 1, name=effective_name, 
+                                       max_depth=max_depth, max_array_display=max_array_display,
+                                       collapse_levels=collapse_levels,
+                                       collapse_levels_labels=collapse_levels_labels,
+                                       current_path=path, _skip_type_line=True,
+                                       indent_size=indent_size)  # ADDED
+            else:
+                # NOT COLLAPSED
+                if not _skip_type_line:
+                    print(f"{prefix}{display_name} → list [{len(obj)} items]")
+                
+                print_dict_structure(obj[0], indent + 1, name="[0]", 
+                                   max_depth=max_depth, max_array_display=max_array_display,
+                                   collapse_levels=collapse_levels,
+                                   collapse_levels_labels=collapse_levels_labels,
+                                   current_path=path,
+                                   indent_size=indent_size)  # ADDED
+    
+    elif isinstance(obj, np.ndarray):
+        shape_str = "×".join(map(str, obj.shape))
+        if obj.ndim <= max_array_display:
+            print(f"{prefix}{display_name} → array[{shape_str}] <{obj.dtype}>")
+        else:
+            print(f"{prefix}{display_name} → array[{shape_str}] <{obj.dtype}> ({obj.ndim}D)")
+    
+    elif isinstance(obj, (int, np.integer)):
+        print(f"{prefix}{display_name} → int")
+    
+    elif isinstance(obj, (float, np.floating)):
+        print(f"{prefix}{display_name} → float")
+    
+    elif isinstance(obj, str):
+        max_len = 30
+        if len(obj) <= max_len:
+            print(f"{prefix}{display_name} → str: '{obj}'")
+        else:
+            print(f"{prefix}{display_name} → str[{len(obj)} chars]: '{obj[:max_len]}...'")
+    
+    elif isinstance(obj, bool):
+        print(f"{prefix}{display_name} → bool: {obj}")
+    
+    elif isinstance(obj, tuple):
+        print(f"{prefix}{display_name} → tuple[{len(obj)}]: {obj}")
+    
+    elif obj is None:
+        print(f"{prefix}{display_name} → None")
+    
+    else:
+        print(f"{prefix}{display_name} → {type(obj).__name__}")
+
+
+def list_collapse_presets():
+    """List all available collapse presets with descriptions."""
+    presets = {
+        'minimal': 'Collapse root level only → PARENT',
+        'compact': 'Collapse root, children, sides → PARENT, CHILD, PARENT_SIDE, CHILD_SIDE',
+        'interfaces': 'Collapse interface sides → PARENT_SIDE, CHILD_SIDE',
+        'hierarchy': 'Collapse all repetitive structures with labels',
+        'sides_only': 'Collapse parent_side and child_side → PARENT_SIDE, CHILD_SIDE',
+        'all_lists': 'Collapse all list structures → PARENT, CHILD',
+    }
+    
+    print("\nAvailable collapse presets:")
+    print("=" * 70)
+    for preset, description in presets.items():
+        print(f"  '{preset}'")
+        print(f"      {description}")
+    print("=" * 70)
 
 #Pixels clustering utilities
 
@@ -161,147 +772,9 @@ def reduce_to_fundzone_slow(M, symops):
                 best = s @ M[i]
         M_reduced[i] = best
     return M_reduced
-@njit
-def find_best_symmetric_quat(q, q_ref, symops, max_iter=10, tol=1e-6):
-    q_best = q.copy()
-    M_best = quat_to_mat(q_best)
-    min_ang = quat_misori_deg(q_best, q_ref)
-
-    for _ in range(max_iter):
-        improved = False
-        for s in range(symops.shape[0]):
-            q_sym = quat_mult(mat_to_quat(symops[s]), q)
-            q_sym /= np.linalg.norm(q_sym)
-            ang = quat_misori_deg(q_sym, q_ref)
-            if ang + tol < min_ang:
-                min_ang = ang
-                q_best = q_sym.copy()
-                M_best = quat_to_mat(q_best)
-                improved = True
-        if not improved:
-            break
-    return q_best, M_best, min_ang
 
 
-# --- Numba-compatible average orientation ---
-def average_orientations_numba(M, labels, symops, max_iter=10, tol=1e-6):
-    N = M.shape[0]
-    unique_labels = np.unique(labels)
-    
-    avg_q_dict = {}
-    avg_M_dict = {}
-    M_best_dict = {}  # new: stores all best-symmetric matrices per cluster
 
-    for i in range(unique_labels.shape[0]):
-        lab = unique_labels[i]
-        if lab == 0: 
-            continue
-
-        # collect indices of current cluster
-        idxs = np.where(labels == lab)[0]
-        n_pix = idxs.shape[0]
-
-        # reference quaternion = first in cluster
-        q_ref = mat_to_quat(M[idxs[0]])
-        #q_ref = mat_to_quat(np.eye(3))
-        
-
-        # store best-symmetric matrices for this cluster
-        M_best_cluster = np.zeros((n_pix,3,3))
-        q_sum = np.zeros(4)
-
-        for j in range(n_pix):
-            q_best, M_best, _ = find_best_symmetric_quat(mat_to_quat(M[idxs[j]]), q_ref, symops, max_iter, tol)
-            if np.dot(q_best, q_ref) < 0:
-                q_best *= -1.0
-            q_sum += q_best
-            M_best_cluster[j] = M_best
-
-        # average quaternion
-        q_mean = q_sum / np.linalg.norm(q_sum)
-        M_mean = quat_to_mat(q_mean)
-
-        avg_q_dict[lab] = q_mean
-        avg_M_dict[lab] = M_mean
-        M_best_dict[lab] = M_best_cluster
-
-    return avg_M_dict, avg_q_dict, M_best_dict
-
-def find_best_symmetric_oris(avg_M_dict, label_ref, symops, max_iter=10, tol=1e-6):
-    if type(symops)==list:
-        symops = np.array(symops)
-    M_best_dict = {}  # new: stores all best-symmetric matrices per cluster
-
-    q_ref = mat_to_quat(avg_M_dict[label_ref])
-
-    for lab in avg_M_dict.keys():
-
-        q_best, M_best, _ = find_best_symmetric_quat(mat_to_quat(avg_M_dict[lab]), q_ref, symops, max_iter, tol)
-        M_best_dict[lab] = M_best
-
-    return M_best_dict
-
-# --- Numba-compatible average orientation ---
-def average_orientations_numba_withref(M, labels, symops, labref=None, max_iter=10, tol=1e-6):
-    ##Not working!!!!!!!!!!!!!!!!!!!!!!
-    N = M.shape[0]
-    avg_q_dict = {}
-    avg_M_dict = {}
-    M_best_dict = {}  # new: stores all best-symmetric matrices per cluster
-    unique_labels = np.unique(labels[labels>0])
-    if labref is None:
-        #find largest subgrain
-        numpx = []
-        for lab in np.unique(labels[labels>0]):
-            numpx.append((np.where(labels==lab)[0].shape[0]))
-        idx=np.argmax(numpx)
-        lab = np.unique(labels[labels>0])[idx]
-        labmax = np.unique(labels[labels>0])[idx]
-        labref = labmax
-    else:
-        lab = labref
-        labmax = labref
-    # collect indices of current cluster
-    idxs = np.where(labels == lab)[0]
-    
-    # reference quaternion = first in cluster
-    q_ref = mat_to_quat(M[idxs[0]])
-    
-    avg_q_dict = {}
-    avg_M_dict = {}
-    M_best_dict = {}  # new: stores all best-symmetric matrices per cluster
-
-    for i in range(unique_labels.shape[0]):
-        lab = unique_labels[i]
-        if lab == 0: 
-            continue
-
-        # collect indices of current cluster
-        idxs = np.where(labels == lab)[0]
-        n_pix = idxs.shape[0]
-
-                
-
-        # store best-symmetric matrices for this cluster
-        M_best_cluster = np.zeros((n_pix,3,3))
-        q_sum = np.zeros(4)
-
-        for j in range(n_pix):
-            q_best, M_best, _ = find_best_symmetric_quat(mat_to_quat(M[idxs[j]]), q_ref, symops, max_iter, tol)
-            if np.dot(q_best, q_ref) < 0:
-                q_best *= -1.0
-            q_sum += q_best
-            M_best_cluster[j] = M_best
-
-        # average quaternion
-        q_mean = q_sum / np.linalg.norm(q_sum)
-        M_mean = quat_to_mat(q_mean)
-
-        avg_q_dict[lab] = q_mean
-        avg_M_dict[lab] = M_mean
-        M_best_dict[lab] = M_best_cluster
-
-    return avg_M_dict, avg_q_dict, M_best_dict,labref
 
 
 
@@ -1783,6 +2256,7 @@ class EBSDData(getPhases):
         self._phase_2d = None
         self._neighbors = None
         self._inside_mask = None
+        self._coord_to_idx = None  # NEW: Coordinate to index mapping
         
     def setAttributes(self,**kwargs):    
         """
@@ -2090,13 +2564,18 @@ class EBSDData(getPhases):
             
             labels_2d = np.zeros((ny, nx), dtype=np.int32)
             phase_2d = np.zeros((ny, nx), dtype=np.int32)
-            
+            # NEW: Create coordinate to original index mapping
+            coord_to_idx = {}
+            for i in range(self.N):
+                coord_to_idx[(self.X[i], self.Y[i])] = i
+
             self._grid_2d = {
                 'xs': xs, 'ys': ys,
                 'labels_2d': labels_2d,
                 'phase_2d': phase_2d,
                 'x_map': x_map, 'y_map': y_map,
-                'shape': (ny, nx)
+                'shape': (ny, nx),
+                'coord_to_idx': coord_to_idx  # NEW
                 }
             
         return self._grid_2d
@@ -2585,6 +3064,41 @@ class EBSDData(getPhases):
         else:
             index = i * self._ebsdData.ncols + j
         return index
+    def get_coord_to_idx_map(self):
+        """
+        Get coordinate to index mapping.
+        
+        Returns
+        -------
+        coord_to_idx : dict
+            Mapping {(x, y): i} from coordinates to original array indices
+        """
+        grid = self.get_grid_2d()
+        return grid['coord_to_idx']
+    
+    def coords_to_indices(self, coords):
+        """
+        Convert array of coordinates to original array indices.
+        
+        Parameters
+        ----------
+        coords : array (M, 2)
+            Array of (x, y) coordinates
+        
+        Returns
+        -------
+        indices : array (M,)
+            Original array indices. -1 if coordinate not found.
+        """
+        coord_to_idx = self.get_coord_to_idx_map()
+        indices = np.empty(len(coords), dtype=np.int32)
+        
+        for i, (x, y) in enumerate(coords):
+            # Convert to same dtype as stored coordinates
+            key = (float(x), float(y))
+            indices[i] = coord_to_idx.get(key, -1)
+        
+        return indices
 
 class selectROI(object):
     """Select indices from a matplotlib collection using `PolygonSelector`.
@@ -2634,6 +3148,7 @@ class selectROI(object):
     def disconnect(self):
         self.poly.disconnect_events()
         self.canvas.draw_idle()
+
         
 class EBSDSubset:
     """
@@ -3110,6 +3625,22 @@ class ClusteringResult:
         self.get_phase_labels()
         #self.getColors()
         self.getAvgOri()
+        # ========== NEW: Cached morphological properties ==========
+        self._cluster_areas = None
+        self._cluster_perimeters = None
+        self._cluster_equivalent_diameters = None
+        self._cluster_sphericities = None
+        # ==========================================================
+        # Detect grid type from EBSD data
+        if hasattr(data, '_ebsdData') and hasattr(data._ebsdData, 'grid'):
+            grid_type = data._ebsdData.grid.lower()
+            self.is_hexagonal = (grid_type == 'hexgrid')
+            self.grid_type = grid_type
+        else:
+            self.is_hexagonal = False
+            self.grid_type = 'sqrgrid'
+        # ==========================================================
+
     @property
     def n_clusters(self):
         return len(self.get_unique_clusters())
@@ -3266,6 +3797,14 @@ class ClusteringResult:
         new_result._cluster_sizes = None
         new_result._cluster_phases_id = None  # Need to recompute after filtering
         new_result._com = None  # Need to recompute after filtering
+
+        # ========== NEW: Invalidate morphological properties ==========
+        new_result._cluster_areas = None
+        new_result._cluster_perimeters = None
+        new_result._cluster_equivalent_diameters = None
+        new_result._cluster_sphericities = None
+        # ==============================================================
+
         return new_result
     
     def update_grid_2d(self):
@@ -3280,7 +3819,7 @@ class ClusteringResult:
                 grid['labels_2d'][j, k] = self.labels[i]
                 grid['phase_2d'][j, k] = self.data.phases_id[i]
     # --- Numba-compatible average orientation ---
-    def average_orientations(self, phase, max_iter=10, tol=1e-6):
+    def average_orientations(self, phase, ref_idx=0, max_iter=10, tol=1e-6,q_ref=None):
         N = self.data.quaternions.shape[0]
         unique_labels = self.labels_by_phase[phase]
         symops = np.array(self.data.phases[phase]['symops'])
@@ -3297,26 +3836,27 @@ class ClusteringResult:
 
             # collect indices of current cluster
             idxs = np.where(self.labels == lab)[0]
-            n_pix = idxs.shape[0]
+            q_mean,M_mean,M_best_cluster,q_best_cluster= get_avg_orientations(self.data.quaternions[idxs], symops, ref_idx=ref_idx, max_iter=max_iter, tol=tol,q_ref=q_ref)
+            #n_pix = idxs.shape[0]
 
-            # reference quaternion = first in cluster
-            q_ref = self.data.quaternions[idxs[0]]#mat_to_quat(M[idxs[0]])
-            #q_ref = mat_to_quat(np.eye(3))
+            ## reference quaternion = first in cluster
+            #q_ref = self.data.quaternions[idxs[0]]#mat_to_quat(M[idxs[0]])
+            ##q_ref = mat_to_quat(np.eye(3))
             
+            
+            ## store best-symmetric matrices for this cluster
+            #M_best_cluster = np.zeros((n_pix,3,3))
+            #q_sum = np.zeros(4)
 
-            # store best-symmetric matrices for this cluster
-            M_best_cluster = np.zeros((n_pix,3,3))
-            q_sum = np.zeros(4)
+            #for j in range(n_pix):
+            #    q_best, M_best, _ = find_best_symmetric_quat(self.data.quaternions[idxs[j]], q_ref, symops, max_iter, tol)
+            #    if np.dot(q_best, q_ref) < 0:
+            #        q_best *= -1.0
+            #    q_sum += q_best
+            #    M_best_cluster[j] = M_best
 
-            for j in range(n_pix):
-                q_best, M_best, _ = find_best_symmetric_quat(self.data.quaternions[idxs[j]], q_ref, symops, max_iter, tol)
-                if np.dot(q_best, q_ref) < 0:
-                    q_best *= -1.0
-                q_sum += q_best
-                M_best_cluster[j] = M_best
-
-            # average quaternion
-            q_mean = q_sum / np.linalg.norm(q_sum)
+            ## average quaternion
+            #q_mean = q_sum / np.linalg.norm(q_sum)
             M_mean = quat_to_mat(q_mean)
 
             avg_q_dict[lab] = q_mean
@@ -3324,8 +3864,2344 @@ class ClusteringResult:
             M_best_dict[lab] = M_best_cluster
 
         return avg_M_dict, avg_q_dict, M_best_dict
+    # ============================================================================
+    # MORPHOLOGICAL ANALYSIS METHODS
+    # ============================================================================
+
+    
+    def get_cluster_areas(self, pixel_size=None, use_hexagonal=None, units='pixels'):
+        """
+        Get area of each cluster.
+        
+        Parameters
+        ----------
+        pixel_size : float, optional
+            Size of one pixel in physical units (e.g., micrometers).
+            For square grids only. Ignored if use_hexagonal=True.
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData for hexagonal grid.
+            If None, automatically detected from data._ebsdData.grid.
+        units : str, optional
+            Unit string for the measurement (e.g., 'μm', 'nm').
+            Default is 'pixels'.
+        
+        Returns
+        -------
+        cluster_areas : dict
+            Dictionary {cluster_label: area}
+        """
+        # Determine if using hexagonal grid
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        # Calculate area per pixel
+        if use_hexagonal:
+            if not hasattr(self.data, '_ebsdData'):
+                raise ValueError("Hexagonal grid requested but data._ebsdData not found")
+            if not hasattr(self.data._ebsdData, 'dx') or not hasattr(self.data._ebsdData, 'dy'):
+                raise ValueError("Hexagonal grid requested but data._ebsdData.dx and dy not found")
+            
+            dx = self.data._ebsdData.dx
+            dy = self.data._ebsdData.dy
+            # Area per hexagonal pixel (standard formula for hexagonal grid)
+            area_per_pixel = dx * dy * np.sqrt(3) / 2
+            area_label = f"{units}"
+        elif pixel_size is not None:
+            # Square grid with physical units
+            area_per_pixel = pixel_size ** 2
+            area_label = f"{units}²"
+        else:
+            # Square grid in pixels
+            area_per_pixel = 1.0
+            area_label = "pixels"
+        
+        if self._cluster_areas is None or pixel_size is not None or use_hexagonal:
+            clusters = self.get_unique_clusters()
+            cluster_areas = {}
+            
+            for c in clusters:
+                n_pixels = np.sum(self.labels == c)
+                area = n_pixels * area_per_pixel
+                cluster_areas[c] = area
+            
+            # Cache only if using default settings
+            if pixel_size is None and not use_hexagonal:
+                self._cluster_areas = cluster_areas
+            
+            return cluster_areas
+        
+        return self._cluster_areas
+    
+    def get_cluster_perimeters_from_boundaries(self, boundary_result, pixel_size=None, 
+                                          use_hexagonal=None, boundary_type='all',
+                                          warn_zero_perimeter=True):
+        """
+        Get perimeter of each cluster using actual boundary coordinates.
+        
+        This is more accurate than edge counting as it uses the actual
+        detected boundaries from boundary analysis.
+        
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids)
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        boundary_type : str, optional
+            Type of boundaries to count:
+            - 'all': All boundaries including ROI (default)
+            - 'same_phase': Only boundaries with same-phase neighbors (excludes ROI and inter-phase)
+            - 'exclude_interphase': ROI + same-phase boundaries (excludes inter-phase)
+            - 'interphase_only': Only inter-phase boundaries (excludes ROI and same-phase)
+        warn_zero_perimeter : bool, optional
+            If True, prints warning when clusters have zero perimeter. Default is True.
+        
+        Returns
+        -------
+        cluster_perimeters : dict
+            Dictionary {cluster_label: perimeter}
+        """
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        # Validate boundary_type
+        valid_types = ['all', 'same_phase', 'exclude_interphase', 'interphase_only']
+        if boundary_type not in valid_types:
+            raise ValueError(f"boundary_type must be one of {valid_types}")
+        
+        # Calculate edge length
+        if use_hexagonal:
+            dx = self.data._ebsdData.dx
+            dy = self.data._ebsdData.dy
+            edge_length = (dx + dy) / 2
+        elif pixel_size is not None:
+            edge_length = pixel_size
+        else:
+            edge_length = 1.0
+        
+        cluster_perimeters = {}
+        zero_perimeter_clusters = []
+        
+        # Iterate through all clusters in boundary result
+        for i, cluster_id in enumerate(boundary_result.clusters):
+            cluster_phase_id = boundary_result.cluster_phases_id[i]
+            
+            # Get all boundaries for this cluster
+            boundaries = boundary_result.grouped_boundaries[i]
+            boundary_phases = boundary_result.grouped_boundary_phases_id[i]
+            
+            # Sum up boundary lengths based on boundary_type
+            total_boundary_pixels = 0
+            
+            for neighbor_id, coords in boundaries.items():
+                count_this_boundary = False
+                
+                if neighbor_id == -1:
+                    # ROI boundary
+                    if boundary_type in ['all', 'exclude_interphase']:
+                        count_this_boundary = True
+                else:
+                    # Cluster-to-cluster boundary
+                    neighbor_phase_id = boundary_phases[neighbor_id]
+                    is_same_phase = (neighbor_phase_id == cluster_phase_id)
+                    
+                    if boundary_type == 'all':
+                        count_this_boundary = True
+                    elif boundary_type == 'same_phase':
+                        count_this_boundary = is_same_phase
+                    elif boundary_type == 'exclude_interphase':
+                        count_this_boundary = is_same_phase
+                    elif boundary_type == 'interphase_only':
+                        count_this_boundary = not is_same_phase
+                
+                if count_this_boundary:
+                    total_boundary_pixels += len(coords)
+            
+            # Convert to actual length
+            perimeter = total_boundary_pixels * edge_length
+            cluster_perimeters[cluster_id] = perimeter
+            
+            # Track zero perimeter clusters
+            if perimeter == 0 and boundary_type != 'all':
+                zero_perimeter_clusters.append(cluster_id)
+        
+        # Warn about zero perimeter clusters
+        if warn_zero_perimeter and len(zero_perimeter_clusters) > 0:
+            print(f"\nWARNING: {len(zero_perimeter_clusters)} clusters have zero perimeter with boundary_type='{boundary_type}'")
+            if boundary_type == 'same_phase':
+                print(f"These clusters have no same-phase neighbors (surrounded by different phases).")
+            elif boundary_type == 'exclude_interphase':
+                print(f"These clusters are completely surrounded by different phases with no ROI contact.")
+            elif boundary_type == 'interphase_only':
+                print(f"These clusters have no inter-phase boundaries (surrounded by same phase).")
+            
+            if len(zero_perimeter_clusters) <= 10:
+                print(f"  Cluster IDs: {zero_perimeter_clusters}")
+            else:
+                print(f"  Cluster IDs: {zero_perimeter_clusters[:10]}... (and {len(zero_perimeter_clusters)-10} more)")
+            print(f"Consider using boundary_type='all' or filtering these clusters.\n")
+        
+        return cluster_perimeters
+    
+    
+    def get_cluster_perimeters(self, pixel_size=None, use_hexagonal=None, 
+                            boundary_type='all', warn_zero_perimeter=True):
+        """
+        Get perimeter of each cluster.
+        
+        Perimeter is calculated by counting exposed edges (not boundary pixels).
+        For each pixel in a cluster, we count how many of its edges border
+        non-cluster pixels or the ROI boundary.
+        
+        Parameters
+        ----------
+        pixel_size : float, optional
+            Size of one pixel in physical units.
+            For square grids only. Ignored if use_hexagonal=True.
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+            If None, automatically detected from data._ebsdData.grid.
+        boundary_type : str, optional
+            Type of boundaries to count:
+            - 'all': All boundaries (default)
+            - 'same_phase': Only boundaries with same-phase neighbors
+            - 'exclude_interphase': All boundaries except inter-phase boundaries
+            - 'interphase_only': Only inter-phase boundaries
+        warn_zero_perimeter : bool, optional
+            If True, prints warning when clusters have zero perimeter. Default is True.
+        
+        Returns
+        -------
+        cluster_perimeters : dict
+            Dictionary {cluster_label: perimeter}
+        """
+        # Determine if using hexagonal grid
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        # Validate boundary_type
+        valid_types = ['all', 'same_phase', 'exclude_interphase', 'interphase_only']
+        if boundary_type not in valid_types:
+            raise ValueError(f"boundary_type must be one of {valid_types}")
+        
+        # Calculate edge length
+        if use_hexagonal:
+            if not hasattr(self.data, '_ebsdData'):
+                raise ValueError("Hexagonal grid requested but data._ebsdData not found")
+            if not hasattr(self.data._ebsdData, 'dx') or not hasattr(self.data._ebsdData, 'dy'):
+                raise ValueError("Hexagonal grid requested but data._ebsdData.dx and dy not found")
+            
+            dx = self.data._ebsdData.dx
+            dy = self.data._ebsdData.dy
+            edge_length = (dx + dy) / 2
+        elif pixel_size is not None:
+            edge_length = pixel_size
+        else:
+            edge_length = 1.0
+        
+        # Need 2D grid to calculate perimeter
+        grid = self.data.get_grid_2d()
+        labels_2d = grid['labels_2d']
+        inside_mask = self.data.get_inside_mask2d()
+        
+        # Update grid with current labels
+        self.update_grid_2d()
+        
+        clusters = self.get_unique_clusters()
+        cluster_perimeters = {}
+        
+        # Create phase map for quick lookup
+        phase_2d = np.zeros_like(labels_2d)
+        for i in range(self.data.N):
+            j, k = grid['y_map'][self.data.Y[i]], grid['x_map'][self.data.X[i]]
+            if inside_mask[j, k]:
+                phase_2d[j, k] = self.data.phases_id[i]
+        
+        # Define 4-connectivity neighborhood (orthogonal only)
+        dy_array = np.array([-1, 0, 1, 0], dtype=np.int32)
+        dx_array = np.array([0, 1, 0, -1], dtype=np.int32)
+        
+        ny, nx = labels_2d.shape
+        
+        zero_perimeter_clusters = []
+        
+        for c in clusters:
+            edge_count = 0
+            cluster_phase = self.cluster_phases_id[c]
+            
+            # Find all pixels in this cluster
+            cluster_mask = labels_2d == c
+            ys, xs = np.where(cluster_mask)
+            
+            for y, x in zip(ys, xs):
+                # Count how many edges of this pixel should be counted
+                for n in range(4):  # Check all 4 orthogonal neighbors
+                    yy = y + dy_array[n]
+                    xx = x + dx_array[n]
+                    
+                    count_this_edge = False
+                    
+                    if yy < 0 or yy >= ny or xx < 0 or xx >= nx:
+                        # Out of bounds
+                        if boundary_type in ['all', 'exclude_interphase']:
+                            count_this_edge = True
+                    elif not inside_mask[yy, xx]:
+                        # Outside ROI
+                        if boundary_type in ['all', 'exclude_interphase']:
+                            count_this_edge = True
+                    elif labels_2d[yy, xx] != c:
+                        # Different cluster - check phase
+                        neighbor_phase = phase_2d[yy, xx]
+                        is_same_phase = (neighbor_phase == cluster_phase)
+                        
+                        if boundary_type == 'all':
+                            count_this_edge = True
+                        elif boundary_type == 'same_phase':
+                            count_this_edge = is_same_phase
+                        elif boundary_type == 'exclude_interphase':
+                            count_this_edge = is_same_phase
+                        elif boundary_type == 'interphase_only':
+                            count_this_edge = not is_same_phase
+                    
+                    if count_this_edge:
+                        edge_count += 1
+            
+            perimeter = edge_count * edge_length
+            cluster_perimeters[c] = perimeter
+            
+            # Track zero perimeter clusters
+            if perimeter == 0 and boundary_type != 'all':
+                zero_perimeter_clusters.append(c)
+        
+        # Warn about zero perimeter clusters
+        if warn_zero_perimeter and len(zero_perimeter_clusters) > 0:
+            print(f"\nWARNING: {len(zero_perimeter_clusters)} clusters have zero perimeter with boundary_type='{boundary_type}'")
+            if boundary_type == 'same_phase':
+                print(f"These clusters have no same-phase neighbors (surrounded by different phases).")
+            elif boundary_type == 'exclude_interphase':
+                print(f"These clusters are completely surrounded by different phases with no ROI contact.")
+            elif boundary_type == 'interphase_only':
+                print(f"These clusters have no inter-phase boundaries (surrounded by same phase).")
+            
+            if len(zero_perimeter_clusters) <= 10:
+                print(f"  Cluster IDs: {zero_perimeter_clusters}")
+            else:
+                print(f"  Cluster IDs: {zero_perimeter_clusters[:10]}... (and {len(zero_perimeter_clusters)-10} more)")
+            print(f"Consider using boundary_type='all' or filtering these clusters.\n")
+        
+        return cluster_perimeters
+    
+    def get_cluster_equivalent_diameters(self, pixel_size=None, use_hexagonal=None):
+        """
+        Get equivalent diameter of each cluster.
+        
+        Equivalent diameter is the diameter of a circle with the same area.
+        Formula: d_eq = 2 * sqrt(Area / π)
+        
+        Parameters
+        ----------
+        pixel_size : float, optional
+            Size of one pixel in physical units.
+            For square grids only. Ignored if use_hexagonal=True.
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+            If None, automatically detected from data._ebsdData.grid.
+        
+        Returns
+        -------
+        cluster_equivalent_diameters : dict
+            Dictionary {cluster_label: equivalent_diameter}
+        """
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        if self._cluster_equivalent_diameters is None or pixel_size is not None or use_hexagonal:
+            areas = self.get_cluster_areas(pixel_size=pixel_size, use_hexagonal=use_hexagonal)
+            
+            cluster_equivalent_diameters = {}
+            for c, area in areas.items():
+                d_eq = 2 * np.sqrt(area / np.pi)
+                cluster_equivalent_diameters[c] = d_eq
+            
+            # Cache only if using default settings
+            if pixel_size is None and not use_hexagonal:
+                self._cluster_equivalent_diameters = cluster_equivalent_diameters
+            
+            return cluster_equivalent_diameters
+        
+        return self._cluster_equivalent_diameters
+    
+    def get_cluster_sphericities(self, pixel_size=None, use_hexagonal=None, 
+                                boundary_result=None, boundary_type='all'):
+        """
+        Get sphericity (circularity) of each cluster.
+        
+        Sphericity is a measure of how circular a cluster is.
+        Formula: sphericity = 4π × Area / Perimeter²
+        
+        Values range from 0 to 1:
+        - 1.0 = perfect circle
+        - < 1.0 = irregular shape
+        
+        Parameters
+        ----------
+        pixel_size : float, optional
+            Size of one pixel in physical units.
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        boundary_result : BoundaryResult, optional
+            If provided, uses actual boundary coordinates for more accurate perimeter.
+        boundary_type : str, optional
+            Type of boundaries to count: 'all', 'same_phase', 
+            'exclude_interphase', 'interphase_only'. Default is 'all'.
+        
+        Returns
+        -------
+        cluster_sphericities : dict
+            Dictionary {cluster_label: sphericity}
+            Note: Clusters with zero perimeter will have sphericity = 0.0
+        """
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        areas = self.get_cluster_areas(pixel_size=pixel_size, use_hexagonal=use_hexagonal)
+        
+        # Choose perimeter calculation method
+        if boundary_result is not None:
+            perimeters = self.get_cluster_perimeters_from_boundaries(
+                boundary_result, pixel_size=pixel_size, 
+                use_hexagonal=use_hexagonal, boundary_type=boundary_type,
+                warn_zero_perimeter=False  # Don't warn here, warn below
+            )
+        else:
+            perimeters = self.get_cluster_perimeters(
+                pixel_size=pixel_size, use_hexagonal=use_hexagonal,
+                boundary_type=boundary_type, warn_zero_perimeter=False
+            )
+        
+        cluster_sphericities = {}
+        zero_perimeter_count = 0
+        
+        for c in self.get_unique_clusters():
+            area = areas[c]
+            perimeter = perimeters[c]
+            
+            if perimeter > 0:
+                sphericity = 4 * np.pi * area / (perimeter ** 2)
+                sphericity = min(sphericity, 1.0)
+            else:
+                sphericity = 0.0
+                zero_perimeter_count += 1
+            
+            cluster_sphericities[c] = sphericity
+        
+        # Warning for zero perimeter clusters
+        if zero_perimeter_count > 0:
+            print(f"\nWARNING: {zero_perimeter_count} clusters have sphericity = 0 due to zero perimeter")
+            print(f"  (boundary_type='{boundary_type}')")
+            print(f"  These clusters will be excluded from sphericity statistics.\n")
+        
+        return cluster_sphericities
+
+
+    def get_cluster_morphology(self, cluster_id, pixel_size=None, use_hexagonal=None, 
+                            units='pixels', boundary_result=None, boundary_type='all'):
+        """
+        Get complete morphological information for a specific cluster.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids)
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        units : str, optional
+            Unit string for measurements
+        boundary_result : BoundaryResult, optional
+            If provided, uses actual boundary coordinates for perimeter.
+        boundary_type : str, optional
+            Type of boundaries to count: 'all', 'same_phase', 
+            'exclude_interphase', 'interphase_only'. Default is 'all'.
+        
+        Returns
+        -------
+        morphology : dict
+            Dictionary containing morphological properties
+        """
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        if cluster_id not in self.get_unique_clusters():
+            raise ValueError(f"Cluster {cluster_id} not found")
+        
+        areas = self.get_cluster_areas(pixel_size=pixel_size, use_hexagonal=use_hexagonal, units=units)
+        
+        if boundary_result is not None:
+            perimeters = self.get_cluster_perimeters_from_boundaries(
+                boundary_result, pixel_size=pixel_size, 
+                use_hexagonal=use_hexagonal, boundary_type=boundary_type,
+                warn_zero_perimeter=False
+            )
+        else:
+            perimeters = self.get_cluster_perimeters(
+                pixel_size=pixel_size, use_hexagonal=use_hexagonal,
+                boundary_type=boundary_type, warn_zero_perimeter=False
+            )
+        
+        equiv_diameters = self.get_cluster_equivalent_diameters(pixel_size=pixel_size, use_hexagonal=use_hexagonal)
+        sphericities = self.get_cluster_sphericities(
+            pixel_size=pixel_size, use_hexagonal=use_hexagonal,
+            boundary_result=boundary_result, boundary_type=boundary_type
+        )
+        
+        cluster_idx = np.where(self.get_unique_clusters() == cluster_id)[0][0]
+        phase_id = self.cluster_phases_id[cluster_id]
+        
+        return {
+            'cluster_id': cluster_id,
+            'n_pixels': self.cluster_sizes[cluster_id],
+            'area': areas[cluster_id],
+            'perimeter': perimeters[cluster_id],
+            'equivalent_diameter': equiv_diameters[cluster_id],
+            'sphericity': sphericities[cluster_id],
+            'center_of_mass': tuple(self.com[cluster_idx]),
+            'phase_id': phase_id,
+            'phase_name': self.data.phase_names[phase_id],
+            'grid_type': self.grid_type,
+            'units': units if (pixel_size is not None or use_hexagonal) else 'pixels',
+            'boundary_type': boundary_type
+        }
+
+
+    def get_all_cluster_morphologies(self, pixel_size=None, use_hexagonal=None, units='pixels',
+                                    boundary_result=None, boundary_type='all'):
+        """
+        Get morphological information for all clusters.
+        
+        Parameters
+        ----------
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids)
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        units : str, optional
+            Unit string for measurements
+        boundary_result : BoundaryResult, optional
+            If provided, uses actual boundary coordinates for perimeter.
+        boundary_type : str, optional
+            Type of boundaries to count: 'all', 'same_phase', 
+            'exclude_interphase', 'interphase_only'. Default is 'all'.
+        
+        Returns
+        -------
+        morphologies : list of dict
+            List of morphology dictionaries, one per cluster
+        """
+        return [
+            self.get_cluster_morphology(c, pixel_size=pixel_size, 
+                                    use_hexagonal=use_hexagonal, units=units,
+                                    boundary_result=boundary_result,
+                                    boundary_type=boundary_type)
+            for c in self.get_unique_clusters()
+        ]
+
+
+    def print_cluster_morphology(self, cluster_id, pixel_size=None, use_hexagonal=None, 
+                                units='μm', boundary_result=None, boundary_type='all'):
+        """
+        Print detailed morphological information for a specific cluster.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label to print
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids)
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        units : str, optional
+            Unit string for measurements. Default is 'μm'.
+        boundary_result : BoundaryResult, optional
+            If provided, uses actual boundary coordinates for perimeter.
+        boundary_type : str, optional
+            Type of boundaries to count: 'all', 'same_phase', 
+            'exclude_interphase', 'interphase_only'. Default is 'all'.
+        """
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        # Get morphology data
+        morph = self.get_cluster_morphology(
+            cluster_id, 
+            pixel_size=pixel_size, 
+            use_hexagonal=use_hexagonal, 
+            units=units,
+            boundary_result=boundary_result,
+            boundary_type=boundary_type
+        )
+        
+        # Determine area units
+        if use_hexagonal:
+            dx = self.data._ebsdData.dx
+            dy = self.data._ebsdData.dy
+            area_units = f"{units}"
+            grid_info = f"Hexagonal grid (dx={dx}, dy={dy})"
+        elif pixel_size is not None:
+            area_units = f"{units}²"
+            grid_info = f"Square grid (pixel size={pixel_size} {units})"
+        else:
+            area_units = "pixels"
+            units = "pixels"
+            grid_info = "Square grid (pixel units)"
+        
+        # Describe boundary type
+        boundary_desc = {
+            'all': 'All boundaries (ROI + same-phase + inter-phase)',
+            'same_phase': 'Same-phase only (intra-phase grain boundaries)',
+            'exclude_interphase': 'ROI + same-phase (excludes inter-phase)',
+            'interphase_only': 'Inter-phase only'
+        }
+        
+        # Print formatted output
+        print(f"\n{'='*70}")
+        print(f"Cluster {morph['cluster_id']} - Morphological Analysis")
+        print(f"{'='*70}")
+        
+        print(f"\nBasic Information:")
+        print(f"  Phase:             {morph['phase_name']} (ID: {morph['phase_id']})")
+        print(f"  Grid type:         {morph['grid_type']}")
+        print(f"  Measurement:       {grid_info}")
+        print(f"  Boundary type:     {boundary_desc[boundary_type]}")
+        if boundary_result is not None:
+            print(f"  Perimeter method:  Boundary-based (accurate)")
+        else:
+            print(f"  Perimeter method:  Edge-counting")
+        
+        print(f"\nSize Metrics:")
+        print(f"  Number of pixels:  {morph['n_pixels']}")
+        print(f"  Area:              {morph['area']:.2f} {area_units}")
+        
+        if morph['perimeter'] > 0:
+            print(f"  Perimeter:         {morph['perimeter']:.2f} {units}")
+        else:
+            print(f"  Perimeter:         {morph['perimeter']:.2f} {units} [ZERO - see warnings]")
+        
+        print(f"\nShape Metrics:")
+        print(f"  Equiv. diameter:   {morph['equivalent_diameter']:.2f} {units}")
+        
+        if morph['sphericity'] > 0:
+            print(f"  Sphericity:        {morph['sphericity']:.4f} (0=irregular, 1=circular)")
+            
+            # Interpret sphericity
+            if morph['sphericity'] > 0.9:
+                shape_desc = "nearly circular"
+            elif morph['sphericity'] > 0.7:
+                shape_desc = "fairly circular"
+            elif morph['sphericity'] > 0.5:
+                shape_desc = "moderately irregular"
+            else:
+                shape_desc = "highly irregular"
+            print(f"  Shape:             {shape_desc}")
+        else:
+            print(f"  Sphericity:        {morph['sphericity']:.4f} [ZERO - no valid perimeter]")
+            print(f"  Shape:             Cannot determine (zero perimeter)")
+        
+        print(f"\nLocation:")
+        print(f"  Center of mass:    ({morph['center_of_mass'][0]:.2f}, {morph['center_of_mass'][1]:.2f})")
+        
+        print(f"{'='*70}\n")
+        
+        return morph
+
+
+    def print_cluster_morphology_summary(self, pixel_size=None, use_hexagonal=None, units='μm',
+                                        boundary_result=None, boundary_type='all',
+                                        sort_by='area', ascending=False, 
+                                        max_clusters=None, exclude_zero_perimeter=False):
+        """
+        Print formatted summary of cluster morphologies.
+        
+        Parameters
+        ----------
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids)
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        units : str, optional
+            Unit string for measurements
+        boundary_result : BoundaryResult, optional
+            If provided, uses actual boundary coordinates for perimeter.
+        boundary_type : str, optional
+            Type of boundaries to count: 'all', 'same_phase', 
+            'exclude_interphase', 'interphase_only'. Default is 'all'.
+        sort_by : str, optional
+            Sort by: 'area', 'perimeter', 'equivalent_diameter', 'sphericity', 'cluster_id'
+            Default is 'area'
+        ascending : bool, optional
+            Sort in ascending order. Default is False (descending).
+        max_clusters : int, optional
+            Maximum number of clusters to print. If None, prints all.
+        exclude_zero_perimeter : bool, optional
+            If True, excludes clusters with zero perimeter from the summary.
+            Default is False.
+        """
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        morphologies = self.get_all_cluster_morphologies(
+            pixel_size=pixel_size, use_hexagonal=use_hexagonal, units=units,
+            boundary_result=boundary_result, boundary_type=boundary_type
+        )
+        
+        # Filter out zero perimeter if requested
+        if exclude_zero_perimeter:
+            original_count = len(morphologies)
+            morphologies = [m for m in morphologies if m['perimeter'] > 0]
+            excluded_count = original_count - len(morphologies)
+            if excluded_count > 0:
+                print(f"\nNote: Excluded {excluded_count} clusters with zero perimeter from summary.")
+        
+        if len(morphologies) == 0:
+            print("\nNo clusters to display (all have zero perimeter).")
+            return
+        
+        # Sort
+        if sort_by in ['area', 'perimeter', 'equivalent_diameter', 'sphericity', 'n_pixels']:
+            morphologies.sort(key=lambda x: x[sort_by], reverse=not ascending)
+        elif sort_by == 'cluster_id':
+            morphologies.sort(key=lambda x: x['cluster_id'], reverse=not ascending)
+        
+        # Print header
+        print(f"\n{'='*110}")
+        print(f"Cluster Morphology Summary (sorted by {sort_by}, {'ascending' if ascending else 'descending'})")
+        print(f"{'='*110}")
+        
+        grid_type = morphologies[0]['grid_type'] if morphologies else self.grid_type
+        print(f"Grid type: {grid_type}")
+        
+        if use_hexagonal:
+            dx = self.data._ebsdData.dx
+            dy = self.data._ebsdData.dy
+            print(f"Hexagonal grid: dx={dx}, dy={dy}")
+            area_units = f"{units}"
+        elif pixel_size is not None:
+            print(f"Pixel size: {pixel_size} {units}")
+            area_units = f"{units}²"
+        else:
+            area_units = "pixels"
+            units = "pixels"
+        
+        boundary_desc = {
+            'all': 'All boundaries',
+            'same_phase': 'Same-phase only',
+            'exclude_interphase': 'Excludes inter-phase',
+            'interphase_only': 'Inter-phase only'
+        }
+        print(f"Boundary type: {boundary_desc[boundary_type]}")
+        
+        if boundary_result is not None:
+            print(f"Perimeter method: Boundary-based (accurate)")
+        else:
+            print(f"Perimeter method: Edge-counting")
+        
+        # Column headers
+        print(f"\n{'ID':>6} {'Phase':>8} {'Pixels':>8} {'Area':>12} {'Perimeter':>12} "
+            f"{'Equiv.Diam':>12} {'Sphericity':>12}")
+        print(f"{'':>6} {'':>8} {'':>8} {f'({area_units})':>12} {f'({units})':>12} "
+            f"{f'({units})':>12} {'(0-1)':>12}")
+        print(f"{'-'*110}")
+        
+        # Print clusters
+        n_to_print = len(morphologies) if max_clusters is None else min(max_clusters, len(morphologies))
+        
+        for i, morph in enumerate(morphologies[:n_to_print]):
+            phase_name = self.data.phase_names[morph['phase_id']]
+            
+            # Mark zero perimeter clusters
+            perim_str = f"{morph['perimeter']:>12.2f}"
+            if morph['perimeter'] == 0:
+                perim_str = f"{morph['perimeter']:>11.2f}*"
+            
+            sph_str = f"{morph['sphericity']:>12.4f}"
+            if morph['sphericity'] == 0:
+                sph_str = f"{morph['sphericity']:>11.4f}*"
+            
+            print(f"{morph['cluster_id']:>6} {phase_name:>8} {morph['n_pixels']:>8} "
+                f"{morph['area']:>12.2f} {perim_str} "
+                f"{morph['equivalent_diameter']:>12.2f} {sph_str}")
+        
+        if max_clusters is not None and len(morphologies) > max_clusters:
+            print(f"... and {len(morphologies) - max_clusters} more clusters")
+        
+        # Print statistics
+        print(f"\n{'-'*110}")
+        print(f"Summary Statistics:")
+        print(f"  Total clusters: {len(morphologies)}")
+        
+        areas = [m['area'] for m in morphologies]
+        perimeters = [m['perimeter'] for m in morphologies if m['perimeter'] > 0]
+        diameters = [m['equivalent_diameter'] for m in morphologies]
+        sphericities = [m['sphericity'] for m in morphologies if m['sphericity'] > 0]
+        
+        zero_perim_count = len([m for m in morphologies if m['perimeter'] == 0])
+        if zero_perim_count > 0:
+            print(f"  Clusters with zero perimeter: {zero_perim_count} (*marked in table)")
+        
+        print(f"  Area - Mean: {np.mean(areas):.2f}, Std: {np.std(areas):.2f}, "
+            f"Min: {np.min(areas):.2f}, Max: {np.max(areas):.2f} {area_units}")
+        
+        if len(perimeters) > 0:
+            print(f"  Perimeter - Mean: {np.mean(perimeters):.2f}, Std: {np.std(perimeters):.2f}, "
+                f"Min: {np.min(perimeters):.2f}, Max: {np.max(perimeters):.2f} {units}")
+        else:
+            print(f"  Perimeter - All clusters have zero perimeter!")
+        
+        print(f"  Equiv. Diameter - Mean: {np.mean(diameters):.2f}, Std: {np.std(diameters):.2f}, "
+            f"Min: {np.min(diameters):.2f}, Max: {np.max(diameters):.2f} {units}")
+        
+        if len(sphericities) > 0:
+            print(f"  Sphericity - Mean: {np.mean(sphericities):.4f}, Std: {np.std(sphericities):.4f}, "
+                f"Min: {np.min(sphericities):.4f}, Max: {np.max(sphericities):.4f} (n={len(sphericities)})")
+        else:
+            print(f"  Sphericity - All clusters have zero sphericity!")
+        
+        print(f"{'='*110}\n")
+
+
+    def filter_by_sphericity(self, min_sphericity, pixel_size=None, use_hexagonal=None,
+                            boundary_result=None, boundary_type='all'):
+        """
+        Create new result with non-circular clusters removed.
+        
+        Parameters
+        ----------
+        min_sphericity : float
+            Minimum sphericity (0-1). Clusters below this are removed.
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids)
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData.
+        boundary_result : BoundaryResult, optional
+            If provided, uses actual boundary coordinates for perimeter.
+        boundary_type : str, optional
+            Type of boundaries to count: 'all', 'same_phase', 
+            'exclude_interphase', 'interphase_only'. Default is 'all'.
+        
+        Returns
+        -------
+        new_result : ClusteringResult
+            New result with filtered clusters
+        """
+        from copy import deepcopy
+        
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        sphericities = self.get_cluster_sphericities(
+            pixel_size=pixel_size, use_hexagonal=use_hexagonal,
+            boundary_result=boundary_result, boundary_type=boundary_type
+        )
+        
+        # Create new labels array
+        new_labels = self.labels.copy()
+        
+        for cluster_id, sphericity in sphericities.items():
+            if sphericity < min_sphericity:
+                new_labels[new_labels == cluster_id] = 0
+        
+        new_result = deepcopy(self)
+        new_result.labels = new_labels
+        
+        # Invalidate cached properties
+        new_result._clusters_unique = None
+        new_result._cluster_sizes = None
+        new_result._cluster_phases_id = None
+        new_result._com = None
+        new_result._cluster_areas = None
+        new_result._cluster_perimeters = None
+        new_result._cluster_equivalent_diameters = None
+        new_result._cluster_sphericities = None
+        
+        return new_result  
+
+    # ============================================================================
+    # LAMELLAR CLUSTER IDENTIFICATION METHODS
+    # ============================================================================
+
+    def analyze_cluster_elongation(self, cluster_id, use_sklearn=False, min_width_threshold=1.0,min_pixesl_threshold=3):
+        """
+        Analyze elongation and principal direction of a specific cluster.
+        
+        Uses PCA on all cluster pixels (not just boundary) to find the principal
+        axis and calculate aspect ratio.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+        use_sklearn : bool, optional
+            If True, uses scikit-learn PCA (more robust).
+            If False, uses NumPy eigendecomposition (no extra dependencies).
+            Default is False.
+        min_width_threshold : float, optional
+            Minimum width (in pixels) for valid cluster.
+            Clusters narrower than this are considered degenerate (1D artifacts).
+            Default is 1.0 pixel.
+        min_pixesl_threshold : int, optional
+            Minimum number of pixels for valid cluster.
+            Clusters smaller than this are ignored.
+            Default is 3 pixels.
+        
+        Returns
+        -------
+        elongation_info : dict or None
+            Dictionary containing elongation properties, or None if:
+            - Cluster too small (< 3 pixels)
+            - Cluster too narrow (width < min_width_threshold)
+        """
+        # Get all pixels in this cluster
+        mask = self.labels == cluster_id
+        n_pixels = np.sum(mask)
+        
+        if n_pixels < min_pixesl_threshold:
+            return None
+        
+        # Get coordinates of all pixels in cluster
+        coords = np.column_stack([self.data.X[mask], self.data.Y[mask]])
+        
+        # Calculate centroid
+        centroid = np.mean(coords, axis=0)
+        coords_centered = coords - centroid
+        
+        # PCA to find principal directions
+        if use_sklearn:
+            try:
+                from sklearn.decomposition import PCA
+                
+                # Fit PCA
+                pca = PCA(n_components=2)
+                pca.fit(coords_centered)
+                
+                # Get principal components
+                principal_direction = pca.components_[0]
+                perpendicular_direction = pca.components_[1]
+                eigenvalues = pca.explained_variance_
+                
+            except ImportError:
+                print("Warning: scikit-learn not available, falling back to NumPy")
+                use_sklearn = False
+        
+        if not use_sklearn:
+            # NumPy implementation
+            cov = np.cov(coords_centered.T)
+            eigenvalues, eigenvectors = np.linalg.eig(cov)
+            
+            # Sort by eigenvalue (largest first)
+            idx = eigenvalues.argsort()[::-1]
+            eigenvalues = eigenvalues[idx]
+            eigenvectors = eigenvectors[:, idx]
+            
+            # Principal direction (long axis)
+            principal_direction = eigenvectors[:, 0]
+            perpendicular_direction = eigenvectors[:, 1]
+        
+        # Ensure real values (in case of numerical issues)
+        principal_direction = np.real(principal_direction)
+        perpendicular_direction = np.real(perpendicular_direction)
+        eigenvalues = np.real(eigenvalues)
+        
+        # Calculate angle
+        principal_angle = np.arctan2(principal_direction[1], principal_direction[0]) * 180 / np.pi
+        if principal_angle < 0:
+            principal_angle += 180
+        
+        # Project points onto principal axes
+        projections_principal = np.dot(coords_centered, principal_direction)
+        projections_perpendicular = np.dot(coords_centered, perpendicular_direction)
+        
+        # Calculate extents
+        length = np.max(projections_principal) - np.min(projections_principal)
+        width = np.max(projections_perpendicular) - np.min(projections_perpendicular)
+        
+        # Validate width - filter out degenerate (1D) clusters
+        if min_width_threshold is not None:
+            if width <= min_width_threshold:
+                # Cluster is too narrow (likely 1D artifact, single-pixel line, or scanning issue)
+                # Return None to exclude from analysis
+                return None
+        
+        # Calculate aspect ratio (width is guaranteed to be >= min_width_threshold)
+        #print(width)
+        aspect_ratio = length / width# if width > 1e-9 else 999.9
+        
+        # Calculate area directly (fast, no perimeter calculation)
+        if self.is_hexagonal:
+            if hasattr(self.data, '_ebsdData') and hasattr(self.data._ebsdData, 'dx'):
+                dx = self.data._ebsdData.dx
+                dy = self.data._ebsdData.dy
+                area = n_pixels * dx * dy * np.sqrt(3) / 2
+            else:
+                area = float(n_pixels)  # Fallback to pixel count
+        else:
+            area = float(n_pixels)  # In pixels
+        
+        # End points (extremes along principal axis)
+        max_proj_idx = np.argmax(projections_principal)
+        min_proj_idx = np.argmin(projections_principal)
+        end_point_1 = coords[max_proj_idx]
+        end_point_2 = coords[min_proj_idx]
+        
+        return {
+            'cluster_id': cluster_id,
+            'principal_direction': principal_direction,
+            'perpendicular_direction': perpendicular_direction,
+            'principal_angle': principal_angle,
+            'aspect_ratio': aspect_ratio,
+            'length': length,
+            'width': width,
+            'centroid': centroid,
+            'eigenvalues': eigenvalues,
+            'end_point_1': end_point_1,
+            'end_point_2': end_point_2,
+            'area': area,
+            'n_pixels': n_pixels,
+            'pca_method': 'sklearn' if use_sklearn else 'numpy'
+        }
+
+    def identify_lamellar_clusters(self, phase_id=None, phase_name=None, 
+                                min_aspect_ratio=None,
+                                pixel_size=None, use_hexagonal=None,
+                                use_sklearn=False,
+                                min_width_threshold=1.0,
+                                show_progress=True,sort_by='cluster_id',min_pixesl_threshold=3):
+        """
+        Analyze elongation of all clusters for a specific phase.
+        
+        Returns elongation information for ALL clusters, not just lamellar ones.
+        Users can filter by aspect ratio afterwards.
+        
+        Parameters
+        ----------
+        phase_id : int, optional
+            Phase ID to analyze
+        phase_name : str, optional
+            Phase name to analyze (alternative to phase_id)
+        min_aspect_ratio : float, optional
+            If provided, marks clusters as 'is_lamellar' based on this threshold.
+            If None, all clusters are analyzed without filtering.
+            Default is None.
+        pixel_size : float, optional
+            Size of one pixel in physical units (for square grids).
+            If provided, length, width, and area are reported in physical units.
+            For square grids only. Ignored if use_hexagonal=True.
+        use_hexagonal : bool, optional
+            If True, uses dx and dy from data._ebsdData for hexagonal grids.
+            If None, automatically detected from data._ebsdData.grid.
+        use_sklearn : bool, optional
+            If True, uses scikit-learn PCA (more robust).
+            If False, uses NumPy eigendecomposition.
+            Default is False.
+        min_width_threshold : float, optional
+            Minimum width (in pixels or physical units depending on pixel_size) 
+            for valid clusters. Clusters narrower than this are excluded.
+            Default is 1.0.
+        min_pixesl_threshold : int, optional
+            Minimum number of pixels for valid cluster.
+            Clusters smaller than this are ignored.
+            Default is 3 pixels.
+
+        show_progress : bool, optional
+            If True, shows progress bar. Default is True.
+        sort_by : str, optional
+            Sort results by:
+            - 'aspect_ratio': Most elongated first (default)
+            - 'cluster_id': By cluster ID (ascending)
+            - 'length': Longest first
+            - 'area': Largest first
+            Default is 'cluster_id'.
+        
+        Returns
+        -------
+        cluster_elongations : list of dict
+            List of elongation information for ALL valid clusters in the phase.
+            Each dict contains:
+            - All geometric properties (length, width, area) in physical units if pixel_size provided
+            - 'units' field indicating the measurement units
+            - 'is_lamellar' flag if min_aspect_ratio was provided
+        
+        Examples
+        --------
+        >>> # Get all cluster elongations in pixel units
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite'
+        ... )
+        >>> 
+        >>> # Get elongations in physical units (micrometers)
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite',
+        ...     pixel_size=0.5,  # 0.5 μm per pixel
+        ...     min_aspect_ratio=2.5
+        ... )
+        >>> print(f"Length: {all_clusters[0]['length']:.2f} μm")
+        """
+        # Determine if using hexagonal grid
+        if use_hexagonal is None:
+            use_hexagonal = self.is_hexagonal
+        
+        # Calculate scale factors for physical units
+        if use_hexagonal:
+            if not hasattr(self.data, '_ebsdData'):
+                raise ValueError("Hexagonal grid requested but data._ebsdData not found")
+            if not hasattr(self.data._ebsdData, 'dx') or not hasattr(self.data._ebsdData, 'dy'):
+                raise ValueError("Hexagonal grid requested but data._ebsdData.dx and dy not found")
+            
+            dx = self.data._ebsdData.dx
+            dy = self.data._ebsdData.dy
+            # For hexagonal: use average of dx and dy for length scaling
+            length_scale = (dx + dy) / 2
+            # Area per pixel for hexagonal
+            area_per_pixel = dx * dy * np.sqrt(3) / 2
+            units = "physical"  # Assume dx, dy are in physical units
+        elif pixel_size is not None:
+            # Square grid with physical units
+            length_scale = pixel_size
+            area_per_pixel = pixel_size ** 2
+            units = "physical"
+        else:
+            # Pixel units (no scaling)
+            length_scale = 1.0
+            area_per_pixel = 1.0
+            units = "pixels"
+        
+        # Determine phase
+        if phase_name is not None:
+            # Find phase_id from name
+            phase_id = None
+            for pid, pname in self.data.phase_names.items():
+                if pname == phase_name:
+                    phase_id = pid
+                    break
+            if phase_id is None:
+                raise ValueError(f"Phase '{phase_name}' not found")
+        elif phase_id is None:
+            raise ValueError("Must specify either phase_id or phase_name")
+        
+        # Get phase name
+        phase_name = self.data.phase_names[phase_id]
+        
+        # Get all clusters in this phase
+        if phase_name not in self.labels_by_phase:
+            return []
+        
+        phase_clusters = self.labels_by_phase[phase_name]
+        
+        n_clusters = len(phase_clusters)
+        if show_progress:
+            print(f"\nAnalyzing elongation of {n_clusters} clusters in phase '{phase_name}'...")
+            if min_aspect_ratio is not None:
+                print(f"Lamellar threshold: aspect ratio >= {min_aspect_ratio}")
+            print(f"Width threshold: >= {min_width_threshold} {units}")
+            print(f"Units: {units}")
+            if use_hexagonal:
+                print(f"Hexagonal grid: dx={dx}, dy={dy}")
+            elif pixel_size is not None:
+                print(f"Pixel size: {pixel_size}")
+        
+        cluster_elongations = []
+        n_lamellar = 0
+        n_degenerate = 0
+        
+        for i, cluster_id in enumerate(phase_clusters):
+            if show_progress and (i % max(1, n_clusters // 20) == 0 or i == n_clusters - 1):
+                progress = (i + 1) / n_clusters * 100
+                if min_aspect_ratio is not None:
+                    print(f"  Progress: {i+1}/{n_clusters} ({progress:.1f}%) - "
+                        f"Found {n_lamellar} lamellar, {n_degenerate} degenerate", end='\r')
+                else:
+                    print(f"  Progress: {i+1}/{n_clusters} ({progress:.1f}%) - "
+                        f"{n_degenerate} degenerate excluded", end='\r')
+            
+            # Analyze elongation (returns in pixel units)
+            elongation = self.analyze_cluster_elongation(
+                cluster_id, 
+                use_sklearn=use_sklearn,
+                min_width_threshold=min_width_threshold / length_scale if min_width_threshold is not None else None,# Convert threshold to pixels
+                min_pixesl_threshold=min_pixesl_threshold  
+            )
+            
+            if elongation is None:
+                n_degenerate += 1
+                continue
+            
+            # Scale geometric properties to physical units
+            length_physical = elongation['length'] * length_scale
+            width_physical = elongation['width'] * length_scale
+            area_physical = elongation['n_pixels'] * area_per_pixel
+            
+            # Aspect ratio is dimensionless (unchanged)
+            aspect_ratio = elongation['aspect_ratio']
+            
+            # Determine if lamellar
+            
+            if min_aspect_ratio is not None:
+                is_lamellar = aspect_ratio >= min_aspect_ratio
+                if is_lamellar:
+                    n_lamellar += 1
+            else:
+                is_lamellar = True
+                n_lamellar += 1
+            
+            # Add to list with physical units
+            cluster_elongations.append({
+                'cluster_id': cluster_id,
+                'phase_id': phase_id,
+                'phase_name': phase_name,
+                'aspect_ratio': aspect_ratio,  # Dimensionless
+                'length': length_physical,  # In physical units
+                'width': width_physical,  # In physical units
+                'orientation_angle': elongation['principal_angle'],  # Degrees
+                'principal_direction': elongation['principal_direction'],  # Unit vector
+                'perpendicular_direction': elongation['perpendicular_direction'],  # Unit vector
+                'centroid': elongation['centroid'],  # In pixel coordinates
+                'end_point_1': elongation['end_point_1'],  # In pixel coordinates
+                'end_point_2': elongation['end_point_2'],  # In pixel coordinates
+                'area': area_physical,  # In physical units
+                'n_pixels': elongation['n_pixels'],  # Count (dimensionless)
+                'eigenvalues': elongation['eigenvalues'],  # In pixel^2 units
+                'pca_method': elongation['pca_method'],
+                'is_lamellar': is_lamellar,
+                'units': units,  # 'pixels' or 'physical'
+                'elongation_info': elongation,  # Original data in pixels
+                'length_scale': length_scale
+            })
+        
+        if show_progress:
+            print()  # New line after progress
+            if min_aspect_ratio is not None:
+                print(f"✓ Complete: {n_lamellar} lamellar clusters "
+                    f"({n_lamellar/n_clusters*100:.1f}% of phase clusters)")
+            print(f"  Valid clusters analyzed: {len(cluster_elongations)}")
+            print(f"  Degenerate clusters excluded: {n_degenerate}\n")
+        
+        # ========== UPDATED SORTING ==========
+        # Sort based on requested criterion
+        if sort_by == 'cluster_id':
+            cluster_elongations.sort(key=lambda x: x['cluster_id'])
+        elif sort_by == 'aspect_ratio':
+            cluster_elongations.sort(key=lambda x: x['aspect_ratio'], reverse=True)
+        elif sort_by == 'length':
+            cluster_elongations.sort(key=lambda x: x['length'], reverse=True)
+        elif sort_by == 'area':
+            cluster_elongations.sort(key=lambda x: x['area'], reverse=True)
+        elif sort_by == 'width':
+            cluster_elongations.sort(key=lambda x: x['width'], reverse=True)
+        else:
+            print(f"Warning: Unknown sort_by='{sort_by}', using 'aspect_ratio'")
+            cluster_elongations.sort(key=lambda x: x['aspect_ratio'], reverse=True)
+        # ====================================
+        
+        return cluster_elongations
+    
+    def get_lamellar_cluster_info(self, cluster_id, use_sklearn=False, elongation_cache=None):
+        """
+        Get detailed lamellar information for a specific cluster.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+        use_sklearn : bool, optional
+            If True, uses scikit-learn PCA. Default is False.
+            Ignored if elongation_cache is provided.
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results from identify_lamellar_clusters.
+            If provided as dict: {cluster_id: elongation_info}
+            If provided as list: results from identify_lamellar_clusters
+            If None, computes elongation on the fly.
+        
+        Returns
+        -------
+        info : dict
+            Complete lamellar cluster information
+        
+        Examples
+        --------
+        >>> # Without cache (computes PCA)
+        >>> info = clustering_result.get_lamellar_cluster_info(cluster_id=42)
+        >>> 
+        >>> # With cache (reuses PCA from identify_lamellar_clusters)
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite'
+        ... )
+        >>> info = clustering_result.get_lamellar_cluster_info(
+        ...     cluster_id=42,
+        ...     elongation_cache=all_clusters
+        ... )
+        """
+        # Try to get from cache
+        elongation_data = None
+        
+        if elongation_cache is not None:
+            if isinstance(elongation_cache, dict):
+                # Cache is a dictionary {cluster_id: data}
+                elongation_data = elongation_cache.get(cluster_id)
+            elif isinstance(elongation_cache, list):
+                # Cache is a list of results from identify_lamellar_clusters
+                for cluster_data in elongation_cache:
+                    if cluster_data['cluster_id'] == cluster_id:
+                        elongation_data = cluster_data
+                        break
+        
+        # If not in cache, compute it
+        if elongation_data is None:
+            elongation = self.analyze_cluster_elongation(cluster_id, use_sklearn=use_sklearn)
+            
+            if elongation is None:
+                return None
+            
+            # Build elongation_data from elongation
+            phase_id = self.cluster_phases_id[cluster_id]
+            
+            elongation_data = {
+                'cluster_id': cluster_id,
+                'phase_id': phase_id,
+                'phase_name': self.data.phase_names[phase_id],
+                'aspect_ratio': elongation['aspect_ratio'],
+                'length': elongation['length'],
+                'width': elongation['width'],
+                'orientation_angle': elongation['principal_angle'],
+                'principal_direction': elongation['principal_direction'],
+                'perpendicular_direction': elongation['perpendicular_direction'],
+                'centroid': elongation['centroid'],
+                'end_point_1': elongation['end_point_1'],
+                'end_point_2': elongation['end_point_2'],
+                'area': elongation['area'],
+                'n_pixels': elongation['n_pixels'],
+                'eigenvalues': elongation['eigenvalues'],
+                'pca_method': elongation['pca_method'],
+                'elongation_info': elongation
+            }
+        
+        # Get morphology for perimeter and sphericity
+        morphology = self.get_cluster_morphology(elongation_data['cluster_id'])
+        
+        # Calculate side lines (equations for the two long edges)
+        centroid = elongation_data['centroid']
+        perpendicular_dir = elongation_data['perpendicular_direction']
+        width = elongation_data['width']
+        
+        # Two parallel lines at ±width/2 from centroid
+        side_1_point = centroid + perpendicular_dir * (width / 2)
+        side_2_point = centroid - perpendicular_dir * (width / 2)
+        
+        return {
+            'cluster_id': elongation_data['cluster_id'],
+            'phase_id': elongation_data['phase_id'],
+            'phase_name': elongation_data['phase_name'],
+            
+            # Size metrics
+            'n_pixels': elongation_data['n_pixels'],
+            'area': elongation_data['area'],
+            'perimeter': morphology['perimeter'],
+            
+            # Elongation metrics
+            'aspect_ratio': elongation_data['aspect_ratio'],
+            'length': elongation_data['length'],
+            'width': elongation_data['width'],
+            'is_lamellar': elongation_data['aspect_ratio'] >= 2.5,
+            
+            # Orientation
+            'orientation_angle': elongation_data['orientation_angle'],
+            'principal_direction': elongation_data['principal_direction'],
+            'perpendicular_direction': elongation_data['perpendicular_direction'],
+            
+            # Position
+            'centroid': elongation_data['centroid'],
+            'center_of_mass': morphology['center_of_mass'],
+            'end_point_1': elongation_data['end_point_1'],
+            'end_point_2': elongation_data['end_point_2'],
+            
+            # Shape quality
+            'eigenvalues': elongation_data['eigenvalues'],
+            'sphericity': morphology['sphericity'],
+            
+            # Side lines
+            'side_1_point': side_1_point,
+            'side_2_point': side_2_point,
+            
+            # Method info
+            'pca_method': elongation_data.get('pca_method', 'unknown'),
+            'units': elongation_data.get('units', 'pixels'),
+            
+            # Complete data
+            'elongation_info': elongation_data.get('elongation_info', elongation_data),
+            'morphology': morphology
+        }
+
+    def print_lamellar_clusters_summary(self, phase_id=None, phase_name=None,
+                                    min_aspect_ratio=2.5,
+                                    sort_by='aspect_ratio',
+                                    max_clusters=None,
+                                    use_sklearn=False):
+        """
+        Print summary of lamellar clusters for a phase.
+        
+        Parameters
+        ----------
+        phase_id : int, optional
+            Phase ID to analyze
+        phase_name : str, optional
+            Phase name to analyze
+        min_aspect_ratio : float, optional
+            Minimum aspect ratio. Default is 2.5.
+        sort_by : str, optional
+            Sort by: 'aspect_ratio', 'length', 'area', 'orientation_angle'
+            Default is 'aspect_ratio'.
+        max_clusters : int, optional
+            Maximum clusters to print
+        use_sklearn : bool, optional
+            If True, uses scikit-learn PCA. Default is False.
+        """
+        lamellar = self.identify_lamellar_clusters(
+            phase_id=phase_id,
+            phase_name=phase_name,
+            min_aspect_ratio=min_aspect_ratio,
+            use_sklearn=use_sklearn
+        )
+        
+        if len(lamellar) == 0:
+            phase_str = phase_name or self.data.phase_names[phase_id]
+            print(f"\nNo lamellar clusters found in phase '{phase_str}' "
+                f"(aspect ratio >= {min_aspect_ratio})")
+            return
+        
+        # Sort
+        if sort_by in lamellar[0]:
+            lamellar.sort(key=lambda x: x[sort_by], reverse=True)
+        
+        phase_str = lamellar[0]['phase_name']
+        pca_method = lamellar[0]['pca_method']
+        
+        print(f"\n{'='*90}")
+        print(f"Lamellar Clusters in Phase '{phase_str}' (min aspect ratio: {min_aspect_ratio})")
+        print(f"PCA method: {pca_method}")
+        print(f"{'='*90}")
+        print(f"Total lamellar clusters: {len(lamellar)}")
+        
+        print(f"\n{'ID':>6} {'Pixels':>8} {'Area':>10} {'Length':>10} {'Width':>8} "
+            f"{'Aspect':>8} {'Angle':>8}")
+        print(f"{'':>6} {'':>8} {'':>10} {'':>10} {'':>8} {'Ratio':>8} {'(°)':>8}")
+        print(f"{'-'*90}")
+        
+        n_to_print = len(lamellar) if max_clusters is None else min(max_clusters, len(lamellar))
+        
+        for info in lamellar[:n_to_print]:
+            print(f"{info['cluster_id']:>6} {info['n_pixels']:>8} {info['area']:>10.2f} "
+                f"{info['length']:>10.2f} {info['width']:>8.2f} "
+                f"{info['aspect_ratio']:>8.2f} {info['orientation_angle']:>8.1f}")
+        
+        if max_clusters and len(lamellar) > max_clusters:
+            print(f"... and {len(lamellar) - max_clusters} more lamellar clusters")
+        
+        # Statistics
+        print(f"\n{'-'*90}")
+        print(f"Statistics:")
+        
+        aspect_ratios = [l['aspect_ratio'] for l in lamellar]
+        lengths = [l['length'] for l in lamellar]
+        widths = [l['width'] for l in lamellar]
+        angles = [l['orientation_angle'] for l in lamellar]
+        
+        print(f"  Aspect ratio - Mean: {np.mean(aspect_ratios):.2f}, "
+            f"Std: {np.std(aspect_ratios):.2f}, "
+            f"Min: {np.min(aspect_ratios):.2f}, Max: {np.max(aspect_ratios):.2f}")
+        print(f"  Length - Mean: {np.mean(lengths):.2f}, "
+            f"Std: {np.std(lengths):.2f}, "
+            f"Min: {np.min(lengths):.2f}, Max: {np.max(lengths):.2f}")
+        print(f"  Width - Mean: {np.mean(widths):.2f}, "
+            f"Std: {np.std(widths):.2f}, "
+            f"Min: {np.min(widths):.2f}, Max: {np.max(widths):.2f}")
+        print(f"  Orientation - Mean: {np.mean(angles):.1f}°, "
+            f"Std: {np.std(angles):.1f}°")
+        
+        print(f"{'='*90}\n")
+        
+        return lamellar
+    
+    def plot_aspect_ratio_distribution(self,all_clusters, max_aspect_ratio=20.0, 
+                                    lamellar_threshold=2.5, figsize=(14, 5)):
+        """
+        Plot aspect ratio distribution with optional cropping.
+        
+        Parameters
+        ----------
+        all_clusters : list of dict
+            Results from identify_lamellar_clusters
+        max_aspect_ratio : float, optional
+            Maximum aspect ratio to display (crops outliers).
+            Default is 20.0. Set to None for no cropping.
+        lamellar_threshold : float, optional
+            Threshold to mark on plots. Default is 2.5.
+        figsize : tuple, optional
+            Figure size
+        
+        Returns
+        -------
+        fig, axes : matplotlib figure and axes
+        stats : dict
+            Statistics dictionary
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Extract aspect ratios
+        aspect_ratios = np.array([c['aspect_ratio'] for c in all_clusters])
+        
+        # Apply cropping if requested
+        if max_aspect_ratio is not None:
+            aspect_ratios_cropped = np.clip(aspect_ratios, None, max_aspect_ratio)
+            n_cropped = np.sum(aspect_ratios > max_aspect_ratio)
+            cropped = True
+        else:
+            aspect_ratios_cropped = aspect_ratios
+            n_cropped = 0
+            cropped = False
+        
+        if n_cropped > 0:
+            print(f"\nCropped {n_cropped} clusters with aspect ratio > {max_aspect_ratio}")
+            print(f"  Original max: {np.max(aspect_ratios):.2f}")
+            print(f"  Cropped max: {np.max(aspect_ratios_cropped):.2f}")
+        
+        # Create plots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+        
+        # Histogram
+        ax1.hist(aspect_ratios_cropped, bins=50, edgecolor='black', alpha=0.7, 
+                color='steelblue')
+        ax1.axvline(lamellar_threshold, color='red', linestyle='--', linewidth=2, 
+                label=f'Lamellar threshold ({lamellar_threshold})')
+        ax1.set_xlabel('Aspect Ratio', fontsize=11)
+        ax1.set_ylabel('Count', fontsize=11)
+        
+        title = 'Aspect Ratio Distribution'
+        if cropped:
+            title += f' (cropped at {max_aspect_ratio})'
+        ax1.set_title(title, fontsize=12, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Add annotation for cropped values
+        if n_cropped > 0:
+            ax1.text(0.98, 0.98, f'{n_cropped} values\n> {max_aspect_ratio}',
+                    transform=ax1.transAxes,
+                    verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7),
+                    fontsize=9)
+        
+        # Cumulative distribution
+        sorted_ar = np.sort(aspect_ratios_cropped)
+        cumulative = np.arange(1, len(sorted_ar) + 1) / len(sorted_ar) * 100
+        
+        ax2.plot(sorted_ar, cumulative, linewidth=2.5, color='steelblue')
+        ax2.axvline(lamellar_threshold, color='red', linestyle='--', linewidth=2,
+                label=f'Lamellar threshold ({lamellar_threshold})')
+        ax2.axhline(50, color='gray', linestyle=':', alpha=0.5, linewidth=1)
+        ax2.set_xlabel('Aspect Ratio', fontsize=11)
+        ax2.set_ylabel('Cumulative %', fontsize=11)
+        
+        title = 'Cumulative Distribution'
+        if cropped:
+            title += f' (cropped at {max_aspect_ratio})'
+        ax2.set_title(title, fontsize=12, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Add percentile markers
+        percentiles = [25, 50, 75, 90]
+        for p in percentiles:
+            value = np.percentile(aspect_ratios_cropped, p)
+            ax2.plot(value, p, 'ro', markersize=8, zorder=5)
+            ax2.text(value, p + 3, f'P{p}={value:.1f}', 
+                    fontsize=8, ha='center', 
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                            edgecolor='red', alpha=0.7))
+        
+        plt.tight_layout()
+        
+        # Calculate statistics
+        stats = {
+            'n_total': len(aspect_ratios),
+            'n_cropped': n_cropped,
+            'original': {
+                'mean': np.mean(aspect_ratios),
+                'median': np.median(aspect_ratios),
+                'std': np.std(aspect_ratios),
+                'min': np.min(aspect_ratios),
+                'max': np.max(aspect_ratios),
+            },
+            'cropped': {
+                'mean': np.mean(aspect_ratios_cropped),
+                'median': np.median(aspect_ratios_cropped),
+                'std': np.std(aspect_ratios_cropped),
+                'min': np.min(aspect_ratios_cropped),
+                'max': np.max(aspect_ratios_cropped),
+            },
+            'percentiles': {p: np.percentile(aspect_ratios_cropped, p) 
+                        for p in [10, 25, 50, 75, 90, 95, 99]},
+            'n_lamellar': np.sum(aspect_ratios >= lamellar_threshold),
+            'pct_lamellar': np.sum(aspect_ratios >= lamellar_threshold) / len(aspect_ratios) * 100
+        }
+        
+        # Print statistics
+        print(f"\n{'='*70}")
+        print(f"Aspect Ratio Statistics")
+        print(f"{'='*70}")
+        print(f"\nTotal clusters: {stats['n_total']}")
+        if cropped:
+            print(f"Cropped at: {max_aspect_ratio}")
+            print(f"Clusters cropped: {n_cropped} ({n_cropped/stats['n_total']*100:.1f}%)")
+        
+        print(f"\nOriginal data:")
+        for key, val in stats['original'].items():
+            print(f"  {key.capitalize():8s}: {val:.2f}")
+        
+        if cropped:
+            print(f"\nCropped data:")
+            for key, val in stats['cropped'].items():
+                print(f"  {key.capitalize():8s}: {val:.2f}")
+        
+        print(f"\nPercentiles:")
+        for p, val in stats['percentiles'].items():
+            print(f"  P{p:2d}: {val:.2f}")
+        
+        print(f"\nClassification (threshold = {lamellar_threshold}):")
+        print(f"  Lamellar (AR >= {lamellar_threshold}): {stats['n_lamellar']} ({stats['pct_lamellar']:.1f}%)")
+        print(f"  Non-lamellar (AR < {lamellar_threshold}): {stats['n_total']-stats['n_lamellar']} ({100-stats['pct_lamellar']:.1f}%)")
+        
+        print(f"{'='*70}\n")
+        
+        return fig, (ax1, ax2), stats
+    # ============================================================================
+    # ROI SELECTION AROUND LAMELLAR CLUSTER
+    # ============================================================================
+
+    def create_lamellar_roi(self, cluster_id, n_layers=1, 
+                       longitudinal_shrinkage=0.1,
+                       layer_thickness_relative=None,
+                       pixel_size=None, use_hexagonal=None,
+                       elongation_cache=None):
+        """
+        Create a rectangular ROI around a lamellar cluster for interface analysis.
+        
+        The ROI is aligned with the principal axes of the lamella. By default, it's
+        SHORTENED along the length (to exclude tip neighbors) and EXTENDED in width
+        (to include neighbor layers from both long sides).
+        
+        This is designed for analyzing the long interfaces of the lamella with neighbors.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Lamellar cluster ID
+        n_layers : int or tuple, optional
+            Number of neighbor layers to include perpendicular to long interfaces.
+            If int: same number on both sides.
+            If tuple (n_side1, n_side2): different for each side.
+            Default is 1 (includes 1 layer of neighbors on each long side).
+        longitudinal_shrinkage : float, optional
+            Fraction to shrink along the long axis (to exclude tip neighbors).
+            Default is 0.1 (remove 10% from each end).
+        layer_thickness_relative : float, optional
+            Thickness of one layer as fraction of cluster width.
+            If None, uses cluster width as estimate.
+            Default is None (uses width).
+        pixel_size : float, optional
+            Pixel size for physical units. Ignored if elongation_cache provides units.
+        use_hexagonal : bool, optional
+            Use hexagonal grid. Ignored if elongation_cache provides units.
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results from identify_lamellar_clusters.
+            If provided, avoids recomputing PCA.
+            Can be dict {cluster_id: data} or list of cluster data.
+        
+        Returns
+        -------
+        roi_info : dict
+            Dictionary containing:
+            - 'vertices': Full ROI vertices (4, 2)
+            - 'semi_roi_1_vertices': Half ROI on side 1 (4, 2)
+            - 'semi_roi_2_vertices': Half ROI on side 2 (4, 2)
+            - Other ROI geometry and cluster information
+        
+        Examples
+        --------
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite'
+        ... )
+        >>> roi = clustering_result.create_lamellar_roi(
+        ...     cluster_id=42,
+        ...     n_layers=2,
+        ...     elongation_cache=all_clusters
+        ... )
+        >>> # Full ROI
+        >>> full_vertices = roi['vertices']
+        >>> # Half ROIs (split at cluster centerline)
+        >>> semi1_vertices = roi['semi_roi_1_vertices']
+        >>> semi2_vertices = roi['semi_roi_2_vertices']
+        """
+        # Get elongation data from cache or compute
+        elongation_data = None
+        
+        if elongation_cache is not None:
+            if isinstance(elongation_cache, dict):
+                elongation_data = elongation_cache.get(cluster_id)
+            elif isinstance(elongation_cache, list):
+                for cluster_data in elongation_cache:
+                    if cluster_data['cluster_id'] == cluster_id:
+                        elongation_data = cluster_data
+                        break
+        #print(elongation_data)
+        if elongation_data is None:
+            elongation = self.analyze_cluster_elongation(cluster_id, use_sklearn=False)
+            if elongation is None:
+                raise ValueError(f"Cluster {cluster_id} not found or too small")
+            
+            phase_id = self.cluster_phases_id[cluster_id]
+            
+            elongation_data = {
+                'cluster_id': cluster_id,
+                'phase_id': phase_id,
+                'phase_name': self.data.phase_names[phase_id],
+                'aspect_ratio': elongation['aspect_ratio'],
+                'length': elongation['length'],
+                'width': elongation['width'],
+                'orientation_angle': elongation['principal_angle'],
+                'principal_direction': elongation['principal_direction'],
+                'perpendicular_direction': elongation['perpendicular_direction'],
+                'centroid': elongation['centroid'],
+                'end_point_1': elongation['end_point_1'],
+                'end_point_2': elongation['end_point_2'],
+                'area': elongation['area'],
+                'n_pixels': elongation['n_pixels'],
+                'eigenvalues': elongation['eigenvalues'],
+                'pca_method': elongation['pca_method'],
+            }
+        
+        aspect_ratio = elongation_data['aspect_ratio']
+        if aspect_ratio < 2.5:
+            print(f"Warning: Cluster {cluster_id} has aspect ratio {aspect_ratio:.2f}, "
+                f"which may not be lamellar (< 2.5)")
+        
+        if longitudinal_shrinkage < 0 or longitudinal_shrinkage >= 0.5:
+            raise ValueError(f"longitudinal_shrinkage must be in [0, 0.5), got {longitudinal_shrinkage}")
+        
+        # Get elongation parameters
+        centroid = elongation_data['centroid']
+        principal_dir = elongation_data['principal_direction']
+        perpendicular_dir = elongation_data['perpendicular_direction']
+        length = elongation_data['length']
+        width = elongation_data['width']
+        
+        # Parse n_layers
+        if isinstance(n_layers, int):
+            n_layers_side1 = n_layers
+            n_layers_side2 = n_layers
+        else:
+            n_layers_side1, n_layers_side2 = n_layers
+        
+        # Determine layer thickness
+        if layer_thickness_relative is None:
+            layer_thickness = width
+        else:
+            layer_thickness = width * layer_thickness_relative
+        
+        # Calculate ROI dimensions
+        length_roi = length * (1.0 - 2.0 * longitudinal_shrinkage)
+        
+        if length_roi <= 0:
+            raise ValueError(f"longitudinal_shrinkage={longitudinal_shrinkage} is too large")
+        
+        width_side1 = n_layers_side1 * layer_thickness
+        width_side2 = n_layers_side2 * layer_thickness
+        width_roi = width + width_side1 + width_side2
+        
+        # Calculate center offset
+        width_offset = (width_side1 - width_side2) / 2
+        center_roi = centroid + perpendicular_dir * width_offset
+        
+        # Define corners in local coordinate system
+        half_length = length_roi / 2
+        half_width = width_roi / 2
+        
+        # ========== FULL ROI VERTICES ==========
+        corners_local = np.array([
+            [-half_length, -half_width],  # Corner 0: bottom-left
+            [-half_length, +half_width],  # Corner 1: top-left
+            [+half_length, +half_width],  # Corner 2: top-right
+            [+half_length, -half_width]   # Corner 3: bottom-right
+        ])
+        
+        rotation_matrix = np.column_stack([principal_dir, perpendicular_dir])
+        
+        vertices = np.zeros((4, 2))
+        for i in range(4):
+            vertices[i] = center_roi + rotation_matrix @ corners_local[i]
+        
+        # ========== SEMI-ROI 1 VERTICES (Side 1, positive perpendicular direction) ==========
+        # This semi-ROI goes from centerline to the outer edge on side 1
+        # Width: from centerline (0) to +half_width
+        semi1_half_width = half_width / 2  # Half of the full ROI width, centered on side 1
+        semi1_center_offset = half_width / 2  # Shift center toward side 1
+        
+        semi1_corners_local = np.array([
+            [-half_length, 0],                    # Corner 0: centerline start
+            [-half_length, +half_width],          # Corner 1: outer edge start
+            [+half_length, +half_width],          # Corner 2: outer edge end
+            [+half_length, 0]                     # Corner 3: centerline end
+        ])
+        
+        semi_roi_1_vertices = np.zeros((4, 2))
+        for i in range(4):
+            semi_roi_1_vertices[i] = center_roi + rotation_matrix @ semi1_corners_local[i]
+        
+        # ========== SEMI-ROI 2 VERTICES (Side 2, negative perpendicular direction) ==========
+        # This semi-ROI goes from centerline to the outer edge on side 2
+        # Width: from -half_width to centerline (0)
+        semi2_corners_local = np.array([
+            [-half_length, -half_width],          # Corner 0: outer edge start
+            [-half_length, 0],                    # Corner 1: centerline start
+            [+half_length, 0],                    # Corner 2: centerline end
+            [+half_length, -half_width]           # Corner 3: outer edge end
+        ])
+        
+        semi_roi_2_vertices = np.zeros((4, 2))
+        for i in range(4):
+            semi_roi_2_vertices[i] = center_roi + rotation_matrix @ semi2_corners_local[i]
+        
+        # ========================================
+        
+        # Calculate the two long edges (full ROI)
+        long_edge_1 = (vertices[1], vertices[2])  # Side 1 (top edge)
+        long_edge_2 = (vertices[0], vertices[3])  # Side 2 (bottom edge)
+        
+        # Calculate the centerline (dividing the two semi-ROIs)
+        centerline_start = center_roi + rotation_matrix @ np.array([-half_length, 0])
+        centerline_end = center_roi + rotation_matrix @ np.array([+half_length, 0])
+        centerline = (centerline_start, centerline_end)
+        
+        removed_length_per_end = length * longitudinal_shrinkage
+        
+        return {
+            # Full ROI
+            'vertices': vertices,
+            'center': center_roi,
+            'width_roi': width_roi,
+            'length_roi': length_roi,
+            
+            # Semi-ROIs (half thickness each)
+            'semi_roi_1_vertices': semi_roi_1_vertices,
+            'semi_roi_2_vertices': semi_roi_2_vertices,
+            'semi_roi_1_width': half_width,
+            'semi_roi_2_width': half_width,
+            'centerline': centerline,
+            
+            # Orientation
+            'orientation_angle': elongation_data['orientation_angle'],
+            'principal_direction': principal_dir,
+            'perpendicular_direction': perpendicular_dir,
+            
+            # Cluster info
+            'cluster_id': cluster_id,
+            'n_layers': (n_layers_side1, n_layers_side2),
+            'longitudinal_shrinkage': longitudinal_shrinkage,
+            'removed_length_per_end': removed_length_per_end,
+            'layer_thickness': layer_thickness,
+            'cluster_width': width,
+            'cluster_length': length,
+            
+            # Edges
+            'long_edge_1': long_edge_1,
+            'long_edge_2': long_edge_2,
+            'width_side1': width_side1,
+            'width_side2': width_side2,
+            
+            # Data
+            'cluster_info': elongation_data
+        }
+    
+    def create_lamellar_roi_mask(self, cluster_id, n_layers=1,
+                             longitudinal_shrinkage=0.1,
+                             layer_thickness_relative=None,
+                                elongation_cache=None):
+        """
+        Create boolean masks for the ROI around a lamellar cluster.
+        
+        Creates masks for the full ROI and both semi-ROIs.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Lamellar cluster ID
+        n_layers : int or tuple, optional
+            Number of layers on each side. Default is 1.
+        longitudinal_shrinkage : float, optional
+            Fraction to remove from each end. Default is 0.1.
+        layer_thickness_relative : float, optional
+            Layer thickness as fraction of width. Default is None.
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results. Avoids recomputing PCA.
+        
+        Returns
+        -------
+        roi_masks : dict
+            Dictionary containing:
+            - 'full_roi': Boolean mask for full ROI
+            - 'semi_roi_1': Boolean mask for semi-ROI 1
+            - 'semi_roi_2': Boolean mask for semi-ROI 2
+        roi_info : dict
+            ROI information from create_lamellar_roi
+        
+        Examples
+        --------
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite'
+        ... )
+        >>> roi_masks, roi_info = clustering_result.create_lamellar_roi_mask(
+        ...     cluster_id=42,
+        ...     n_layers=2,
+        ...     elongation_cache=all_clusters
+        ... )
+        >>> 
+        >>> # Access masks
+        >>> full_mask = roi_masks['full_roi']
+        >>> semi1_mask = roi_masks['semi_roi_1']
+        >>> semi2_mask = roi_masks['semi_roi_2']
+        >>> 
+        >>> print(f"Full ROI: {np.sum(full_mask)} points")
+        >>> print(f"Semi-ROI 1: {np.sum(semi1_mask)} points")
+        >>> print(f"Semi-ROI 2: {np.sum(semi2_mask)} points")
+        """
+        # Get ROI vertices (using cache)
+        roi_info = self.create_lamellar_roi(
+            cluster_id, n_layers,
+            longitudinal_shrinkage,
+            layer_thickness_relative,
+            elongation_cache=elongation_cache
+        )
+        
+        # Create mask using point-in-polygon test
+        from matplotlib.path import Path
+        
+        # All data points
+        points = np.column_stack([self.data.X, self.data.Y])
+        
+        # Full ROI mask
+        full_vertices = roi_info['vertices']
+        full_path = Path(full_vertices)
+        full_roi_mask = full_path.contains_points(points)
+        
+        # Semi-ROI 1 mask
+        semi1_vertices = roi_info['semi_roi_1_vertices']
+        semi1_path = Path(semi1_vertices)
+        semi_roi_1_mask = semi1_path.contains_points(points)
+        
+        # Semi-ROI 2 mask
+        semi2_vertices = roi_info['semi_roi_2_vertices']
+        semi2_path = Path(semi2_vertices)
+        semi_roi_2_mask = semi2_path.contains_points(points)
+        
+        roi_masks = {
+            'full_roi': full_roi_mask,
+            'semi_roi_1': semi_roi_1_mask,
+            'semi_roi_2': semi_roi_2_mask
+        }
+        
+        return roi_masks, roi_info
+
+    def extract_roi_data(self, cluster_id, n_layers=1,
+                        longitudinal_shrinkage=0.1,
+                        layer_thickness_relative=None,
+                        elongation_cache=None):
+        """
+        Extract all EBSD data within the ROI around a lamellar cluster.
+        
+        Extracts data for the full ROI and both semi-ROIs.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Lamellar cluster ID
+        n_layers : int or tuple, optional
+            Number of layers. Default is 1.
+        longitudinal_shrinkage : float, optional
+            Fraction to remove from each end. Default is 0.1.
+        layer_thickness_relative : float, optional
+            Layer thickness. Default is None.
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results. Avoids recomputing PCA.
+        
+        Returns
+        -------
+        roi_data : dict
+            Dictionary containing data for full ROI and semi-ROIs:
+            - 'full_roi': Data for complete ROI
+            - 'semi_roi_1': Data for semi-ROI 1
+            - 'semi_roi_2': Data for semi-ROI 2
+            - 'roi_info': ROI geometry information
+        
+        Examples
+        --------
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite'
+        ... )
+        >>> roi_data = clustering_result.extract_roi_data(
+        ...     cluster_id=42,
+        ...     n_layers=2,
+        ...     elongation_cache=all_clusters
+        ... )
+        >>> 
+        >>> # Access full ROI data
+        >>> full = roi_data['full_roi']
+        >>> print(f"Full ROI: {len(full['X'])} points")
+        >>> print(f"Clusters in full ROI: {full['unique_clusters']}")
+        >>> 
+        >>> # Access semi-ROI 1 data
+        >>> semi1 = roi_data['semi_roi_1']
+        >>> print(f"Semi-ROI 1: {len(semi1['X'])} points")
+        >>> print(f"Clusters in semi-ROI 1: {semi1['unique_clusters']}")
+        >>> 
+        >>> # Access semi-ROI 2 data
+        >>> semi2 = roi_data['semi_roi_2']
+        >>> print(f"Semi-ROI 2: {len(semi2['X'])} points")
+        """
+
+        # Get ROI masks (using cache)
+        roi_masks, roi_info = self.create_lamellar_roi_mask(
+            cluster_id, n_layers,
+            longitudinal_shrinkage,
+            layer_thickness_relative,
+            elongation_cache=elongation_cache
+        )
+        
+        full_mask = roi_masks['full_roi']
+        semi1_mask = roi_masks['semi_roi_1']
+        semi2_mask = roi_masks['semi_roi_2']
+        
+        # Extract data for full ROI
+        full_roi_data = {
+            'mask': full_mask,
+            'X': self.data.X[full_mask],
+            'Y': self.data.Y[full_mask],
+            'labels': self.labels[full_mask],
+            'phases_id': self.data.phases_id[full_mask],
+            'n_points': np.sum(full_mask)
+        }
+        
+        # Add quaternions if available
+        if hasattr(self.data, 'quaternions') and self.data.quaternions is not None:
+            full_roi_data['quaternions'] = self.data.quaternions[full_mask]
+        
+        # Get unique clusters
+        full_roi_data['unique_clusters'] = np.unique(full_roi_data['labels'][full_roi_data['labels'] > 0])
+        
+        # Extract data for semi-ROI 1
+        semi_roi_1_data = {
+            'mask': semi1_mask,
+            'X': self.data.X[semi1_mask],
+            'Y': self.data.Y[semi1_mask],
+            'labels': self.labels[semi1_mask],
+            'phases_id': self.data.phases_id[semi1_mask],
+            'n_points': np.sum(semi1_mask)
+        }
+        
+        if hasattr(self.data, 'quaternions') and self.data.quaternions is not None:
+            semi_roi_1_data['quaternions'] = self.data.quaternions[semi1_mask]
+        
+        semi_roi_1_data['unique_clusters'] = np.unique(semi_roi_1_data['labels'][semi_roi_1_data['labels'] > 0])
+        
+        # Extract data for semi-ROI 2
+        semi_roi_2_data = {
+            'mask': semi2_mask,
+            'X': self.data.X[semi2_mask],
+            'Y': self.data.Y[semi2_mask],
+            'labels': self.labels[semi2_mask],
+            'phases_id': self.data.phases_id[semi2_mask],
+            'n_points': np.sum(semi2_mask)
+        }
+        
+        if hasattr(self.data, 'quaternions') and self.data.quaternions is not None:
+            semi_roi_2_data['quaternions'] = self.data.quaternions[semi2_mask]
+        
+        semi_roi_2_data['unique_clusters'] = np.unique(semi_roi_2_data['labels'][semi_roi_2_data['labels'] > 0])
+        
+        return {
+            'cluster_id': cluster_id,
+            'full_roi': full_roi_data,
+            'semi_roi_1': semi_roi_1_data,
+            'semi_roi_2': semi_roi_2_data,
+            'roi_info': roi_info
+        }
+    
+    def visualize_lamellar_roi(self, cluster_id, n_layers=1,
+                            longitudinal_shrinkage=0.1,
+                            layer_thickness_relative=None,
+                            show_neighbors=True,
+                            show_long_edges=True,
+                            show_removed_regions=True,
+                            show_semi_rois=True,
+                            elongation_cache=None,invert_y_axis=True,
+                            figsize=(12, 10)):
+        """
+        Visualize a lamellar cluster with its ROI for interface analysis.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Lamellar cluster ID
+        n_layers : int or tuple, optional
+            Number of layers perpendicular to long interfaces. Default is 1.
+        longitudinal_shrinkage : float, optional
+            Fraction to remove from each end. Default is 0.1.
+        layer_thickness_relative : float, optional
+            Layer thickness. Default is None.
+        show_neighbors : bool, optional
+            Show neighboring clusters. Default is True.
+        show_long_edges : bool, optional
+            Highlight the two long edges. Default is True.
+        show_removed_regions : bool, optional
+            Show the regions removed from tips. Default is True.
+        show_semi_rois : bool, optional
+            Show the two half-thickness semi-ROIs. Default is True.
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results from identify_lamellar_clusters.
+            Avoids recomputing PCA.
+        figsize : tuple, optional
+            Figure size
+        
+        Returns
+        -------
+        fig, ax : matplotlib figure and axis
+        roi_info : dict
+            ROI information
+        
+        Examples
+        --------
+        >>> # Without cache
+        >>> fig, ax, roi = clustering_result.visualize_lamellar_roi(
+        ...     cluster_id=42, n_layers=2
+        ... )
+        >>> 
+        >>> # With cache (efficient for multiple visualizations)
+        >>> all_clusters = clustering_result.identify_lamellar_clusters(
+        ...     phase_name='Ferrite'
+        ... )
+        >>> fig, ax, roi = clustering_result.visualize_lamellar_roi(
+        ...     cluster_id=42,
+        ...     n_layers=2,
+        ...     show_semi_rois=True,
+        ...     elongation_cache=all_clusters
+        ... )
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Polygon
+        
+        # Get ROI masks and info (using cache if provided)
+        roi_masks, roi_info = self.create_lamellar_roi_mask(
+            cluster_id, n_layers,
+            longitudinal_shrinkage,
+            layer_thickness_relative,
+            elongation_cache=elongation_cache
+        )
+        
+        # Use full ROI mask for visualization
+        roi_mask = roi_masks['full_roi']
+        
+        info = roi_info['cluster_info']
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Plot all clusters in ROI
+        if show_neighbors:
+            roi_coords = np.column_stack([self.data.X[roi_mask], self.data.Y[roi_mask]])
+            roi_labels = self.labels[roi_mask]
+            
+            unique_roi_clusters = np.unique(roi_labels[roi_labels > 0])
+            
+            import matplotlib.cm as cm
+            colors = cm.get_cmap('tab20')(np.linspace(0, 1, len(unique_roi_clusters)))
+            
+            for i, c in enumerate(unique_roi_clusters):
+                cluster_mask_roi = roi_labels == c
+                coords = roi_coords[cluster_mask_roi]
+                
+                if c == cluster_id:
+                    ax.plot(coords[:, 0], coords[:, 1], 'o', 
+                        color='red', markersize=4, alpha=0.8,
+                        label=f'Cluster {c} (lamellar)')
+                else:
+                    ax.plot(coords[:, 0], coords[:, 1], 'o',
+                        color=colors[i], markersize=3, alpha=0.6,
+                        label=f'Cluster {c}' if i < 5 else '')
+        else:
+            cluster_mask = self.labels == cluster_id
+            coords = np.column_stack([self.data.X[cluster_mask], self.data.Y[cluster_mask]])
+            ax.plot(coords[:, 0], coords[:, 1], 'ro', markersize=4, 
+                label=f'Cluster {cluster_id} (lamellar)')
+        
+        # Show removed regions (tips that are excluded)
+        if show_removed_regions and longitudinal_shrinkage > 0:
+            centroid = info['centroid']
+            principal_dir = roi_info['principal_direction']
+            perpendicular_dir = roi_info['perpendicular_direction']
+            cluster_length = roi_info['cluster_length']
+            cluster_width = roi_info['cluster_width']
+            removed_length = roi_info['removed_length_per_end']
+            
+            # Create rectangles for removed tip regions
+            rotation_matrix = np.column_stack([principal_dir, perpendicular_dir])
+            
+            # Tip 1 (positive end)
+            tip1_corners_local = np.array([
+                [cluster_length/2 - removed_length, -cluster_width/2],
+                [cluster_length/2, -cluster_width/2],
+                [cluster_length/2, cluster_width/2],
+                [cluster_length/2 - removed_length, cluster_width/2]
+            ])
+            tip1_corners = np.array([centroid + rotation_matrix @ c for c in tip1_corners_local])
+            
+            # Tip 2 (negative end)
+            tip2_corners_local = np.array([
+                [-cluster_length/2, -cluster_width/2],
+                [-cluster_length/2 + removed_length, -cluster_width/2],
+                [-cluster_length/2 + removed_length, cluster_width/2],
+                [-cluster_length/2, cluster_width/2]
+            ])
+            tip2_corners = np.array([centroid + rotation_matrix @ c for c in tip2_corners_local])
+            
+            # Plot removed regions
+            tip1_poly = Polygon(tip1_corners, fill=True, facecolor='yellow', 
+                            edgecolor='orange', linewidth=2, alpha=0.3,
+                            label=f'Removed tips ({longitudinal_shrinkage*100:.0f}% each)')
+            tip2_poly = Polygon(tip2_corners, fill=True, facecolor='yellow', 
+                            edgecolor='orange', linewidth=2, alpha=0.3)
+            ax.add_patch(tip1_poly)
+            ax.add_patch(tip2_poly)
+        
+        # Plot semi-ROIs (half-width ROIs)
+        if show_semi_rois:
+            # Semi-ROI 1 (side 1)
+            semi1_vertices = roi_info['semi_roi_1_vertices']
+            semi1_poly = Polygon(semi1_vertices, fill=False, edgecolor='cyan', 
+                            linewidth=2, linestyle=':',
+                            label=f'Semi-ROI 1 (width={roi_info["semi_roi_1_width"]:.1f})')
+            ax.add_patch(semi1_poly)
+            
+            # Semi-ROI 2 (side 2)
+            semi2_vertices = roi_info['semi_roi_2_vertices']
+            semi2_poly = Polygon(semi2_vertices, fill=False, edgecolor='magenta', 
+                            linewidth=2, linestyle=':',
+                            label=f'Semi-ROI 2 (width={roi_info["semi_roi_2_width"]:.1f})')
+            ax.add_patch(semi2_poly)
+            
+            # Plot centerline dividing the two semi-ROIs
+            centerline = roi_info['centerline']
+            ax.plot([centerline[0][0], centerline[1][0]], 
+                [centerline[0][1], centerline[1][1]],
+                'k--', linewidth=1.5, alpha=0.6, label='Centerline')
+        
+        # Plot full ROI rectangle
+        vertices = roi_info['vertices']
+        polygon = Polygon(vertices, fill=False, edgecolor='blue', 
+                        linewidth=3, linestyle='--',
+                        label='Full ROI')
+        ax.add_patch(polygon)
+        
+        # Highlight long edges if requested
+        if show_long_edges:
+            long_edge_1 = roi_info['long_edge_1']
+            long_edge_2 = roi_info['long_edge_2']
+            
+            # Long edge 1 (side 1)
+            ax.plot([long_edge_1[0][0], long_edge_1[1][0]], 
+                [long_edge_1[0][1], long_edge_1[1][1]],
+                'g-', linewidth=5, alpha=0.8, 
+                label=f'Long edge 1 ({roi_info["n_layers"][0]} layers)')
+            
+            # Long edge 2 (side 2)
+            ax.plot([long_edge_2[0][0], long_edge_2[1][0]], 
+                [long_edge_2[0][1], long_edge_2[1][1]],
+                'm-', linewidth=5, alpha=0.8,
+                label=f'Long edge 2 ({roi_info["n_layers"][1]} layers)')
+        
+        # Plot cluster centroid
+        centroid = info['centroid']
+        ax.plot(centroid[0], centroid[1], 'r*', markersize=15,
+            label='Cluster centroid')
+        
+        # Plot ROI center
+        center = roi_info['center']
+        ax.plot(center[0], center[1], 'b^', markersize=12, 
+            label='ROI center')
+        
+        # Plot principal axes
+        principal_dir = info['principal_direction']
+        perpendicular_dir = info['perpendicular_direction']
+        length = info['length']
+        width = info['width']
+        
+        # Principal axis (long) - along length
+        scale = length * 0.6
+        ax.arrow(centroid[0], centroid[1],
+                principal_dir[0] * scale, principal_dir[1] * scale,
+                color='darkred', width=1.0, head_width=4, head_length=3,
+                alpha=0.7)
+        ax.arrow(centroid[0], centroid[1],
+                -principal_dir[0] * scale, -principal_dir[1] * scale,
+                color='darkred', width=1.0, head_width=4, head_length=3,
+                alpha=0.7, label='Long axis')
+        
+        # Perpendicular axis (short) - across width
+        scale = width * 0.6
+        ax.arrow(centroid[0], centroid[1],
+                perpendicular_dir[0] * scale, perpendicular_dir[1] * scale,
+                color='darkblue', width=1.0, head_width=4, head_length=3,
+                alpha=0.7)
+        ax.arrow(centroid[0], centroid[1],
+                -perpendicular_dir[0] * scale, -perpendicular_dir[1] * scale,
+                color='darkblue', width=1.0, head_width=4, head_length=3,
+                alpha=0.7, label='Short axis')
+        
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        
+        # Build title
+        title = f'Lamellar Cluster {cluster_id} - Interface Analysis ROI\n'
+        title += f'Aspect ratio: {info["aspect_ratio"]:.2f}, '
+        title += f'Angle: {info["orientation_angle"]:.1f}°\n'
+        title += f'Cluster: {info["length"]:.1f} (L) × {info["width"]:.1f} (W), '
+        title += f'ROI: {roi_info["length_roi"]:.1f} (L) × {roi_info["width_roi"]:.1f} (W)\n'
+        title += f'Shrinkage: {longitudinal_shrinkage*100:.0f}% each end ({roi_info["removed_length_per_end"]:.1f} removed), '
+        title += f'Layers: {roi_info["n_layers"]}'
+        if show_semi_rois:
+            title += f'\nSemi-ROIs: Each {roi_info["semi_roi_1_width"]:.1f} width (half of full ROI)'
+        
+        ax.set_title(title, fontsize=10)
+        ax.legend(loc='best', fontsize=8, ncol=2)  # Two columns for better layout
+        ax.axis('equal')
+        ax.grid(True, alpha=0.3)
+        if invert_y_axis:
+            ax.invert_yaxis()
+        plt.tight_layout()
+        
+        return fig, ax, roi_info
     
 
+
+    
 
 # ============================================================================
 # BOUNDARY ANALYZER
@@ -3390,6 +6266,30 @@ class BoundaryResult:
         
         return interphase
     
+    def list_phase_pairs(self):
+        """
+        List all phase pairs that have inter-phase boundaries.
+        """
+        phase_pairs = set()
+        
+        for i, phases_dict in enumerate(self.grouped_boundary_phases_id):
+            cluster_phase = self.cluster_phases_id[i]
+            
+            for neighbor_label, neighbor_phase in phases_dict.items():
+                if neighbor_phase == -1:  # Skip ROI
+                    continue
+                if neighbor_phase != cluster_phase:
+                    # Store as sorted tuple to avoid duplicates
+                    pair = tuple(sorted([cluster_phase, neighbor_phase]))
+                    phase_pairs.add(pair)
+        
+        print("Available phase pairs with inter-phase boundaries:")
+        for p1, p2 in sorted(phase_pairs):
+            print(f"  Phase {p1} ↔ Phase {p2}")
+        
+        return list(phase_pairs)
+
+
     def get_phase_boundaries(self, phase_id_1, phase_id_2):
         """Get all boundaries between two phases."""
         boundaries_p1_to_p2 = []
@@ -3413,7 +6313,1331 @@ class BoundaryResult:
                         })
         
         return boundaries_p1_to_p2, boundaries_p2_to_p1
+    
+    def get_enclosed_clusters(self, cluster_id, target_phase_id=None):
+        """
+        Find all clusters that have their longest interface with the given cluster.
+        
+        A cluster is considered "enclosed" if:
+        1. It shares a boundary with cluster_id
+        2. Its longest boundary is with cluster_id (compared to all other boundaries)
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label to analyze (the "container" cluster)
+        target_phase_id : int, optional
+            Phase ID of clusters to search for.
+            If None, searches for all phases different from the container cluster's phase.
+        
+        Returns
+        -------
+        enclosed_clusters : dict
+            Dictionary with structure:
+            {
+                'cluster_id': cluster_id,
+                'cluster_phase_id': phase of container cluster,
+                'target_phase_id': target_phase_id,
+                'enclosed': [list of cluster IDs],
+                'n_enclosed': number of enclosed clusters,
+                'boundary_lengths': {enclosed_cluster_id: boundary_length}
+            }
+        """
+        # Find cluster index
+        try:
+            cluster_idx = np.where(self.clusters == cluster_id)[0][0]
+        except IndexError:
+            raise ValueError(f"Cluster {cluster_id} not found!")
+        
+        # Get phase of this cluster
+        cluster_phase_id = self.cluster_phases_id[cluster_idx]
+        
+        # Determine target phase
+        if target_phase_id is None:
+            # Find all other phases
+            all_phases = np.unique(list(self.cluster_phases_id))
+            target_phases = [p for p in all_phases if p != cluster_phase_id]
+        else:
+            target_phases = [target_phase_id]
+        
+        # Get boundaries of this cluster
+        boundaries = self.grouped_boundaries[cluster_idx]
+        boundary_phases = self.grouped_boundary_phases_id[cluster_idx]
+        
+        # Find all clusters that touch cluster_id and are in target phase
+        candidate_neighbors = {}
+        
+        for neighbor_label, coords in boundaries.items():
+            if neighbor_label == -1:
+                continue  # Skip ROI
+            
+            neighbor_phase = boundary_phases[neighbor_label]
+            
+            # Check if neighbor is in target phase
+            if neighbor_phase in target_phases:
+                # Store boundary length with cluster_id
+                boundary_length = len(coords)
+                candidate_neighbors[neighbor_label] = boundary_length
+        
+        # Now check each candidate: is this the longest boundary for that cluster?
+        enclosed_clusters = []
+        boundary_lengths = {}
+        
+        for candidate_id, length_with_cluster_id in candidate_neighbors.items():
+            # Find candidate's index
+            try:
+                candidate_idx = np.where(self.clusters == candidate_id)[0][0]
+            except IndexError:
+                continue
+            
+            # Get all boundaries of the candidate cluster
+            candidate_boundaries = self.grouped_boundaries[candidate_idx]
+            
+            # Find longest boundary of candidate cluster
+            max_boundary_length = 0
+            longest_neighbor = None
+            
+            for nb_label, nb_coords in candidate_boundaries.items():
+                if nb_label == -1:
+                    continue  # Skip ROI
+                
+                nb_length = len(nb_coords)
+                if nb_length > max_boundary_length:
+                    max_boundary_length = nb_length
+                    longest_neighbor = nb_label
+            
+            # Select candidate if its longest boundary is with cluster_id
+            if longest_neighbor == cluster_id:
+                enclosed_clusters.append(candidate_id)
+                boundary_lengths[candidate_id] = length_with_cluster_id
+        
+        return {
+            'cluster_id': cluster_id,
+            'cluster_phase_id': cluster_phase_id,
+            'target_phase_id': target_phases,
+            'enclosed': enclosed_clusters,
+            'n_enclosed': len(enclosed_clusters),
+            'boundary_lengths': boundary_lengths
+        }
 
+
+    def find_all_enclosures(self, phase1, phase2):
+        """
+        Find all clusters of phase1 that contain clusters of phase2.
+        
+        A phase2 cluster is "contained" by a phase1 cluster if the phase1 cluster
+        provides the longest boundary for the phase2 cluster.
+        
+        Parameters
+        ----------
+        phase1 : int
+            Phase ID of container clusters
+        phase2 : int
+            Phase ID of enclosed clusters
+        
+        Returns
+        -------
+        enclosures : list of dict
+            List of enclosure information for each phase1 cluster that contains phase2 clusters.
+            Each dict contains:
+            - 'container_cluster': cluster ID
+            - 'enclosed_clusters': list of enclosed cluster IDs
+            - 'n_enclosed': number of enclosed clusters
+            - 'boundary_lengths': dict {enclosed_id: boundary_length}
+            - 'total_boundary_length': sum of all boundaries with enclosed clusters
+        """
+        enclosures = []
+        
+        # Get all clusters in phase1
+        phase1_clusters = [
+            cluster_id for i, cluster_id in enumerate(self.clusters)
+            if self.cluster_phases_id[i] == phase1
+        ]
+        
+        print(f"Analyzing {len(phase1_clusters)} clusters of phase {phase1}...")
+        
+        for cluster_id in phase1_clusters:
+            result = self.get_enclosed_clusters(cluster_id, target_phase_id=phase2)
+            
+            if result['n_enclosed'] > 0:
+                total_boundary_length = sum(result['boundary_lengths'].values())
+                enclosures.append({
+                    'container_cluster': cluster_id,
+                    'enclosed_clusters': result['enclosed'],
+                    'n_enclosed': result['n_enclosed'],
+                    'boundary_lengths': result['boundary_lengths'],
+                    'total_boundary_length': total_boundary_length
+                })
+        
+        return enclosures
+
+
+    def get_cluster_topology_info(self, cluster_id):
+        """
+        Get complete topological information about a cluster.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster to analyze
+        
+        Returns
+        -------
+        topology : dict
+            Dictionary containing:
+            - 'cluster_id': cluster ID
+            - 'phase_id': phase of this cluster
+            - 'same_phase_neighbors': dict {neighbor_id: boundary_length}
+            - 'inter_phase_neighbors': dict {phase_id: {neighbor_id: boundary_length}}
+            - 'enclosed_clusters': dict {phase_id: [cluster_ids]}
+            - 'longest_neighbor': ID of neighbor with longest boundary
+            - 'longest_neighbor_length': length of longest boundary
+            - 'n_pixels': number of pixels in cluster
+            - 'touches_roi': whether cluster touches ROI boundary
+            - 'roi_boundary_length': length of ROI boundary
+        """
+        # Find cluster index
+        try:
+            cluster_idx = np.where(self.clusters == cluster_id)[0][0]
+        except IndexError:
+            raise ValueError(f"Cluster {cluster_id} not found!")
+        
+        cluster_phase_id = self.cluster_phases_id[cluster_idx]
+        
+        # Get boundaries
+        boundaries = self.grouped_boundaries[cluster_idx]
+        boundary_phases = self.grouped_boundary_phases_id[cluster_idx]
+        
+        # Analyze neighbors with boundary lengths
+        same_phase_neighbors = {}
+        inter_phase_neighbors = {}
+        touches_roi = False
+        roi_boundary_length = 0
+        
+        longest_neighbor = None
+        longest_neighbor_length = 0
+        
+        for neighbor_label, coords in boundaries.items():
+            boundary_length = len(coords)
+            
+            if neighbor_label == -1:
+                touches_roi = True
+                roi_boundary_length = boundary_length
+                continue
+            
+            neighbor_phase = boundary_phases[neighbor_label]
+            
+            # Track longest neighbor
+            if boundary_length > longest_neighbor_length:
+                longest_neighbor_length = boundary_length
+                longest_neighbor = neighbor_label
+            
+            if neighbor_phase == cluster_phase_id:
+                same_phase_neighbors[neighbor_label] = boundary_length
+            else:
+                if neighbor_phase not in inter_phase_neighbors:
+                    inter_phase_neighbors[neighbor_phase] = {}
+                inter_phase_neighbors[neighbor_phase][neighbor_label] = boundary_length
+        
+        # Find enclosed clusters (those whose longest boundary is with this cluster)
+        enclosed_info = self.get_enclosed_clusters(cluster_id)
+        
+        # Organize enclosed by phase
+        enclosed_by_phase = {}
+        for enclosed_id in enclosed_info['enclosed']:
+            enc_idx = np.where(self.clusters == enclosed_id)[0][0]
+            enc_phase = self.cluster_phases_id[enc_idx]
+            if enc_phase not in enclosed_by_phase:
+                enclosed_by_phase[enc_phase] = []
+            enclosed_by_phase[enc_phase].append(enclosed_id)
+        
+        # Count pixels
+        n_pixels = np.sum(self.clustering.labels == cluster_id)
+        
+        return {
+            'cluster_id': cluster_id,
+            'phase_id': cluster_phase_id,
+            'same_phase_neighbors': same_phase_neighbors,
+            'inter_phase_neighbors': inter_phase_neighbors,
+            'enclosed_clusters': enclosed_by_phase,
+            'longest_neighbor': longest_neighbor,
+            'longest_neighbor_length': longest_neighbor_length,
+            'n_pixels': n_pixels,
+            'touches_roi': touches_roi,
+            'roi_boundary_length': roi_boundary_length
+        }
+
+
+    def get_cluster_parent(self, cluster_id):
+        """
+        Find the "parent" cluster - the neighbor with the longest boundary.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster to analyze
+        
+        Returns
+        -------
+        parent_info : dict
+            Dictionary containing:
+            - 'cluster_id': this cluster
+            - 'parent_id': cluster with longest boundary (None if ROI is longest)
+            - 'parent_phase_id': phase of parent
+            - 'boundary_length': length of boundary with parent
+            - 'boundary_fraction': fraction of total boundary
+        """
+        topology = self.get_cluster_topology_info(cluster_id)
+        
+        parent_id = topology['longest_neighbor']
+        boundary_length = topology['longest_neighbor_length']
+        
+        # Calculate total boundary length
+        total_boundary = boundary_length + topology.get('roi_boundary_length', 0)
+        for neighbors in topology['same_phase_neighbors'].values():
+            if isinstance(neighbors, dict):
+                total_boundary += sum(neighbors.values())
+            else:
+                total_boundary += neighbors
+        for phase_neighbors in topology['inter_phase_neighbors'].values():
+            total_boundary += sum(phase_neighbors.values())
+        
+        if parent_id is not None:
+            parent_idx = np.where(self.clusters == parent_id)[0][0]
+            parent_phase = self.cluster_phases_id[parent_idx]
+        else:
+            parent_phase = None
+        
+        boundary_fraction = boundary_length / total_boundary if total_boundary > 0 else 0
+        
+        return {
+            'cluster_id': cluster_id,
+            'parent_id': parent_id,
+            'parent_phase_id': parent_phase,
+            'boundary_length': boundary_length,
+            'boundary_fraction': boundary_fraction
+        }
+    def get_boundary_indices(self, cluster_id, neighbor_id=None):
+        """
+        Get original array indices for boundary pixels.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+        neighbor_id : int, optional
+            Neighbor label. If None, returns all boundaries.
+            Use -1 for ROI boundary.
+        
+        Returns
+        -------
+        indices : array (M,)
+            Original array indices where data.X[indices], data.Y[indices]
+            are the boundary coordinates. -1 for coordinates not found.
+        coords : array (M, 2)
+            Corresponding (x, y) coordinates
+        """
+        # Find cluster index
+        try:
+            cluster_idx = np.where(self.clusters == cluster_id)[0][0]
+        except IndexError:
+            raise ValueError(f"Cluster {cluster_id} not found!")
+        
+        # Get boundaries
+        boundaries = self.grouped_boundaries[cluster_idx]
+        
+        if neighbor_id is not None:
+            # Get specific boundary
+            if neighbor_id not in boundaries:
+                raise ValueError(f"Cluster {cluster_id} has no boundary with neighbor {neighbor_id}")
+            coords = boundaries[neighbor_id]
+        else:
+            # Get all boundaries
+            all_coords = []
+            for nb_id, coords_nb in boundaries.items():
+                all_coords.append(coords_nb)
+            coords = np.vstack(all_coords) if all_coords else np.zeros((0, 2))
+        
+        # Convert coordinates to indices
+        indices = self.data.coords_to_indices(coords)
+        
+        return indices, coords
+    
+    def get_all_boundary_indices_by_type(self, cluster_id):
+        """
+        Get boundary indices organized by type.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+        
+        Returns
+        -------
+        boundary_indices : dict
+            Dictionary with structure:
+            {
+                'roi': {'indices': array, 'coords': array},
+                'same_phase': {neighbor_id: {'indices': array, 'coords': array}},
+                'inter_phase': {neighbor_id: {'indices': array, 'coords': array}}
+            }
+        """
+        # Find cluster index
+        try:
+            cluster_idx = np.where(self.clusters == cluster_id)[0][0]
+        except IndexError:
+            raise ValueError(f"Cluster {cluster_id} not found!")
+        
+        cluster_phase_id = self.cluster_phases_id[cluster_idx]
+        boundaries = self.grouped_boundaries[cluster_idx]
+        boundary_phases = self.grouped_boundary_phases_id[cluster_idx]
+        
+        result = {
+            'roi': {'indices': None, 'coords': None},
+            'same_phase': {},
+            'inter_phase': {}
+        }
+        
+        for neighbor_id, coords in boundaries.items():
+            indices = self.data.coords_to_indices(coords)
+            
+            if neighbor_id == -1:
+                # ROI boundary
+                result['roi']['indices'] = indices
+                result['roi']['coords'] = coords
+            else:
+                neighbor_phase = boundary_phases[neighbor_id]
+                
+                if neighbor_phase == cluster_phase_id:
+                    # Same phase boundary
+                    result['same_phase'][neighbor_id] = {
+                        'indices': indices,
+                        'coords': coords
+                    }
+                else:
+                    # Inter-phase boundary
+                    result['inter_phase'][neighbor_id] = {
+                        'indices': indices,
+                        'coords': coords
+                    }
+        
+        return result
+    
+    def get_interphase_boundary_data(self, cluster_id, neighbor_id):
+        """
+        Get complete data for pixels on an inter-phase boundary.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+        neighbor_id : int
+            Neighbor cluster label
+        
+        Returns
+        -------
+        boundary_data : dict
+            Dictionary containing:
+            - 'indices': original array indices
+            - 'coords': (x, y) coordinates
+            - 'X', 'Y': coordinates
+            - 'orientations': orientation data
+            - 'phases_id': phase labels
+            - 'quality': quality values
+            - 'n_pixels': number of boundary pixels
+        """
+        indices, coords = self.get_boundary_indices(cluster_id, neighbor_id)
+        
+        # Filter out invalid indices
+        valid_mask = indices >= 0
+        valid_indices = indices[valid_mask]
+        valid_coords = coords[valid_mask]
+        
+        if len(valid_indices) == 0:
+            return {
+                'indices': np.array([], dtype=np.int32),
+                'coords': np.zeros((0, 2)),
+                'X': np.array([]),
+                'Y': np.array([]),
+                'orientations': np.zeros((0, 4)),
+                'phases_id': np.array([], dtype=np.int32),
+                'quality': np.array([]),
+                'n_pixels': 0
+            }
+        
+        return {
+            'indices': valid_indices,
+            'coords': valid_coords,
+            'X': self.data.X[valid_indices],
+            'Y': self.data.Y[valid_indices],
+            'orientations': self.data.orientations[valid_indices],
+            'phases_id': self.data.phases_id[valid_indices],
+            'quality': self.data.quality[valid_indices],
+            'n_pixels': len(valid_indices)
+        }
+    
+    def get_parent_child_hierarchy_with_boundaries(self, parent_phase_id, child_phase_id,
+                                                ref_idx=0, max_iter=10, tol=1e-6, 
+                                                parent_ids_out=False,
+                                                filter_lamellar_to_semi_rois=False,
+                                                clustering_result=None,
+                                                semi_roi_params=None,
+                                                elongation_cache=None,
+                                                min_aspect_ratio=2.5,
+                                                include_touching_parents=True):
+        """
+        Get complete hierarchical structure of parent-child relationships with boundary details.
+        
+        For each parent cluster (phase 1), lists all enclosed children (phase 2),
+        and for each parent-child pair, provides detailed boundary information including
+        original array indices from both sides.
+        
+        Optionally filters lamellar child interfaces into semi-ROI 1 and semi-ROI 2.
+        
+        Parameters
+        ----------
+        parent_phase_id : int
+            Phase ID of parent clusters
+        child_phase_id : int
+            Phase ID of child clusters
+        ref_idx : int, optional
+            Index of the referential orientation for calculation of similar orientations 
+            prior their averaging. Default is 0.
+        max_iter : int, optional
+            Maximum iterations for averaging. Default is 10.
+        tol : float, optional
+            Tolerance for averaging. Default is 1e-6.
+        parent_ids_out : bool, optional
+            If True, also returns list of parent IDs. Default is False.
+        filter_lamellar_to_semi_rois : bool, optional
+            If True, identifies lamellar children and splits their interfaces into
+            semi-ROI 1 and semi-ROI 2. Default is False (backward compatible).
+        clustering_result : ClusteringResult, optional
+            Required if filter_lamellar_to_semi_rois=True.
+        semi_roi_params : dict, optional
+            Parameters for semi-ROI creation:
+            - 'n_layers': int (default 1)
+            - 'longitudinal_shrinkage': float (default 0.1)
+            - 'layer_thickness_relative': float (default None)
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results to avoid recomputing PCA.
+        min_aspect_ratio : float, optional
+            Minimum aspect ratio to consider a cluster lamellar. Default is 2.5.
+        include_touching_parents : bool, optional
+            If True, includes children under ALL parent clusters they touch,
+            not just the enclosing parent. This captures interfaces at borders
+            between parent clusters. Default is False (backward compatible).
+            When True, adds 'relationship' field to each child: 'enclosed' or 'touching'.
+        
+        Returns
+        -------
+        hierarchy : list of dict
+            List of parent cluster information. Each dict contains:
+            {
+                'parent_cluster_id': int,
+                'parent_phase_id': int,
+                'parent_n_pixels': int,
+                'n_children': int,
+                'parent_boundary_indices_all': array,
+                'child_boundary_indices_all': array,
+                'parent_boundary_mask': array(bool),
+                'child_boundary_mask': array(bool),
+                'parent_boundary_avgori_all': array,
+                'child_boundary_avgori_all': array,
+                'children': [
+                    {
+                        'child_cluster_id': int,
+                        'child_phase_id': int,
+                        'child_n_pixels': int,
+                        'relationship': str,  # 'enclosed' or 'touching' (if include_touching_parents=True)
+                        'enclosing_parent_id': int,  # ID of parent that encloses this child (if relationship='touching')
+                        'is_lamellar': bool,  # (only if filter_lamellar_to_semi_rois=True)
+                        'aspect_ratio': float,  # (only if is_lamellar=True)
+                        'interface': {...},
+                        'semi_roi_1': {...},  # (only if lamellar)
+                        'semi_roi_2': {...},  # (only if lamellar)
+                        'roi_info': dict  # (only if lamellar)
+                    },
+                    ...
+                ]
+            }
+        parent_ids : list (optional)
+            Returned only if parent_ids_out=True
+        
+        Examples
+        --------
+        >>> # Standard usage (backward compatible)
+        >>> hierarchy = boundary_result.get_parent_child_hierarchy_with_boundaries(1, 2)
+        >>> 
+        >>> # With touching parents (captures border interfaces)
+        >>> hierarchy = boundary_result.get_parent_child_hierarchy_with_boundaries(
+        ...     parent_phase_id=1,
+        ...     child_phase_id=2,
+        ...     filter_lamellar_to_semi_rois=True,
+        ...     clustering_result=clustering_result,
+        ...     elongation_cache=all_clusters,
+        ...     include_touching_parents=True  # NEW
+        ... )
+        >>> 
+        >>> # Check relationships
+        >>> for parent in hierarchy:
+        ...     for child in parent['children']:
+        ...         if child['relationship'] == 'touching':
+        ...             print(f"Child {child['child_cluster_id']} touches Parent {parent['parent_cluster_id']}")
+        ...             print(f"  (enclosed by Parent {child['enclosing_parent_id']})")
+        """
+        from matplotlib.path import Path
+        
+        # Validate parameters
+        if filter_lamellar_to_semi_rois and clustering_result is None:
+            raise ValueError("filter_lamellar_to_semi_rois requires clustering_result parameter")
+        
+        if include_touching_parents and clustering_result is None:
+            raise ValueError("include_touching_parents requires clustering_result parameter")
+        
+        # Set default semi_roi_params
+        if semi_roi_params is None:
+            semi_roi_params = {
+                'n_layers': 1,
+                'longitudinal_shrinkage': 0.1,
+                'layer_thickness_relative': None
+            }
+        
+        # Get all parent clusters that have children
+        enclosures = self.find_all_enclosures(parent_phase_id, child_phase_id)
+        parent_symops = np.array(self.data.phases[self.data.phase_names[parent_phase_id]]['symops'])
+        child_symops = np.array(self.data.phases[self.data.phase_names[child_phase_id]]['symops'])
+        hierarchy = []
+        
+        print(f"Building hierarchy for Phase {parent_phase_id} → Phase {child_phase_id}...")
+        if filter_lamellar_to_semi_rois:
+            print(f"  Filtering lamellar children (AR >= {min_aspect_ratio}) to semi-ROIs...")
+        if include_touching_parents:
+            print(f"  Including touching parents (captures border interfaces)...")
+        
+        parent_ids = []
+        parent_boundary_avgori_all = self.data.orientations.copy()
+        child_boundary_avgori_all = self.data.orientations.copy()
+        
+        # Helper function to create child info
+        def create_child_info(parent_id, child_id, relationship='enclosed', enclosing_parent_id=None):
+            """Create child info dictionary with interface and optional semi-ROI data."""
+            
+            # Get child cluster info
+            child_n_pixels = np.sum(self.clustering.labels == child_id)
+            
+            # Get boundary data from parent's perspective
+            parent_boundary_indices, parent_boundary_coords = \
+                self.get_boundary_indices(parent_id, neighbor_id=child_id)
+            
+            # Get boundary data from child's perspective
+            child_boundary_indices, child_boundary_coords = \
+                self.get_boundary_indices(child_id, neighbor_id=parent_id)
+            
+            # Filter out invalid indices
+            parent_valid_mask = parent_boundary_indices >= 0
+            child_valid_mask = child_boundary_indices >= 0
+            
+            parent_valid_indices = parent_boundary_indices[parent_valid_mask]
+            parent_valid_coords = parent_boundary_coords[parent_valid_mask]
+            
+            parent_X = self.data.X[parent_valid_indices]
+            parent_Y = self.data.Y[parent_valid_indices]
+            
+            child_valid_indices = child_boundary_indices[child_valid_mask]
+            child_valid_coords = child_boundary_coords[child_valid_mask]
+            child_X = self.data.X[child_valid_indices]
+            child_Y = self.data.Y[child_valid_indices]
+            
+            # Total boundary pixels (both sides)
+            n_boundary_pixels = len(parent_valid_indices) + len(child_valid_indices)
+            
+            # Get reference orientations
+            q_ref_parent = None
+            if clustering_result is not None:
+                q_ref_parent = clustering_result.avg_quats[parent_id]
+            
+            q_ref_child = None
+            if clustering_result is not None:
+                q_ref_child = clustering_result.avg_quats[child_id]
+            
+            # Calculate average orientations
+            parent_q_mean, parent_M_mean, parent_M_best_cluster, parent_q_best_cluster = get_avg_orientations(
+                self.data.quaternions[parent_valid_indices], parent_symops, 
+                ref_idx=ref_idx, max_iter=max_iter, tol=tol, q_ref=q_ref_parent
+            )
+            child_q_mean, child_M_mean, child_M_best_cluster, child_q_best_cluster = get_avg_orientations(
+                self.data.quaternions[child_valid_indices], child_symops, 
+                ref_idx=ref_idx, max_iter=max_iter, tol=tol, q_ref=q_ref_child
+            )
+            
+            # Build basic child info
+            child_info = {
+                'child_cluster_id': child_id,
+                'child_phase_id': child_phase_id,
+                'child_n_pixels': child_n_pixels,
+                'relationship': relationship,
+                'interface': {
+                    'n_boundary_pixels': n_boundary_pixels,
+                    'parent_side': {
+                        'indices': parent_valid_indices,
+                        'coords': parent_valid_coords,
+                        'X': parent_X,
+                        'Y': parent_Y,
+                        'q_mean': parent_q_mean,
+                        'M_mean': parent_M_mean,
+                        'q_best_cluster': parent_q_best_cluster,
+                        'M_best_cluster': parent_M_best_cluster,
+                        'n_pixels': len(parent_valid_indices)
+                    },
+                    'child_side': {
+                        'indices': child_valid_indices,
+                        'coords': child_valid_coords,
+                        'X': child_X,
+                        'Y': child_Y,
+                        'q_mean': child_q_mean,
+                        'M_mean': child_M_mean,
+                        'q_best_cluster': child_q_best_cluster,
+                        'M_best_cluster': child_M_best_cluster,
+                        'n_pixels': len(child_valid_indices)
+                    }
+                }
+            }
+            
+            # Add enclosing parent ID if this is a touching relationship
+            if relationship == 'touching' and enclosing_parent_id is not None:
+                child_info['enclosing_parent_id'] = enclosing_parent_id
+            
+            # ========== ADD SEMI-ROI FILTERING FOR LAMELLAR CHILDREN ==========
+            if filter_lamellar_to_semi_rois:
+                # Check if this child is lamellar
+                is_lamellar = False
+                aspect_ratio = None
+                
+                # Get or compute elongation info
+                elongation_info = None
+                if elongation_cache is not None:
+                    if isinstance(elongation_cache, dict):
+                        elongation_info = elongation_cache.get(child_id)
+                    elif isinstance(elongation_cache, list):
+                        for cluster_data in elongation_cache:
+                            if cluster_data['cluster_id'] == child_id:
+                                elongation_info = cluster_data
+                                break
+                
+                if elongation_info is None:
+                    # Compute elongation
+                    elongation_info = clustering_result.analyze_cluster_elongation(
+                        child_id, use_sklearn=False
+                    )
+                
+                if elongation_info is not None:
+                    aspect_ratio = elongation_info.get('aspect_ratio', 0)
+                    is_lamellar = aspect_ratio >= min_aspect_ratio
+                
+                child_info['is_lamellar'] = is_lamellar
+                
+                if is_lamellar:
+                    child_info['aspect_ratio'] = aspect_ratio
+                    
+                    # Get ROI info (only compute once, reuse for touching parents)
+                    roi_info = clustering_result.create_lamellar_roi(
+                        cluster_id=child_id,
+                        n_layers=semi_roi_params['n_layers'],
+                        longitudinal_shrinkage=semi_roi_params['longitudinal_shrinkage'],
+                        layer_thickness_relative=semi_roi_params['layer_thickness_relative'],
+                        elongation_cache=elongation_cache
+                    )
+                    
+                    child_info['roi_info'] = roi_info
+                    
+                    # Get semi-ROI vertices
+                    semi1_vertices = roi_info['semi_roi_1_vertices']
+                    semi2_vertices = roi_info['semi_roi_2_vertices']
+                    
+                    semi1_path = Path(semi1_vertices)
+                    semi2_path = Path(semi2_vertices)
+                    
+                    # ========== FILTER PARENT SIDE ==========
+                    # Semi-ROI 1
+                    parent_semi1_mask = semi1_path.contains_points(parent_valid_coords)
+                    parent_semi1_indices = parent_valid_indices[parent_semi1_mask]
+                    parent_semi1_coords = parent_valid_coords[parent_semi1_mask]
+                    
+                    if len(parent_semi1_indices) > 0:
+                        parent_semi1_q_mean, parent_semi1_M_mean, parent_semi1_M_best_sym, parent_semi1_q_best_sym = get_avg_orientations(
+                            self.data.quaternions[parent_semi1_indices], parent_symops,
+                            ref_idx=ref_idx, max_iter=max_iter, tol=tol, q_ref=q_ref_parent
+                        )
+                    else:
+                        parent_semi1_q_mean = None
+                        parent_semi1_M_mean = None
+                        parent_semi1_M_best_sym = None
+                        parent_semi1_q_best_sym = None
+                    
+                    # Semi-ROI 2
+                    parent_semi2_mask = semi2_path.contains_points(parent_valid_coords)
+                    parent_semi2_indices = parent_valid_indices[parent_semi2_mask]
+                    parent_semi2_coords = parent_valid_coords[parent_semi2_mask]
+                    
+                    if len(parent_semi2_indices) > 0:
+                        parent_semi2_q_mean, parent_semi2_M_mean, parent_semi2_M_best_sym, parent_semi2_q_best_sym = get_avg_orientations(
+                            self.data.quaternions[parent_semi2_indices], parent_symops,
+                            ref_idx=ref_idx, max_iter=max_iter, tol=tol, q_ref=q_ref_parent
+                        )
+                    else:
+                        parent_semi2_q_mean = None
+                        parent_semi2_M_best_sym = None
+                        parent_semi2_q_best_sym = None
+                        parent_semi2_M_mean = None
+                    
+                    # ========== FILTER CHILD SIDE ==========
+                    # Semi-ROI 1
+                    child_semi1_mask = semi1_path.contains_points(child_valid_coords)
+                    child_semi1_indices = child_valid_indices[child_semi1_mask]
+                    child_semi1_coords = child_valid_coords[child_semi1_mask]
+                    
+                    if len(child_semi1_indices) > 0:
+                        child_semi1_q_mean, child_semi1_M_mean, child_semi1_M_best_sym, child_semi1_q_best_sym = get_avg_orientations(
+                            self.data.quaternions[child_semi1_indices], child_symops,
+                            ref_idx=ref_idx, max_iter=max_iter, tol=tol, q_ref=q_ref_child
+                        )
+                    else:
+                        child_semi1_q_mean = None
+                        child_semi1_M_best_sym = None
+                        child_semi1_q_best_sym = None
+                        child_semi1_M_mean = None
+                    
+                    # Semi-ROI 2
+                    child_semi2_mask = semi2_path.contains_points(child_valid_coords)
+                    child_semi2_indices = child_valid_indices[child_semi2_mask]
+                    child_semi2_coords = child_valid_coords[child_semi2_mask]
+                    
+                    if len(child_semi2_indices) > 0:
+                        child_semi2_q_mean, child_semi2_M_mean, child_semi2_M_best_sym, child_semi2_q_best_sym = get_avg_orientations(
+                            self.data.quaternions[child_semi2_indices], child_symops,
+                            ref_idx=ref_idx, max_iter=max_iter, tol=tol, q_ref=q_ref_child
+                        )
+                    else:
+                        child_semi2_q_mean = None
+                        child_semi2_M_best_sym = None
+                        child_semi2_q_best_sym = None
+                        child_semi2_M_mean = None
+                    
+                    # ========== ADD SEMI-ROI DATA TO CHILD INFO ==========
+                    if len(parent_semi1_indices) != 0:
+                        no_parent_side = False
+                    else:
+                        no_parent_side = True
+                    child_info['semi_roi_1'] = {
+                        'n_boundary_pixels': len(parent_semi1_indices) + len(child_semi1_indices),
+                        'no_parent_side': no_parent_side,
+                        'parent_side': {
+                            'indices': parent_semi1_indices,
+                            'coords': parent_semi1_coords,
+                            'X': self.data.X[parent_semi1_indices] if len(parent_semi1_indices) > 0 else np.array([]),
+                            'Y': self.data.Y[parent_semi1_indices] if len(parent_semi1_indices) > 0 else np.array([]),
+                            'q_mean': parent_semi1_q_mean,
+                            'M_mean': parent_semi1_M_mean,
+                            'q_best_sym': parent_semi1_q_best_sym,
+                            'M_best_sym': parent_semi1_M_best_sym,
+                            'n_pixels': len(parent_semi1_indices)
+                        },
+                        'child_side': {
+                            'indices': child_semi1_indices,
+                            'coords': child_semi1_coords,
+                            'X': self.data.X[child_semi1_indices] if len(child_semi1_indices) > 0 else np.array([]),
+                            'Y': self.data.Y[child_semi1_indices] if len(child_semi1_indices) > 0 else np.array([]),
+                            'q_mean': child_semi1_q_mean,
+                            'M_mean': child_semi1_M_mean,
+                            'q_best_sym': child_semi1_q_best_sym,
+                            'M_best_sym': child_semi1_M_best_sym,
+                            'n_pixels': len(child_semi1_indices)
+                        }
+                    }
+                    if len(parent_semi2_indices) != 0:
+                        no_parent_side = False
+                    else:
+                        no_parent_side = True
+                    child_info['semi_roi_2'] = {
+                        'n_boundary_pixels': len(parent_semi2_indices) + len(child_semi2_indices),
+                        'no_parent_side': no_parent_side,
+                        'parent_side': {
+                            'indices': parent_semi2_indices,
+                            'coords': parent_semi2_coords,
+                            'X': self.data.X[parent_semi2_indices] if len(parent_semi2_indices) > 0 else np.array([]),
+                            'Y': self.data.Y[parent_semi2_indices] if len(parent_semi2_indices) > 0 else np.array([]),
+                            'q_mean': parent_semi2_q_mean,
+                            'M_mean': parent_semi2_M_mean,
+                            'q_best_sym': parent_semi2_q_best_sym,
+                            'M_best_sym': parent_semi2_M_best_sym,
+                            'n_pixels': len(parent_semi2_indices),
+                        },
+                        'child_side': {
+                            'indices': child_semi2_indices,
+                            'coords': child_semi2_coords,
+                            'X': self.data.X[child_semi2_indices] if len(child_semi2_indices) > 0 else np.array([]),
+                            'Y': self.data.Y[child_semi2_indices] if len(child_semi2_indices) > 0 else np.array([]),
+                            'q_mean': child_semi2_q_mean,
+                            'M_mean': child_semi2_M_mean,
+                            'q_best_sym': child_semi2_q_best_sym,
+                            'M_best_sym': child_semi2_M_best_sym,
+                            'n_pixels': len(child_semi2_indices)
+                        }
+                    }
+            # ==================================================================
+            
+            return child_info, parent_valid_indices, child_valid_indices
+        
+        # ========== FIRST PASS: BUILD HIERARCHY WITH ENCLOSED CHILDREN ==========
+        # Track which children are enclosed by which parents
+        enclosed_children_map = {}  # {child_id: enclosing_parent_id}
+        
+        for enc in enclosures:
+            parent_id = enc['container_cluster']
+            parent_ids.append(parent_id)
+            child_ids = enc['enclosed_clusters']
+            
+            # Track enclosures
+            for child_id in child_ids:
+                enclosed_children_map[child_id] = parent_id
+            
+            # Get parent cluster info
+            parent_n_pixels = np.sum(self.clustering.labels == parent_id)
+            
+            # Build children list with interface details
+            children_list = []
+            
+            parent_boundary_indices_all = np.array([])
+            child_boundary_indices_all = np.array([])
+            
+            for child_id in child_ids:
+                child_info, parent_indices, child_indices = create_child_info(
+                    parent_id, child_id, relationship='enclosed'
+                )
+                
+                parent_boundary_indices_all = np.append(parent_boundary_indices_all, parent_indices)
+                child_boundary_indices_all = np.append(child_boundary_indices_all, child_indices)
+                
+                # Update global orientation arrays
+                if len(parent_indices) > 0:
+                    parent_boundary_avgori_all[parent_indices, :, :] = child_info['interface']['parent_side']['M_mean']
+                if len(child_indices) > 0:
+                    child_boundary_avgori_all[child_indices] = child_info['interface']['child_side']['M_mean']
+                
+                children_list.append(child_info)
+            
+            parent_boundary_indices_all = parent_boundary_indices_all.astype(int)
+            child_boundary_indices_all = child_boundary_indices_all.astype(int)
+            parent_boundary_mask = (self.data.X * 0).astype(bool)
+            parent_boundary_mask[parent_boundary_indices_all] = True
+            child_boundary_mask = (self.data.X * 0).astype(bool)
+            child_boundary_mask[child_boundary_indices_all] = True
+            
+            parent_info = {
+                'parent_cluster_id': parent_id,
+                'parent_phase_id': parent_phase_id,
+                'parent_n_pixels': parent_n_pixels,
+                'n_children': len(children_list),
+                'children': children_list,
+                'parent_boundary_indices_all': parent_boundary_indices_all,
+                'child_boundary_indices_all': child_boundary_indices_all,
+                'parent_boundary_mask': parent_boundary_mask,
+                'child_boundary_mask': child_boundary_mask,
+                'parent_boundary_avgori_all': parent_boundary_avgori_all,
+                'child_boundary_avgori_all': child_boundary_avgori_all
+            }
+            
+            hierarchy.append(parent_info)
+        
+        # ========== SECOND PASS: ADD TOUCHING CHILDREN (if requested) ==========
+        if include_touching_parents:
+            print(f"  Checking for touching relationships...")
+            
+            touching_count = 0
+            
+            # For each parent, check if any children from other parents touch it
+            for parent_info in hierarchy:
+                parent_id = parent_info['parent_cluster_id']
+                
+                # Find parent's index in boundary result
+                parent_idx = np.where(self.clusters == parent_id)[0]
+                
+                if len(parent_idx) == 0:
+                    continue
+                
+                parent_idx = parent_idx[0]
+                
+                # Get all neighbors of this parent from grouped_boundaries
+                parent_boundaries = self.grouped_boundaries[parent_idx]
+                parent_boundary_phases = self.grouped_boundary_phases_id[parent_idx]
+                
+                # Iterate through all neighbors (keys in boundaries dict)
+                for neighbor_id in parent_boundaries.keys():
+                    if neighbor_id == -1:
+                        continue  # Skip ROI boundary
+                    
+                    # Get neighbor phase
+                    neighbor_phase = parent_boundary_phases[neighbor_id]
+                    
+                    # Is it a child phase?
+                    if neighbor_phase == child_phase_id:
+                        # Is it NOT already in this parent's children (i.e., not enclosed)?
+                        if neighbor_id not in [c['child_cluster_id'] for c in parent_info['children']]:
+                            # This is a touching child!
+                            enclosing_parent_id = enclosed_children_map.get(neighbor_id)
+                            
+                            if enclosing_parent_id is not None:
+                                # Create child info for touching relationship
+                                touching_child_info, parent_indices, child_indices = create_child_info(
+                                    parent_id, neighbor_id, 
+                                    relationship='touching',
+                                    enclosing_parent_id=enclosing_parent_id
+                                )
+                                
+                                # Add to this parent's children
+                                parent_info['children'].append(touching_child_info)
+                                parent_info['n_children'] += 1
+                                
+                                # Update boundary indices (append to existing)
+                                parent_info['parent_boundary_indices_all'] = np.append(
+                                    parent_info['parent_boundary_indices_all'], parent_indices
+                                ).astype(int)
+                                parent_info['child_boundary_indices_all'] = np.append(
+                                    parent_info['child_boundary_indices_all'], child_indices
+                                ).astype(int)
+                                
+                                # Update masks
+                                if len(parent_indices) > 0:
+                                    parent_info['parent_boundary_mask'][parent_indices] = True
+                                if len(child_indices) > 0:
+                                    parent_info['child_boundary_mask'][child_indices] = True
+                                
+                                touching_count += 1
+            
+            if touching_count > 0:
+                print(f"  Found {touching_count} touching relationships")
+            else:
+                print(f"  No touching relationships found")
+        
+        # ========== SUMMARY ==========
+        print(f"Found {len(hierarchy)} parent clusters with children")
+        
+        if filter_lamellar_to_semi_rois:
+            # Count lamellar children (unique, not double-counting touching ones)
+            all_lamellar_children = set()
+            for parent in hierarchy:
+                for child in parent['children']:
+                    if child.get('is_lamellar', False):
+                        all_lamellar_children.add(child['child_cluster_id'])
+            print(f"  {len(all_lamellar_children)} lamellar children identified and filtered to semi-ROIs")
+        
+        print("""Hierarchy structure is as follows:
+        hierarchy : list of dict
+            List of parent cluster information. Each dict contains:
+            {
+                'parent_cluster_id': int,
+                'parent_phase_id': int,
+                'parent_n_pixels': int,
+                'n_children': int,
+                'parent_boundary_indices_all': array,
+                'child_boundary_indices_all': array,
+                'parent_boundary_mask': array(bool),
+                'child_boundary_mask': array(bool),
+                'parent_boundary_avgori_all': array,
+                'child_boundary_avgori_all': array,
+                'children': [
+                    {
+                        'child_cluster_id': int,
+                        'child_phase_id': int,
+                        'child_n_pixels': int,
+                        'relationship': 'enclosed' or 'touching',
+                        'enclosing_parent_id': int (if relationship='touching'),
+                        'interface': {...},
+                        # If filter_lamellar_to_semi_rois=True:
+                        'is_lamellar': bool,
+                        'aspect_ratio': float (if lamellar),
+                        'semi_roi_1': {...} (if lamellar),
+                        'semi_roi_2': {...} (if lamellar),
+                        'roi_info': dict (if lamellar)
+                    },
+                    ...
+                ]
+            }
+        """)
+        
+        if parent_ids_out:
+            return hierarchy, parent_ids
+        else:
+            return hierarchy
+    
+    def print_parent_child_hierarchy(self, parent_phase_id, child_phase_id, 
+                                 parent_cluster_id=None,
+                                 max_parents=None, max_children=None):
+        """
+        Print formatted hierarchy of parent-child relationships.
+        
+        Parameters
+        ----------
+        parent_phase_id : int
+            Phase ID of parent clusters
+        child_phase_id : int
+            Phase ID of child clusters
+        parent_cluster_id : int, optional
+            Specific parent cluster ID to print. If None, prints all parents.
+        max_parents : int, optional
+            Maximum number of parent clusters to print (ignored if parent_cluster_id is specified)
+        max_children : int, optional
+            Maximum number of children per parent to print
+        """
+        hierarchy = self.get_parent_child_hierarchy_with_boundaries(
+            parent_phase_id, child_phase_id
+        )
+        
+        # Filter for specific parent if requested
+        if parent_cluster_id is not None:
+            hierarchy = [p for p in hierarchy if p['parent_cluster_id'] == parent_cluster_id]
+            
+            if len(hierarchy) == 0:
+                print(f"\nParent cluster {parent_cluster_id} not found or has no children of phase {child_phase_id}")
+                return
+        
+        print(f"\n{'='*80}")
+        if parent_cluster_id is not None:
+            print(f"Parent-Child Hierarchy for Cluster {parent_cluster_id}: "
+                f"Phase {parent_phase_id} → Phase {child_phase_id}")
+        else:
+            print(f"Parent-Child Hierarchy: Phase {parent_phase_id} → Phase {child_phase_id}")
+        print(f"{'='*80}\n")
+        
+        for i, parent in enumerate(hierarchy):
+            if parent_cluster_id is None and max_parents is not None and i >= max_parents:
+                print(f"\n... and {len(hierarchy) - max_parents} more parent clusters")
+                break
+            
+            print(f"Parent Cluster {parent['parent_cluster_id']} "
+                f"(Phase {parent['parent_phase_id']}, {parent['parent_n_pixels']} pixels)")
+            print(f"  └─ {parent['n_children']} children:")
+            
+            for j, child in enumerate(parent['children']):
+                if max_children is not None and j >= max_children:
+                    print(f"     ... and {len(parent['children']) - max_children} more children")
+                    break
+                
+                print(f"\n     Child Cluster {child['child_cluster_id']} "
+                    f"(Phase {child['child_phase_id']}, {child['child_n_pixels']} pixels)")
+                
+                interface = child['interface']
+                print(f"       Interface: {interface['n_boundary_pixels']} total boundary pixels")
+                print(f"         Parent side: {interface['parent_side']['n_pixels']} pixels")
+                print(f"           Indices: {interface['parent_side']['indices'][:10]}...")
+                print(f"         Child side:  {interface['child_side']['n_pixels']} pixels")
+                print(f"           Indices: {interface['child_side']['indices'][:10]}...")
+            
+            print()
+
+    
+
+
+    def export_hierarchy_to_dict(self, parent_phase_id, child_phase_id):
+        """
+        Export hierarchy in a format suitable for JSON/analysis.
+        
+        Parameters
+        ----------
+        parent_phase_id : int
+            Phase ID of parent clusters
+        child_phase_id : int
+            Phase ID of child clusters
+        
+        Returns
+        -------
+        export_data : dict
+            Dictionary with simplified structure (arrays converted to lists)
+        """
+        hierarchy = self.get_parent_child_hierarchy_with_boundaries(
+            parent_phase_id, child_phase_id
+        )
+        
+        export_data = {
+            'parent_phase_id': parent_phase_id,
+            'child_phase_id': child_phase_id,
+            'n_parents': len(hierarchy),
+            'parents': []
+        }
+        
+        for parent in hierarchy:
+            parent_export = {
+                'parent_cluster_id': int(parent['parent_cluster_id']),
+                'parent_n_pixels': int(parent['parent_n_pixels']),
+                'n_children': int(parent['n_children']),
+                'children': []
+            }
+            
+            for child in parent['children']:
+                child_export = {
+                    'child_cluster_id': int(child['child_cluster_id']),
+                    'child_n_pixels': int(child['child_n_pixels']),
+                    'interface': {
+                        'n_boundary_pixels': int(child['interface']['n_boundary_pixels']),
+                        'parent_side': {
+                            'n_pixels': int(child['interface']['parent_side']['n_pixels']),
+                            'indices': child['interface']['parent_side']['indices'].tolist()
+                        },
+                        'child_side': {
+                            'n_pixels': int(child['interface']['child_side']['n_pixels']),
+                            'indices': child['interface']['child_side']['indices'].tolist()
+                        }
+                    }
+                }
+                parent_export['children'].append(child_export)
+            
+            export_data['parents'].append(parent_export)
+        
+        return export_data
+
+
+    def get_interface_data_for_hierarchy(self, parent_phase_id, child_phase_id):
+        """
+        Get complete EBSD data for all interfaces in the hierarchy.
+        
+        Parameters
+        ----------
+        parent_phase_id : int
+            Phase ID of parent clusters
+        child_phase_id : int
+            Phase ID of child clusters
+        
+        Returns
+        -------
+        interface_data : list of dict
+            List with one entry per parent-child interface:
+            {
+                'parent_cluster_id': int,
+                'child_cluster_id': int,
+                'parent_data': {
+                    'indices': array,
+                    'X': array, 'Y': array,
+                    'orientations': array,
+                    'phases_id': array,
+                    'quality': array
+                },
+                'child_data': {
+                    'indices': array,
+                    'X': array, 'Y': array,
+                    'orientations': array,
+                    'phases_id': array,
+                    'quality': array
+                }
+            }
+        """
+        hierarchy = self.get_parent_child_hierarchy_with_boundaries(
+            parent_phase_id, child_phase_id
+        )
+        
+        interface_data = []
+        
+        for parent in hierarchy:
+            parent_id = parent['parent_cluster_id']
+            
+            for child in parent['children']:
+                child_id = child['child_cluster_id']
+                
+                # Get indices
+                parent_indices = child['interface']['parent_side']['indices']
+                child_indices = child['interface']['child_side']['indices']
+                
+                # Extract full data
+                entry = {
+                    'parent_cluster_id': parent_id,
+                    'child_cluster_id': child_id,
+                    'parent_data': {
+                        'indices': parent_indices,
+                        'X': self.data.X[parent_indices],
+                        'Y': self.data.Y[parent_indices],
+                        'orientations': self.data.orientations[parent_indices],
+                        'phases_id': self.data.phases_id[parent_indices],
+                        'quality': self.data.quality[parent_indices]
+                    },
+                    'child_data': {
+                        'indices': child_indices,
+                        'X': self.data.X[child_indices],
+                        'Y': self.data.Y[child_indices],
+                        'orientations': self.data.orientations[child_indices],
+                        'phases_id': self.data.phases_id[child_indices],
+                        'quality': self.data.quality[child_indices]
+                    }
+                }
+                
+                interface_data.append(entry)
+        
+        return interface_data
+
+
+    def save_hierarchy_to_hdf5(self, filename, parent_phase_id, child_phase_id):
+        """
+        Save complete hierarchy data to HDF5 file for later analysis.
+        
+        Parameters
+        ----------
+        filename : str
+            Output HDF5 filename
+        parent_phase_id : int
+            Phase ID of parent clusters
+        child_phase_id : int
+            Phase ID of child clusters
+        """
+        import h5py
+        
+        hierarchy = self.get_parent_child_hierarchy_with_boundaries(
+            parent_phase_id, child_phase_id
+        )
+        
+        with h5py.File(filename, 'w') as f:
+            # Store metadata
+            f.attrs['parent_phase_id'] = parent_phase_id
+            f.attrs['child_phase_id'] = child_phase_id
+            f.attrs['n_parents'] = len(hierarchy)
+            
+            # Create groups for each parent
+            for parent in hierarchy:
+                parent_id = parent['parent_cluster_id']
+                parent_group = f.create_group(f'parent_{parent_id}')
+                
+                parent_group.attrs['parent_cluster_id'] = parent_id
+                parent_group.attrs['parent_n_pixels'] = parent['parent_n_pixels']
+                parent_group.attrs['n_children'] = parent['n_children']
+                
+                # Create subgroups for each child
+                for child in parent['children']:
+                    child_id = child['child_cluster_id']
+                    child_group = parent_group.create_group(f'child_{child_id}')
+                    
+                    child_group.attrs['child_cluster_id'] = child_id
+                    child_group.attrs['child_n_pixels'] = child['child_n_pixels']
+                    child_group.attrs['n_boundary_pixels'] = child['interface']['n_boundary_pixels']
+                    
+                    # Save parent side boundary data
+                    parent_side = child_group.create_group('parent_side')
+                    parent_indices = child['interface']['parent_side']['indices']
+                    parent_side.create_dataset('indices', data=parent_indices)
+                    parent_side.create_dataset('X', data=self.data.X[parent_indices])
+                    parent_side.create_dataset('Y', data=self.data.Y[parent_indices])
+                    parent_side.create_dataset('orientations', data=self.data.orientations[parent_indices])
+                    parent_side.create_dataset('phases_id', data=self.data.phases_id[parent_indices])
+                    parent_side.create_dataset('quality', data=self.data.quality[parent_indices])
+                    
+                    # Save child side boundary data
+                    child_side = child_group.create_group('child_side')
+                    child_indices = child['interface']['child_side']['indices']
+                    child_side.create_dataset('indices', data=child_indices)
+                    child_side.create_dataset('X', data=self.data.X[child_indices])
+                    child_side.create_dataset('Y', data=self.data.Y[child_indices])
+                    child_side.create_dataset('orientations', data=self.data.orientations[child_indices])
+                    child_side.create_dataset('phases_id', data=self.data.phases_id[child_indices])
+                    child_side.create_dataset('quality', data=self.data.quality[child_indices])
+        
+        print(f"Hierarchy data saved to {filename}")    
 
 class BoundaryAnalyzer:
     """
@@ -3502,6 +7726,8 @@ class BoundaryAnalyzer:
                 grouped_boundary_phases=result.grouped_boundary_phases_id,
                 cluster_phases=result.cluster_phases_id
             )
+
+
 
 # ============================================================================
 # KAM and GND Analyzer
@@ -3863,9 +8089,10 @@ class EBSDVisualizer:
     - Easy to extend with new plot types
     """
     
-    def __init__(self, figsize=(10, 10), dpi=100):
+    def __init__(self, figsize=(10, 10), dpi=100,invert_y_axis=True):
         self.figsize = figsize
         self.dpi = dpi
+        self.invert_y_axis = invert_y_axis  # Default y-axis inversion
         self.fig = None
         self.axes = None
     def _getMask(self, clustering_result, roi=None,cluster_id=None, phase=None):
@@ -3903,38 +8130,131 @@ class EBSDVisualizer:
         Colors = np.zeros((labels.shape[0], 4))
         Colors = cluster_colors(renumbered_labels,cmap_name=cmap)
         return Colors.astype(int)
-    def plotClusters(self,clustering_result: ClusteringResult, d=[1,0,0], cluster_id=None, color_by='cluster', cmap='jet', tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, color=None, data=None, vmin=None,vmax=None, fig=None,ax=None, **kwargs):
-        plot=True
-        #if cluster_id is None:
-        #    mask=None
-        #else:
-        mask,phase =clustering_result._getMask(cluster_id=cluster_id, roi=roi, phase=phase)
-        if np.where(mask)[0].shape[0]<2:
+    def plotClusters(self, clustering_result: ClusteringResult, d=[1,0,0], cluster_id=None, 
+                    orientations=None, color_by='cluster', cmap='jet', tiling=None, 
+                    scalebar=True, globalScale=False, roi=None, phase=None, color=None, 
+                    data=None, mask=None, vmin=None, vmax=None, fig=None, ax=None,
+                    show_labels=False, label_phase=None, label_clusters=None, 
+                    label_fontsize=10, label_color='white', label_bbox=True,
+                    label_bbox_style='round', **kwargs):
+        """
+        Plot clusters with optional cluster ID labels.
+        
+        Parameters
+        ----------
+        clustering_result : ClusteringResult
+            Clustering result object
+        d : list, optional
+            Direction for IPF coloring. Default is [1,0,0].
+        cluster_id : int or list, optional
+            Specific cluster(s) to plot
+        orientations : array, optional
+            Custom orientations
+        color_by : str, optional
+            Coloring scheme: 'cluster', 'ipf', 'avgipf', 'data', 'kam', 'gnd'
+        cmap : str, optional
+            Colormap name. Default is 'jet'.
+        tiling : optional
+            Tiling parameter
+        scalebar : bool, optional
+            Show scalebar. Default is True.
+        globalScale : bool, optional
+            Use global scale. Default is False.
+        roi : optional
+            Region of interest
+        phase : int or str, optional
+            Phase to plot
+        color : array, optional
+            Custom colors
+        data : array, optional
+            Custom data for coloring
+        mask : array, optional
+            Mask for plotting
+        vmin, vmax : float, optional
+            Value range for data coloring
+        fig, ax : matplotlib objects, optional
+            Figure and axis to plot on
+        show_labels : bool or str, optional
+            Whether to show cluster ID labels:
+            - False: No labels (default)
+            - True or 'all': Show all cluster labels
+            - 'phase': Show labels for clusters in specified phase (requires label_phase)
+            - 'selected': Show labels only for specified clusters (requires label_clusters)
+        label_phase : int or str, optional
+            Phase ID or name for which to show labels (when show_labels='phase')
+        label_clusters : int or list of int, optional
+            Specific cluster ID(s) to label (when show_labels='selected')
+        label_fontsize : int, optional
+            Font size for labels. Default is 10.
+        label_color : str, optional
+            Text color for labels. Default is 'white'.
+        label_bbox : bool, optional
+            Whether to show background box for labels. Default is True.
+        label_bbox_style : str, optional
+            Style of label box: 'round', 'square', etc. Default is 'round'.
+        **kwargs : optional
+            Additional arguments passed to plotting functions
+        
+        Returns
+        -------
+        fig, ax : matplotlib figure and axis
+        
+        Examples
+        --------
+        >>> # Plot without labels
+        >>> fig, ax = vis.plotClusters(clustering_result)
+        >>> 
+        >>> # Show all cluster labels
+        >>> fig, ax = vis.plotClusters(clustering_result, show_labels=True)
+        >>> 
+        >>> # Show labels only for Ferrite phase
+        >>> fig, ax = vis.plotClusters(clustering_result, 
+        ...                           show_labels='phase', 
+        ...                           label_phase='Ferrite')
+        >>> 
+        >>> # Show labels only for specific clusters
+        >>> fig, ax = vis.plotClusters(clustering_result, 
+        ...                           show_labels='selected', 
+        ...                           label_clusters=[5, 12, 18, 23])
+        """        
+        import matplotlib.pyplot as plt
+        plot = True
+        
+        mask2, phase = clustering_result._getMask(cluster_id=cluster_id, roi=roi, phase=phase)
+        if mask is not None:
+            mask = mask * mask2
+        else:
+            mask = mask2
+        
+        if np.where(mask)[0].shape[0] < 2:
             print('Data with only 1 pixel or less cannot be plotted')
-            plot=False
+            plot = False
+            return None, None  # ADD THIS LINE - explicit return when not plotting
+        
         if plot:
-            if color_by=='data' or color_by.lower()=='kam' or color_by.lower()=='gnd':
-                #mask, phase = self._getMask(clustering_result, roi, cluster_id, phase)
-                if color_by.lower()=='kam':
-                    data=clustering_result.data.kam
-                if color_by.lower()=='gnd':
-                    data=clustering_result.data.GND
-                #print(color_by)
+            if color_by == 'data' or color_by.lower() == 'kam' or color_by.lower() == 'gnd':
+                if color_by.lower() == 'kam':
+                    data = clustering_result.data.kam
+                if color_by.lower() == 'gnd':
+                    data = clustering_result.data.GND
+                
                 if vmin is None:
                     vmin = np.nanmin(data)
                 if vmax is None:
                     vmax = np.nanmax(data)
-                norm = plt.Normalize(vmin,vmax)
-                cmap = plt.get_cmap(cmap)
-                Colors = cmap(norm(data))
-                Colors=Colors*255
-                Colors=Colors.astype(int)
-                Colors[:,3]=255
-                #print(mask)
-                #print(np.where(mask)[0].shape)
-                fig,ax = clustering_result.data.plot_colmap(d=d,tiling=tiling, scalebar=scalebar,globalScale=globalScale, color=Colors, mask=mask, fig=fig, ax=ax, **kwargs)
-            if color_by=='cluster':
-                #print(color_by)
+                norm = plt.Normalize(vmin, vmax)
+                cmap_obj = plt.get_cmap(cmap)
+                Colors = cmap_obj(norm(data))
+                Colors = Colors * 255
+                Colors = Colors.astype(int)
+                Colors[:, 3] = 255
+                
+                fig, ax = clustering_result.data.plot_colmap(
+                    d=d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
+                    color=Colors, mask=mask, fig=fig, ax=ax, **kwargs
+                )
+            
+            if color_by == 'cluster':
                 clusters_unique = clustering_result._clusters_unique
                 labels = clustering_result.labels
                 Colors = self.getColors(clusters_unique, labels, cmap=cmap)
@@ -3942,22 +8262,159 @@ class EBSDVisualizer:
                     color = Colors
                 if roi is None:
                     roi = clustering_result.parameters['roi']
-                fig,ax = clustering_result.data.plot_colmap(d=d,tiling=tiling, scalebar=scalebar,globalScale=globalScale, roi=roi, phase=phase, color=color, mask=mask,fig=fig, ax=ax, **kwargs)
-            elif color_by=='avgipf':
-                #print(mask)
+                fig, ax = clustering_result.data.plot_colmap(
+                    d=d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
+                    roi=roi, phase=phase, color=color, mask=mask, fig=fig, ax=ax, **kwargs
+                )
+            elif color_by == 'color':
+                clusters_unique = clustering_result._clusters_unique
                 labels = clustering_result.labels
-                avg_orientations = clustering_result.avg_orientations
-                Mavg=copy.deepcopy(clustering_result.data.orientations)
-                for label in avg_orientations.keys():
-                    Mavg[labels==label,:,:]=avg_orientations[label] 
+                color = (np.zeros((labels.shape[0], 4))+color).astype(int)
                 if roi is None:
                     roi = clustering_result.parameters['roi']
-                clustering_result.data.plot_IPF(d, tiling=tiling, scalebar=scalebar,globalScale=globalScale, roi=roi, phase=phase, orientations=Mavg, mask=mask,fig=fig, ax=ax, **kwargs)
-            elif color_by=='ipf':
+                fig, ax = clustering_result.data.plot_colmap(
+                    d=d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
+                    roi=roi, phase=phase, color=color, mask=mask, fig=fig, ax=ax, **kwargs
+                )
+            
+            elif color_by == 'avgipf':
+                if orientations is not None:
+                    Mavg = orientations
+                else:
+                    labels = clustering_result.labels
+                    avg_orientations = clustering_result.avg_orientations
+                    Mavg = copy.deepcopy(clustering_result.data.orientations)
+                    for label in avg_orientations.keys():
+                        Mavg[labels == label, :, :] = avg_orientations[label]
                 if roi is None:
                     roi = clustering_result.parameters['roi']
-                clustering_result.data.plot_IPF(d, tiling=tiling, scalebar=scalebar,globalScale=globalScale, roi=roi, phase=phase, orientations=None, mask=mask,fig=fig, ax=ax, **kwargs)
-        return fig,ax
+                fig, ax = clustering_result.data.plot_IPF(  # REMOVE any assignment if this returns None
+                    d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
+                    roi=roi, phase=phase, orientations=Mavg, mask=mask, fig=fig, ax=ax, **kwargs
+                )
+            
+            elif color_by == 'ipf':
+                if roi is None:
+                    roi = clustering_result.parameters['roi']
+                fig, ax = clustering_result.data.plot_IPF(  # REMOVE any assignment if this returns None
+                    d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
+                    roi=roi, phase=phase, orientations=None, mask=mask, fig=fig, ax=ax, **kwargs
+                )
+            
+            # ========== ADD CLUSTER LABELS ==========
+            if show_labels:
+                import matplotlib.pyplot as plt
+                
+                # Determine which clusters to label
+                clusters_to_label = []
+                
+                if show_labels == True or show_labels == 'all':
+                    # Label all clusters
+                    clusters_to_label = clustering_result._clusters_unique.tolist()
+                
+                elif show_labels == 'phase':
+                    # Label clusters in specified phase
+                    if label_phase is None:
+                        raise ValueError("show_labels='phase' requires label_phase parameter")
+                    
+                    # Get phase ID
+                    if isinstance(label_phase, str):
+                        # Find phase ID from name
+                        phase_id = None
+                        for pid, pname in clustering_result.data.phase_names.items():
+                            if pname == label_phase:
+                                phase_id = pid
+                                break
+                        if phase_id is None:
+                            raise ValueError(f"Phase '{label_phase}' not found")
+                    else:
+                        phase_id = label_phase
+                    
+                    # Get clusters for this phase
+                    if hasattr(clustering_result, 'labels_by_phase'):
+                        phase_name = clustering_result.data.phase_names[phase_id]
+                        if phase_name in clustering_result.labels_by_phase:
+                            clusters_to_label = clustering_result.labels_by_phase[phase_name]
+                    else:
+                        # Fallback: find clusters manually
+                        labels = clustering_result.labels
+                        phases_id = clustering_result.data.phases_id
+                        for cluster_label in clustering_result._clusters_unique:
+                            cluster_mask = labels == cluster_label
+                            cluster_phase = phases_id[cluster_mask][0]  # Get phase of first pixel
+                            if cluster_phase == phase_id:
+                                clusters_to_label.append(cluster_label)
+                
+                elif show_labels == 'selected':
+                    # Label specific clusters
+                    if label_clusters is None:
+                        raise ValueError("show_labels='selected' requires label_clusters parameter")
+                    
+                    if isinstance(label_clusters, int):
+                        clusters_to_label = [label_clusters]
+                    else:
+                        clusters_to_label = list(label_clusters)
+                
+                else:
+                    raise ValueError(f"Invalid show_labels value: {show_labels}. "
+                                f"Use False, True, 'all', 'phase', or 'selected'")
+                
+                # Get data coordinates and labels
+                X = clustering_result.data.X
+                Y = clustering_result.data.Y
+                labels = clustering_result.labels
+                
+                # Apply mask if present
+                if mask is not None:
+                    X_masked = X[mask]
+                    Y_masked = Y[mask]
+                    labels_masked = labels[mask]
+                else:
+                    X_masked = X
+                    Y_masked = Y
+                    labels_masked = labels
+                
+                # Plot labels for each cluster
+                for cluster_label in clusters_to_label:
+                    # Get pixels in this cluster
+                    cluster_pixels = labels_masked == cluster_label
+                    
+                    if np.sum(cluster_pixels) > 0:
+                        # Calculate centroid
+                        x_center = np.mean(X_masked[cluster_pixels])
+                        y_center = np.mean(Y_masked[cluster_pixels])
+                        
+                        # Create label text
+                        label_text = f'{cluster_label}'
+                        
+                        # Prepare bbox properties
+                        if label_bbox:
+                            bbox_props = dict(
+                                boxstyle=label_bbox_style,
+                                facecolor='black',
+                                alpha=0.7,
+                                edgecolor='white',
+                                linewidth=1
+                            )
+                        else:
+                            bbox_props = None
+                        
+                        # Add text label
+                        ax.text(
+                            x_center, y_center, label_text,
+                            ha='center', va='center',
+                            fontsize=label_fontsize,
+                            color=label_color,
+                            fontweight='bold',
+                            bbox=bbox_props,
+                            zorder=1000  # Ensure labels are on top
+                        )
+                
+                # REMOVE THIS PRINT - it might be causing issues
+                # print(f"Added labels for {len(clusters_to_label)} clusters")
+            # ========================================
+        
+        return fig, ax
 #clustering_result.get_cluster_mask(1)
 
     def plotAvgOriIPF(self,d, tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, fig=None, ax=None,  **kwargs):
@@ -3970,7 +8427,7 @@ class EBSDVisualizer:
         self.data.plot_IPF(d, tiling=tiling, scalebar=scalebar,globalScale=globalScale, roi=roi, phase=phase, orientations=Mavg,fig=fig, ax=ax, **kwargs)
 
     def plot_clustering(self, clustering_result: ClusteringResult, 
-                       color_by='cluster', **kwargs):
+                       color_by='cluster',invert_y_axis=None, **kwargs):
         """
         Plot clustering results.
         
@@ -3980,7 +8437,13 @@ class EBSDVisualizer:
             Results to plot
         color_by : str
             'cluster', 'phase', or 'quality'
+        invert_y_axis : bool, optional
+            Whether to invert y-axis. If None, uses instance default.
         """
+
+        if invert_y_axis is None:
+            invert_y_axis = self.invert_y_axis
+
         data = clustering_result.data
         labels = clustering_result.labels
         
@@ -3994,12 +8457,13 @@ class EBSDVisualizer:
             colors = data.quality
         
         scatter = ax.scatter(data.X, data.Y, c=colors, s=1, **kwargs)
-        ax.yaxis.set_inverted(True)
+        #ax.yaxis.set_inverted(True)
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_title(f'Clustering Result - colored by {color_by}')
         ax.axis('equal')
-        
+        if invert_y_axis:
+            ax.invert_yaxis()
         if color_by in ['phase', 'quality']:
             plt.colorbar(scatter, ax=ax)
         
@@ -4009,7 +8473,7 @@ class EBSDVisualizer:
         return fig, ax
     
     def plot_boundaries(self, boundary_result: BoundaryResult,
-                       boundary_type='all', **kwargs):
+                       boundary_type='all',invert_y_axis=None, **kwargs):
         """
         Plot grain boundaries.
         
@@ -4019,6 +8483,8 @@ class EBSDVisualizer:
             Boundary analysis results
         boundary_type : str
             'all', 'interphase', 'same_phase', 'roi'
+        invert_y_axis : bool, optional
+            Whether to invert y-axis. If None, uses instance default.
         """
         fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
         
@@ -4051,7 +8517,9 @@ class EBSDVisualizer:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_title(f'Grain Boundaries - {boundary_type}')
-        ax.yaxis.set_inverted(True)
+        if invert_y_axis:
+            ax.invert_yaxis()
+        #ax.yaxis.set_inverted(True)
         ax.axis('equal')
         
         return fig, ax
@@ -4061,6 +8529,951 @@ class EBSDVisualizer:
         """Plot boundaries for a single cluster."""
         # Implementation from your plot_single_cluster_interphase_boundary
         pass
+
+    def plot_parent_child_interface(self, boundary_result, parent_cluster_id, 
+                                    child_cluster_id=None, side='both', 
+                                    parent_phase_id=None, child_phase_id=None,
+                                    ax=None, show_labels=True, invert_y_axis=None,
+                                    show_parent_same_phase_boundaries=False,
+                                    filter_to_semi_roi=None,
+                                    semi_roi_params=None,
+                                    clustering_result=None,
+                                    elongation_cache=None,
+                                    only_lamellar=False,
+                                    min_aspect_ratio=2.5,
+                                    plot_as_lines=False,
+                                    line_width=2,
+                                    show_legend=True,
+                                    include_touching_parents=False,
+                                    hierarchy=None):  # NEW PARAMETER
+        """
+        Plot parent-child interface(s) with flexible display options.
+        
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results
+        parent_cluster_id : int
+            Parent cluster ID to plot
+        child_cluster_id : int, optional
+            Specific child cluster ID to plot. If None, plots all children.
+        side : str, optional
+            Which side of interface to plot: 'both', 'parent', 'child'
+            Default is 'both'
+        parent_phase_id : int, optional
+            Parent phase ID. If None, inferred from parent_cluster_id.
+        child_phase_id : int, optional
+            Child phase ID. If None, inferred from children.
+        ax : matplotlib axis, optional
+            Axis to plot on. If None, creates new figure.
+        show_labels : bool, optional
+            Whether to show cluster ID text labels on plot. Default is True.
+        invert_y_axis : bool, optional
+            Whether to invert y-axis. If None, uses instance default.
+        show_parent_same_phase_boundaries : bool, optional
+            Whether to plot parent cluster boundaries with same-phase neighbors.
+            Default is False.
+        filter_to_semi_roi : int or str, optional
+            Filter interface(s) to semi-ROI(s):
+            - None: No filtering (default, shows full interface)
+            - 1, 'side1', 'semi_roi_1': Filter to semi-ROI 1
+            - 2, 'side2', 'semi_roi_2': Filter to semi-ROI 2
+            - 'full', 'full_roi': Filter to full ROI
+        semi_roi_params : dict, optional
+            Parameters for semi-ROI creation.
+        clustering_result : ClusteringResult, optional
+            Clustering result object.
+        elongation_cache : dict or list, optional
+            Pre-computed elongation results.
+        only_lamellar : bool, optional
+            If True and child_cluster_id=None, plots only lamellar children.
+            Default is False.
+        min_aspect_ratio : float, optional
+            Minimum aspect ratio to consider lamellar. Default is 2.5.
+        plot_as_lines : bool, optional
+            If True, plots boundaries as connected lines instead of scatter points.
+            Uses nearest-neighbor ordering to connect points. Default is False.
+        line_width : float, optional
+            Line width when plot_as_lines=True. Default is 2.
+        show_legend : bool, optional
+            Whether to show legend. Default is True.
+        include_touching_parents : bool, optional
+            Whether to include touching children in the hierarchy.
+            Default is False (backward compatible).
+        hierarchy : list of dict, optional
+            Pre-computed hierarchy from get_parent_child_hierarchy_with_boundaries.
+            If provided, skips hierarchy computation.
+            Default is None (computes hierarchy).
+        
+        Returns
+        -------
+        fig, ax : matplotlib figure and axis
+        
+        Examples
+        --------
+        >>> # Standard usage (computes hierarchy)
+        >>> fig, ax = vis.plot_parent_child_interface(
+        ...     boundary_result, parent_cluster_id=5, child_cluster_id=12
+        ... )
+        >>> 
+        >>> # With pre-computed hierarchy (efficient for multiple plots)
+        >>> hierarchy = boundary_result.get_parent_child_hierarchy_with_boundaries(
+        ...     parent_phase_id=1,
+        ...     child_phase_id=2,
+        ...     filter_lamellar_to_semi_rois=True,
+        ...     clustering_result=clustering_result,
+        ...     elongation_cache=all_clusters,
+        ...     min_aspect_ratio=2.5
+        ... )
+        >>> 
+        >>> # Plot multiple parents using same hierarchy
+        >>> for parent_id in [5, 10, 15]:
+        ...     fig, ax = vis.plot_parent_child_interface(
+        ...         boundary_result,
+        ...         parent_cluster_id=parent_id,
+        ...         hierarchy=hierarchy  # Reuse hierarchy
+        ...     )
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        from matplotlib.patches import Polygon
+        from matplotlib.path import Path
+        from scipy.spatial.distance import cdist
+        
+        def order_boundary_points(coords):
+            """
+            Order boundary points to form a continuous line using nearest-neighbor.
+            
+            Parameters
+            ----------
+            coords : array (N, 2)
+                Unordered boundary coordinates
+            
+            Returns
+            -------
+            ordered_coords : array (N, 2)
+                Ordered coordinates forming a continuous path
+            """
+            if len(coords) <= 1:
+                return coords
+            
+            # Start with first point
+            ordered = [coords[0]]
+            remaining = list(range(1, len(coords)))
+            current_idx = 0
+            
+            while remaining:
+                # Find nearest unvisited point
+                current_point = coords[current_idx:current_idx+1]
+                remaining_points = coords[remaining]
+                
+                # Calculate distances
+                distances = cdist(current_point, remaining_points)[0]
+                nearest_idx = np.argmin(distances)
+                
+                # Add nearest point
+                next_idx = remaining[nearest_idx]
+                ordered.append(coords[next_idx])
+                current_idx = next_idx
+                remaining.pop(nearest_idx)
+            
+            return np.array(ordered)
+        
+        if invert_y_axis is None:
+            invert_y_axis = self.invert_y_axis
+        
+        # Validate side parameter
+        if side not in ['both', 'parent', 'child']:
+            raise ValueError("side must be 'both', 'parent', or 'child'")
+        
+        # Validate filter_to_semi_roi
+        if filter_to_semi_roi is not None:
+            if clustering_result is None and hierarchy is None:
+                raise ValueError("filter_to_semi_roi requires clustering_result parameter "
+                            "(or pre-computed hierarchy with ROI info)")
+        
+        # Validate only_lamellar
+        if only_lamellar:
+            if child_cluster_id is not None:
+                raise ValueError("only_lamellar only works when child_cluster_id=None (multiple children)")
+            if clustering_result is None and hierarchy is None:
+                raise ValueError("only_lamellar requires clustering_result parameter "
+                            "(or pre-computed hierarchy with lamellar info)")
+            if clustering_result is not None and elongation_cache is None and hierarchy is None:
+                print("Warning: only_lamellar without elongation_cache will be slow (computing PCA for each child)")
+        
+        # Set default semi_roi_params
+        if semi_roi_params is None:
+            semi_roi_params = {
+                'n_layers': 1,
+                'longitudinal_shrinkage': 0.1,
+                'layer_thickness_relative': None
+            }
+        
+        # Find parent cluster index and phase
+        try:
+            parent_idx = np.where(boundary_result.clusters == parent_cluster_id)[0][0]
+        except IndexError:
+            raise ValueError(f"Parent cluster {parent_cluster_id} not found!")
+        
+        if parent_phase_id is None:
+            parent_phase_id = boundary_result.cluster_phases_id[parent_idx]
+        
+        # ========== GET OR USE HIERARCHY ==========
+        if hierarchy is None:
+            # Need to compute hierarchy
+            print("Computing hierarchy...")
+            
+            # Determine if we need lamellar filtering in hierarchy
+            need_lamellar_filtering = (filter_to_semi_roi is not None) or only_lamellar
+            
+            # Build hierarchy call parameters
+            hierarchy_params = {
+                'parent_phase_id': parent_phase_id,
+                'child_phase_id': child_phase_id if child_phase_id is not None else None,
+            }
+            
+            # Add clustering_result if available (needed for include_touching_parents)
+            if clustering_result is not None:
+                hierarchy_params['clustering_result'] = clustering_result
+                
+                # Add include_touching_parents if requested
+                if include_touching_parents:
+                    hierarchy_params['include_touching_parents'] = True
+                
+                # Add lamellar filtering if needed
+                if need_lamellar_filtering:
+                    hierarchy_params['filter_lamellar_to_semi_rois'] = True
+                    hierarchy_params['semi_roi_params'] = semi_roi_params
+                    hierarchy_params['elongation_cache'] = elongation_cache
+                    hierarchy_params['min_aspect_ratio'] = min_aspect_ratio
+            elif include_touching_parents:
+                # Warn user that touching parents requires clustering_result
+                print("Warning: include_touching_parents=True requires clustering_result. "
+                    "Plotting without touching children.")
+            
+            # Call hierarchy with appropriate parameters
+            hierarchy = boundary_result.get_parent_child_hierarchy_with_boundaries(**hierarchy_params)
+        else:
+            # Use provided hierarchy
+            print("Using pre-computed hierarchy")
+        # ==========================================
+        
+        # Find this parent in hierarchy
+        parent_data = None
+        for p in hierarchy:
+            if p['parent_cluster_id'] == parent_cluster_id:
+                parent_data = p
+                break
+        
+        if parent_data is None:
+            raise ValueError(f"Parent cluster {parent_cluster_id} not found in hierarchy "
+                            f"or has no children")
+        
+        # ========== FILTER CHILDREN ==========
+        if child_cluster_id is not None:
+            # Single child
+            children_to_plot = [c for c in parent_data['children'] 
+                            if c['child_cluster_id'] == child_cluster_id]
+            if len(children_to_plot) == 0:
+                raise ValueError(f"Child cluster {child_cluster_id} not found as child "
+                            f"of parent {parent_cluster_id}")
+            
+            # Check if this is a touching relationship
+            relationship = children_to_plot[0].get('relationship', 'enclosed')
+            
+            if filter_to_semi_roi is not None:
+                if filter_to_semi_roi in [1, 'side1', 'semi_roi_1']:
+                    roi_str = 'Semi-ROI 1'
+                elif filter_to_semi_roi in [2, 'side2', 'semi_roi_2']:
+                    roi_str = 'Semi-ROI 2'
+                elif filter_to_semi_roi in ['full', 'full_roi']:
+                    roi_str = 'Full ROI'
+                else:
+                    roi_str = str(filter_to_semi_roi)
+                plot_title = (f'Interface: Parent {parent_cluster_id} → '
+                            f'Child {child_cluster_id} ({relationship}, side: {side}, filtered to {roi_str})')
+            else:
+                plot_title = (f'Interface: Parent {parent_cluster_id} → '
+                            f'Child {child_cluster_id} ({relationship}, side: {side})')
+        else:
+            # Multiple children
+            if only_lamellar:
+                # Filter for lamellar children using 'is_lamellar' flag from hierarchy
+                children_to_plot = [c for c in parent_data['children'] 
+                                if c.get('is_lamellar', False)]
+                
+                if len(children_to_plot) == 0:
+                    # ========== BETTER ERROR MESSAGE ==========
+                    total_children = len(parent_data['children'])
+                    
+                    # Check if any children have aspect ratio info
+                    children_with_ar = [c for c in parent_data['children'] 
+                                    if 'aspect_ratio' in c]
+                    
+                    if len(children_with_ar) > 0:
+                        max_ar = max(c['aspect_ratio'] for c in children_with_ar)
+                        error_msg = (f"Parent {parent_cluster_id} has {total_children} children "
+                                f"but none are lamellar (max aspect ratio: {max_ar:.2f}, "
+                                f"threshold: {min_aspect_ratio})")
+                    else:
+                        error_msg = (f"Parent {parent_cluster_id} has {total_children} children "
+                                f"but none meet lamellar criteria (aspect ratio >= {min_aspect_ratio})")
+                    
+                    # Provide helpful suggestion
+                    print(f"\n{error_msg}")
+                    print(f"Suggestions:")
+                    print(f"  - Use only_lamellar=False to plot all children")
+                    print(f"  - Lower min_aspect_ratio (currently {min_aspect_ratio})")
+                    
+                    # Show children info
+                    if total_children <= 5:
+                        print(f"\nChildren of parent {parent_cluster_id}:")
+                        for c in parent_data['children']:
+                            child_id = c['child_cluster_id']
+                            ar = c.get('aspect_ratio', 'N/A')
+                            is_lam = c.get('is_lamellar', False)
+                            rel = c.get('relationship', 'enclosed')
+                            ar_str = f"{ar:.2f}" if isinstance(ar, (int, float)) else ar
+                            print(f"  Child {child_id}: AR={ar_str}, lamellar={is_lam}, {rel}")
+                    
+                    raise ValueError(error_msg)
+                    # ==========================================
+                
+                if filter_to_semi_roi is not None:
+                    if filter_to_semi_roi in [1, 'side1', 'semi_roi_1']:
+                        roi_str = 'Semi-ROI 1'
+                    elif filter_to_semi_roi in [2, 'side2', 'semi_roi_2']:
+                        roi_str = 'Semi-ROI 2'
+                    elif filter_to_semi_roi in ['full', 'full_roi']:
+                        roi_str = 'Full ROI'
+                    else:
+                        roi_str = str(filter_to_semi_roi)
+                    plot_title = (f'Parent {parent_cluster_id} with {len(children_to_plot)} '
+                                f'LAMELLAR children (AR >= {min_aspect_ratio}, filtered to {roi_str}, side: {side})')
+                else:
+                    plot_title = (f'Parent {parent_cluster_id} with {len(children_to_plot)} '
+                                f'LAMELLAR children (AR >= {min_aspect_ratio}, side: {side})')
+            else:
+                # All children
+                children_to_plot = parent_data['children']
+                
+                if filter_to_semi_roi is not None:
+                    if filter_to_semi_roi in [1, 'side1', 'semi_roi_1']:
+                        roi_str = 'Semi-ROI 1'
+                    elif filter_to_semi_roi in [2, 'side2', 'semi_roi_2']:
+                        roi_str = 'Semi-ROI 2'
+                    elif filter_to_semi_roi in ['full', 'full_roi']:
+                        roi_str = 'Full ROI'
+                    else:
+                        roi_str = str(filter_to_semi_roi)
+                    plot_title = (f'Parent {parent_cluster_id} with {len(children_to_plot)} children '
+                                f'(lamellar filtered to {roi_str}, side: {side})')
+                else:
+                    plot_title = (f'Parent {parent_cluster_id} with {len(children_to_plot)} children '
+                                f'(side: {side})')
+        # =====================================
+        
+        # Create figure if needed
+        if ax is None:
+            fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+            created_fig = True
+        else:
+            fig = ax.figure
+            created_fig = False
+        
+        # Plot parent cluster's same-phase boundaries if requested
+        if show_parent_same_phase_boundaries:
+            parent_boundaries = boundary_result.grouped_boundaries[parent_idx]
+            parent_boundary_phases = boundary_result.grouped_boundary_phases_id[parent_idx]
+            
+            for neighbor_label, coords in parent_boundaries.items():
+                if neighbor_label == -1:
+                    continue
+                
+                neighbor_phase = parent_boundary_phases[neighbor_label]
+                
+                if neighbor_phase == parent_phase_id:
+                    label = 'Parent same-phase boundaries' if (show_legend and neighbor_label == list(parent_boundaries.keys())[1]) else ''
+                    
+                    if plot_as_lines:
+                        ordered_coords = order_boundary_points(coords)
+                        ax.plot(ordered_coords[:, 0], ordered_coords[:, 1],
+                            color='lightgray', linewidth=line_width*0.5, alpha=0.4,
+                            label=label,
+                            zorder=1)
+                    else:
+                        ax.scatter(
+                            coords[:, 0], coords[:, 1],
+                            c='lightgray', s=30, alpha=0.4,
+                            marker='o', edgecolors='gray', linewidths=0.3,
+                            label=label,
+                            zorder=1
+                        )
+        
+        # Generate colors for children
+        n_children = len(children_to_plot)
+        if n_children > 1:
+            child_colors = cm.get_cmap('tab10')(np.linspace(0, 1, n_children))
+        else:
+            child_colors = ['red']
+        
+        # ========== PROCESS ROI INFO FOR MULTIPLE CHILDREN ==========
+        roi_infos = {}
+
+        if filter_to_semi_roi is not None:
+            roi_key_map = {
+                1: 'semi_roi_1_vertices', 'side1': 'semi_roi_1_vertices', 'semi_roi_1': 'semi_roi_1_vertices',
+                2: 'semi_roi_2_vertices', 'side2': 'semi_roi_2_vertices', 'semi_roi_2': 'semi_roi_2_vertices',
+                'full': 'vertices', 'full_roi': 'vertices'
+            }
+            vertices_key = roi_key_map.get(filter_to_semi_roi)
+            
+            if vertices_key is None:
+                raise ValueError(f"Invalid filter_to_semi_roi: {filter_to_semi_roi}")
+            
+            # ========== USE ROI INFO FROM HIERARCHY IF AVAILABLE ==========
+            for child in children_to_plot:
+                child_id = child['child_cluster_id']
+                
+                # Check if ROI info already exists in hierarchy
+                if 'roi_info' in child:
+                    # Use pre-computed ROI from hierarchy
+                    roi_infos[child_id] = child['roi_info']
+                else:
+                    # Need to compute ROI (child is not lamellar or hierarchy wasn't called with filtering)
+                    if clustering_result is None:
+                        print(f"Warning: Cannot compute ROI for child {child_id} (no clustering_result provided)")
+                        continue
+                    
+                    # Check if this child is lamellar
+                    is_lamellar = child.get('is_lamellar', False)
+                    
+                    if not is_lamellar:
+                        # ========== IMPROVED: Better cache handling ==========
+                        # Try to get from cache
+                        elongation_info = None
+                        if elongation_cache is not None:
+                            if isinstance(elongation_cache, dict):
+                                elongation_info = elongation_cache.get(child_id)
+                            elif isinstance(elongation_cache, list):
+                                for cluster_data in elongation_cache:
+                                    if cluster_data['cluster_id'] == child_id:
+                                        elongation_info = cluster_data
+                                        break
+                        
+                        # If not in cache, skip (don't compute)
+                        if elongation_info is None:
+                            print(f"Warning: Child {child_id} not in elongation_cache. Skipping ROI computation.")
+                            continue
+                        
+                        # Check aspect ratio from cache
+                        aspect_ratio = elongation_info.get('aspect_ratio', 0)
+                        if aspect_ratio < min_aspect_ratio:
+                            continue  # Skip non-lamellar
+                        # ====================================================
+                    
+                    # Compute ROI (we know it's lamellar or should be)
+                    try:
+                        roi_info = clustering_result.create_lamellar_roi(
+                            cluster_id=child_id,
+                            n_layers=semi_roi_params['n_layers'],
+                            longitudinal_shrinkage=semi_roi_params['longitudinal_shrinkage'],
+                            layer_thickness_relative=semi_roi_params['layer_thickness_relative'],
+                            elongation_cache=elongation_cache  # Pass cache to avoid recomputation
+                        )
+                        roi_infos[child_id] = roi_info
+                    except Exception as e:
+                        print(f"Warning: Could not create ROI for child {child_id}: {e}")
+                        continue
+                
+                # Plot ROI boundaries (only if we successfully got ROI info)
+                if child_id in roi_infos:
+                    if child_cluster_id is not None or len(children_to_plot) <= 3:
+                        roi_info = roi_infos[child_id]
+                        full_roi_vertices = roi_info['vertices']
+                        roi_label = f'ROI {child_id}' if (show_legend and len(children_to_plot) > 1) else ('' if not show_legend else 'Full ROI')
+                        full_roi_poly = Polygon(full_roi_vertices, fill=False, edgecolor='blue',
+                                            linewidth=1.5, linestyle='--', alpha=0.5,
+                                            label=roi_label,
+                                            zorder=2)
+                        ax.add_patch(full_roi_poly)
+                        
+                        if child_cluster_id is not None:
+                            semi1_vertices = roi_info['semi_roi_1_vertices']
+                            semi1_poly = Polygon(semi1_vertices, fill=False, edgecolor='cyan',
+                                                linewidth=2, linestyle=':', alpha=0.7,
+                                                label='Semi-ROI 1' if show_legend else '',
+                                                zorder=2)
+                            ax.add_patch(semi1_poly)
+                            
+                            semi2_vertices = roi_info['semi_roi_2_vertices']
+                            semi2_poly = Polygon(semi2_vertices, fill=False, edgecolor='magenta',
+                                                linewidth=2, linestyle=':', alpha=0.7,
+                                                label='Semi-ROI 2' if show_legend else '',
+                                                zorder=2)
+                            ax.add_patch(semi2_poly)
+                            
+                            centerline = roi_info['centerline']
+                            ax.plot([centerline[0][0], centerline[1][0]],
+                                [centerline[0][1], centerline[1][1]],
+                                'k--', linewidth=1.5, alpha=0.5, 
+                                label='Centerline' if show_legend else '', 
+                                zorder=2)
+        # ============================================================
+        
+        # Plot each child interface
+        for i, child in enumerate(children_to_plot):
+            child_id = child['child_cluster_id']
+            interface = child['interface']
+            
+            # Choose color
+            if n_children > 1:
+                color = child_colors[i]
+            else:
+                color = 'red'
+            
+            # Get coordinates
+            parent_coords = interface['parent_side']['coords']
+            child_coords = interface['child_side']['coords']
+            parent_indices = interface['parent_side']['indices']
+            child_indices = interface['child_side']['indices']
+            
+            # ========== APPLY SEMI-ROI FILTERING ==========
+            if filter_to_semi_roi is not None and child_id in roi_infos:
+                roi_info = roi_infos[child_id]
+                roi_vertices = roi_info[vertices_key]
+                roi_path = Path(roi_vertices)
+                
+                parent_mask = roi_path.contains_points(parent_coords)
+                parent_coords_filtered = parent_coords[parent_mask]
+                parent_indices_filtered = parent_indices[parent_mask]
+                
+                child_mask = roi_path.contains_points(child_coords)
+                child_coords_filtered = child_coords[child_mask]
+                child_indices_filtered = child_indices[child_mask]
+                
+                parent_coords_plot = parent_coords_filtered
+                child_coords_plot = child_coords_filtered
+                parent_indices_plot = parent_indices_filtered
+                child_indices_plot = child_indices_filtered
+                
+                # Plot filtered-out points
+                if child_cluster_id is not None and not plot_as_lines and show_legend:
+                    if len(parent_coords) > 0:
+                        parent_mask_out = ~parent_mask
+                        if np.any(parent_mask_out):
+                            ax.scatter(
+                                parent_coords[parent_mask_out, 0],
+                                parent_coords[parent_mask_out, 1],
+                                c='lightgray', s=20, alpha=0.3,
+                                marker='o', edgecolors='none',
+                                label='Filtered out (parent)' if i == 0 else '',
+                                zorder=1
+                            )
+                    
+                    if len(child_coords) > 0:
+                        child_mask_out = ~child_mask
+                        if np.any(child_mask_out):
+                            ax.scatter(
+                                child_coords[child_mask_out, 0],
+                                child_coords[child_mask_out, 1],
+                                c='lightgray', s=20, alpha=0.3,
+                                marker='s', edgecolors='none',
+                                label='Filtered out (child)' if i == 0 else '',
+                                zorder=1
+                            )
+            else:
+                parent_coords_plot = parent_coords
+                child_coords_plot = child_coords
+                parent_indices_plot = parent_indices
+                child_indices_plot = child_indices
+            # ==============================================
+            
+            # ========== PLOT BOUNDARIES (LINES OR POINTS) ==========
+            # Plot parent side
+            if side in ['both', 'parent'] and len(parent_coords_plot) > 0:
+                if n_children == 1:
+                    parent_color = 'blue'
+                    parent_label = f'Parent {parent_cluster_id} side ({len(parent_indices_plot)} pixels)' if show_legend else ''
+                else:
+                    parent_color = color
+                    parent_label = f'Child {child_id}: parent side ({len(parent_indices_plot)} px)' if show_legend else ''
+                
+                if plot_as_lines:
+                    ordered_parent = order_boundary_points(parent_coords_plot)
+                    ax.plot(ordered_parent[:, 0], ordered_parent[:, 1],
+                        color=parent_color, linewidth=line_width, alpha=0.8,
+                        label=parent_label, zorder=5)
+                else:
+                    ax.scatter(
+                        parent_coords_plot[:, 0], parent_coords_plot[:, 1], 
+                        c=[parent_color], s=50, alpha=0.7,
+                        marker='o', edgecolors='black', linewidths=0.5,
+                        label=parent_label,
+                        zorder=5
+                    )
+            
+            # Plot child side
+            if side in ['both', 'child'] and len(child_coords_plot) > 0:
+                if n_children == 1:
+                    child_color = 'red'
+                    child_label = f'Child {child_id} side ({len(child_indices_plot)} pixels)' if show_legend else ''
+                    child_marker = 'o'
+                    child_linestyle = '-'
+                else:
+                    child_color = color
+                    child_label = f'Child {child_id}: child side ({len(child_indices_plot)} px)' if show_legend else ''
+                    child_marker = 's'
+                    child_linestyle = '--'
+                
+                if plot_as_lines:
+                    ordered_child = order_boundary_points(child_coords_plot)
+                    ax.plot(ordered_child[:, 0], ordered_child[:, 1],
+                        color=child_color, linewidth=line_width, alpha=0.8,
+                        linestyle=child_linestyle,
+                        label=child_label, zorder=5)
+                else:
+                    ax.scatter(
+                        child_coords_plot[:, 0], child_coords_plot[:, 1],
+                        c=[child_color], s=50, alpha=0.7,
+                        marker=child_marker, edgecolors='black', linewidths=0.5,
+                        label=child_label,
+                        zorder=5
+                    )
+            # =======================================================
+            
+            # Add text labels if requested
+            if show_labels and (len(parent_coords_plot) > 0 or len(child_coords_plot) > 0):
+                if side == 'parent' and len(parent_coords_plot) > 0:
+                    centroid_x = np.mean(parent_coords_plot[:, 0])
+                    centroid_y = np.mean(parent_coords_plot[:, 1])
+                elif side == 'child' and len(child_coords_plot) > 0:
+                    centroid_x = np.mean(child_coords_plot[:, 0])
+                    centroid_y = np.mean(child_coords_plot[:, 1])
+                else:
+                    all_coords = []
+                    if len(parent_coords_plot) > 0:
+                        all_coords.append(parent_coords_plot)
+                    if len(child_coords_plot) > 0:
+                        all_coords.append(child_coords_plot)
+                    
+                    if len(all_coords) > 0:
+                        all_coords = np.vstack(all_coords)
+                        centroid_x = np.mean(all_coords[:, 0])
+                        centroid_y = np.mean(all_coords[:, 1])
+                    else:
+                        continue
+                
+                ax.text(centroid_x, centroid_y, f'{child_id}',
+                    ha='center', va='center', fontsize=10, fontweight='bold',
+                    color='white',
+                    bbox=dict(boxstyle='round', facecolor=color if n_children > 1 else 'red', 
+                                alpha=0.8, edgecolor='black', linewidth=1.5),
+                    zorder=10)
+        
+        # Add parent cluster representative point
+        rep_point = boundary_result.rep_points[parent_idx]
+        ax.plot(rep_point[0], rep_point[1], '*', 
+            color='gold', markersize=25, markeredgecolor='black', markeredgewidth=2,
+            label=f'Parent {parent_cluster_id} center' if show_legend else '', 
+            zorder=100)
+        
+        ax.set_xlabel('X', fontsize=12)
+        ax.set_ylabel('Y', fontsize=12)
+        ax.set_title(plot_title, fontsize=14, fontweight='bold')
+        
+        # Handle legend - only if show_legend=True
+        if show_legend:
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), 
+                    bbox_to_anchor=(1.05, 1), loc='upper left',
+                    fontsize=9, framealpha=0.9, borderaxespad=0)
+        
+        ax.axis('equal')
+        
+        if invert_y_axis:
+            ax.invert_yaxis()
+        
+        ax.grid(True, alpha=0.3)
+        
+        self.fig = fig
+        self.axes = [ax] if not isinstance(self.axes, list) else self.axes
+        
+        return fig, ax
+
+    def plot_parent_child_hierarchy_overview(self, boundary_result, parent_cluster_id, 
+                                             parent_phase_id=None, child_phase_id=None,
+                                             figsize=None, invert_y_axis=None,
+                                             show_parent_same_phase_boundaries=False):
+        """
+        Create overview plot showing parent with all children in separate subplots.
+        
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results
+        parent_cluster_id : int
+            Parent cluster ID to plot
+        parent_phase_id : int, optional
+            Parent phase ID. If None, inferred from parent_cluster_id.
+        child_phase_id : int, optional
+            Child phase ID. If None, uses all child phases.
+        figsize : tuple, optional
+            Figure size. If None, uses (20, 5).
+        invert_y_axis : bool, optional
+            Whether to invert y-axis. If None, uses instance default.
+        show_parent_same_phase_boundaries : bool, optional
+            Whether to plot parent cluster boundaries with same-phase neighbors.
+            Default is False.
+        
+        Returns
+        -------
+        fig, axes : matplotlib figure and axes array
+        """
+        import matplotlib.pyplot as plt
+        
+        if invert_y_axis is None:
+            invert_y_axis = self.invert_y_axis
+        
+        if figsize is None:
+            figsize = (24, 5)  # Increased width for legend space
+        
+        # Find parent cluster index and phase
+        try:
+            parent_idx = np.where(boundary_result.clusters == parent_cluster_id)[0][0]
+        except IndexError:
+            raise ValueError(f"Parent cluster {parent_cluster_id} not found!")
+        
+        if parent_phase_id is None:
+            parent_phase_id = boundary_result.cluster_phases_id[parent_idx]
+        
+        # Get hierarchy
+        hierarchy = boundary_result.get_parent_child_hierarchy_with_boundaries(
+            parent_phase_id,
+            child_phase_id if child_phase_id is not None else None
+        )
+        
+        # Find this parent
+        parent_data = None
+        for p in hierarchy:
+            if p['parent_cluster_id'] == parent_cluster_id:
+                parent_data = p
+                break
+        
+        if parent_data is None or parent_data['n_children'] == 0:
+            raise ValueError(f"Parent cluster {parent_cluster_id} has no children")
+        
+        n_children = parent_data['n_children']
+        
+        # Create subplots: first shows all, rest show individual children
+        n_plots = min(n_children + 1, 6)  # Limit to 6 total plots
+        fig, axes = plt.subplots(1, n_plots, figsize=figsize, constrained_layout=True)
+        
+        if n_plots == 1:
+            axes = [axes]
+        
+        # First subplot: all children together
+        self.plot_parent_child_interface(
+            boundary_result=boundary_result,
+            parent_cluster_id=parent_cluster_id,
+            child_cluster_id=None,  # All children
+            side='both',
+            parent_phase_id=parent_phase_id,
+            child_phase_id=child_phase_id,
+            ax=axes[0],
+            show_labels=True,
+            invert_y_axis=invert_y_axis,
+            show_parent_same_phase_boundaries=show_parent_same_phase_boundaries
+        )
+        axes[0].set_title(f'All {n_children} children', fontweight='bold')
+        
+        # Remaining subplots: individual children
+        for i in range(1, min(n_plots, n_children + 1)):
+            child = parent_data['children'][i - 1]
+            child_id = child['child_cluster_id']
+            
+            self.plot_parent_child_interface(
+                boundary_result=boundary_result,
+                parent_cluster_id=parent_cluster_id,
+                child_cluster_id=child_id,
+                side='both',
+                parent_phase_id=parent_phase_id,
+                child_phase_id=child_phase_id,
+                ax=axes[i],
+                show_labels=True,
+                invert_y_axis=invert_y_axis,
+                show_parent_same_phase_boundaries=show_parent_same_phase_boundaries
+            )
+            axes[i].set_title(f'Child {child_id}', fontweight='bold')
+        
+        # Hide extra axes if we limited plots
+        if n_plots < len(axes):
+            for i in range(n_plots, len(axes)):
+                axes[i].set_visible(False)
+        
+        self.fig = fig
+        self.axes = axes
+        
+        return fig, axes
+    
+    def plot_enclosures_comparison(self, boundary_result, parent_cluster_id,
+                                   parent_phase_id=None, child_phase_id=None,
+                                   figsize=None, invert_y_axis=None,
+                                   show_parent_same_phase_boundaries=False):
+        """
+        Create three-panel comparison: parent side, child side, and both.
+        
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results
+        parent_cluster_id : int
+            Parent cluster ID to plot
+        parent_phase_id : int, optional
+            Parent phase ID
+        child_phase_id : int, optional
+            Child phase ID
+        figsize : tuple, optional
+            Figure size. If None, uses (28, 8).
+        invert_y_axis : bool, optional
+            Whether to invert y-axis. If None, uses instance default.
+        show_parent_same_phase_boundaries : bool, optional
+            Whether to plot parent cluster boundaries with same-phase neighbors.
+            Default is False.
+        
+        Returns
+        -------
+        fig, axes : matplotlib figure and axes array
+        """
+        import matplotlib.pyplot as plt
+        
+        if invert_y_axis is None:
+            invert_y_axis = self.invert_y_axis
+        
+        if figsize is None:
+            figsize = (28, 8)  # Increased width for legend space
+        
+        fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+        
+        sides = ['parent', 'child', 'both']
+        titles = ['Parent Side Only', 'Child Side Only', 'Both Sides']
+        
+        for ax, side, title in zip(axes, sides, titles):
+            self.plot_parent_child_interface(
+                boundary_result=boundary_result,
+                parent_cluster_id=parent_cluster_id,
+                child_cluster_id=None,  # All children
+                side=side,
+                parent_phase_id=parent_phase_id,
+                child_phase_id=child_phase_id,
+                ax=ax,
+                invert_y_axis=invert_y_axis,
+                show_parent_same_phase_boundaries=show_parent_same_phase_boundaries
+            )
+            ax.set_title(title, fontsize=12, fontweight='bold')
+        
+        self.fig = fig
+        self.axes = axes
+        
+        return fig, axes
+    
+    def plot_multiple_parents_grid(self, boundary_result, parent_phase_id, child_phase_id,
+                                   max_parents=4, figsize=None, invert_y_axis=None,
+                                   show_parent_same_phase_boundaries=False):
+        """
+        Plot interfaces for multiple parents in a grid layout.
+        
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results
+        parent_phase_id : int
+            Parent phase ID
+        child_phase_id : int
+            Child phase ID
+        max_parents : int, optional
+            Maximum number of parents to plot. Default is 4.
+        figsize : tuple, optional
+            Figure size. If None, uses (24, 20).
+        invert_y_axis : bool, optional
+            Whether to invert y-axis. If None, uses instance default.
+        show_parent_same_phase_boundaries : bool, optional
+            Whether to plot parent cluster boundaries with same-phase neighbors.
+            Default is False.
+        
+        Returns
+        -------
+        fig, axes : matplotlib figure and axes array
+        """
+        import matplotlib.pyplot as plt
+        
+        if invert_y_axis is None:
+            invert_y_axis = self.invert_y_axis
+        
+        if figsize is None:
+            figsize = (24, 20)  # Increased width for legend space
+        
+        # Get hierarchy
+        hierarchy = boundary_result.get_parent_child_hierarchy_with_boundaries(
+            parent_phase_id, child_phase_id
+        )
+        
+        # Limit number of parents
+        n_parents = min(len(hierarchy), max_parents)
+        
+        # Determine grid size
+        n_cols = 2
+        n_rows = (n_parents + 1) // 2
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, 
+                                constrained_layout=True)
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        axes = axes.flatten()
+        
+        for i, parent in enumerate(hierarchy[:n_parents]):
+            parent_id = parent['parent_cluster_id']
+            
+            self.plot_parent_child_interface(
+                boundary_result=boundary_result,
+                parent_cluster_id=parent_id,
+                child_cluster_id=None,  # All children
+                side='both',
+                parent_phase_id=parent_phase_id,
+                child_phase_id=child_phase_id,
+                ax=axes[i],
+                invert_y_axis=invert_y_axis,
+                show_parent_same_phase_boundaries=show_parent_same_phase_boundaries
+            )
+        
+        # Hide unused axes
+        for i in range(n_parents, len(axes)):
+            axes[i].set_visible(False)
+        
+        self.fig = fig
+        self.axes = axes
+        
+        return fig, axes
+        
+    def _get_phase_colors(self, phases_id):
+        """Generate colors for phases."""
+        import matplotlib.cm as cm
+        unique_phases_id = np.unique(phases_id)
+        cmap = cm.get_cmap('Set1', len(unique_phases_id))
+        
+        colors = np.zeros((len(phases_id), 4))
+        for i, phase_id in enumerate(unique_phases_id):
+            colors[phases_id == phase_id] = cmap(i)
+        
+        return colors
+    
     
     def _get_cluster_colors(self, labels):
         """Generate colors for clusters."""
@@ -4075,18 +9488,606 @@ class EBSDVisualizer:
         
         return colors
     
-    def _get_phase_colors(self, phases):
-        """Generate colors for phases."""
-        import matplotlib.cm as cm
-        unique_phases = np.unique(phases)
-        cmap = cm.get_cmap('Set1', len(unique_phases))
-        
-        colors = np.zeros((len(phases), 4))
-        for i, phase in enumerate(unique_phases):
-            colors[phases == phase] = cmap(i)
-        
-        return colors
+    #def _get_phase_colors(self, phases):
+    #    """Generate colors for phases."""
+    #    import matplotlib.cm as cm
+    #    unique_phases = np.unique(phases)
+    #    cmap = cm.get_cmap('Set1', len(unique_phases))
+    #    
+    #    colors = np.zeros((len(phases), 4))
+    #    for i, phase in enumerate(unique_phases):
+    #        colors[phases == phase] = cmap(i)
+    #    
+    #    return colors
 
+
+class EbsdHPAnalyzer():
+    def __init__(self, hierarchy, clustering_result: ClusteringResult, boundary_result: BoundaryResult,
+                 maxmillerindex=4, maxdevfrom90deg=4, maxnormaldev=2, maxdirdev=2):
+            self.hierarchy = hierarchy
+            self.clustering_result = clustering_result
+            self.boundary_result = boundary_result
+            self.data = clustering_result.data
+            self.maxdevfrom90deg = maxdevfrom90deg
+            self.maxnormaldev = maxnormaldev
+            self.maxdirdev = maxdirdev
+            self.maxmillerindex=maxmillerindex
+            self.maxdevfrom90deg=maxdevfrom90deg
+            for hi in self.hierarchy:
+                if len([ch['is_lamellar'] for ch in hi['children'] if ch['is_lamellar']])>0:
+                    parent_phase_id = hi['parent_phase_id']
+                    #print(f"Parent cluster {hi['parent_cluster_id']} has following lamellar children:")
+                    if 'children' in hi:
+                        for ch in hi['children']:
+                            if ch['is_lamellar']:
+                                child_phase_id = ch['child_phase_id']
+                                break
+            #try:
+            if True:
+                print(f"Setting HP analyzer phases: parent {parent_phase_id}, child {child_phase_id}")
+                self.keyau = self.clustering_result.data.phase_names[parent_phase_id]
+                self.keyma = self.clustering_result.data.phase_names[child_phase_id]
+                self.setPhases()
+                self.austenite = self.clustering_result.data.austenite
+                self.martensite = self.clustering_result.data.martensite
+                self.PhaseNames = {self.austenite:'Austenite',self.martensite:'Martensite'}
+                self.PhaseCols = {self.austenite:['r','m'],self.martensite:['b','c']}
+                self.Symmetry = {self.austenite:self.clustering_result.data.phases[self.keyau]['symmetry'],self.martensite:self.clustering_result.data.phases[self.keyma]['symmetry']}
+                self.T_AM = self.clustering_result.data.defGrad['NiTi']['A']['T_AM']
+                self.F_AM = self.clustering_result.data.defGrad['NiTi']['A']['F_AM']
+                self.CP = {self.austenite:self.clustering_result.data.OR['NiTi']['CIp'],self.martensite: self.clustering_result.data.OR['NiTi']['Cp']}
+                self.CD = {self.austenite:self.clustering_result.data.OR['NiTi']['CId'],self.martensite: self.clustering_result.data.OR['NiTi']['Cd']}
+
+                self.CrystalRef2Spatial=np.array([[0,1,0],[1,0,0],[0,0,1]])
+                self.phase4HPguess = 'A'
+                self.scan = self.clustering_result.data._ebsdData
+                self.Sels=[]
+                self.PhaseKeys=[]
+                self.G2Cryst={}
+                self.G2Sampl={}
+                self.dirkey={}
+                for key in self.Phases.keys():
+                    self.PhaseKeys.append(key)
+                    self.PhaseKeys
+                    self.G2Cryst[key] = Orientation.from_matrix(self.clustering_result.data._ebsdData.M,symmetry=self.Symmetry[key])
+                    self.G2Sampl[key] = np.transpose(self.G2Cryst[key], axes=(0,2,1))
+                    self.dirkey[key] = plot.DirectionColorKeyTSL(self.Symmetry[key])
+                self.setAttributes( phase4HPguess=self.austenite) 
+                self.setAttributes(PhaseNames={self.austenite:'Austenite',self.martensite:'Martensite'})
+                self.setAttributes(PhaseCols={self.austenite:['r','m'],self.martensite:['b','c']})
+                self.setHP()
+                self.hklsDict = {}
+                for key in [self.keyau,self.keyma]:
+                    self.hklsDict[key]={}
+                    if self.phase4HPguess!=key:
+                        fac=3.
+                    else:
+                        fac=1.
+                    hkls, hkls2, fam = generate_hkls(int(fac*self.maxmillerindex),self.clustering_result.data.phases[key]['symops'])
+                    for key2 in hkls2.keys():
+                        for hkl in hkls2[key2]:
+                            self.hklsDict[key][hkl]=key2
+
+
+            #except:
+            #    print("Failed to setup HP analyzer")
+    def setAttributes(self,**kwargs):    
+        """
+        Set attributes for the EBSD analyzer.
+        
+        Args:
+            **kwargs: Key-value pairs of attributes to set
+        """
+        self.__dict__.update(kwargs)
+    def listLamellarParents(self):
+        for hi in self.hierarchy:
+            if len([ch['is_lamellar'] for ch in hi['children'] if ch['is_lamellar']])>0:
+                print(f"Parent cluster {hi['parent_cluster_id']} has following lamellar children:")
+                if 'children' in hi:
+                    for ch in hi['children']:
+                        if ch['is_lamellar']:
+                            print(f"{ch['child_cluster_id']}",end=', ')
+                print() # newline for readability
+            else:
+                print(f"Parent cluster {hi['parent_cluster_id']} has no lamellar children:")
+
+    def setHP(self):
+        self.HP={}
+        for hidx, hi in enumerate(self.hierarchy):
+            if len([ch['is_lamellar'] for ch in hi['children'] if ch['is_lamellar']])>0:
+                self.HP[hi['parent_cluster_id']]={}
+                #print(f"Parent cluster {hi['parent_cluster_id']} has following lamellar children:")
+                if 'children' in hi:
+                    for chidx, ch in enumerate(hi['children']):
+                        if ch['is_lamellar']:
+                            self.HP[hi['parent_cluster_id']][ch['child_cluster_id']] = {}
+                            self.HP[hi['parent_cluster_id']][ch['child_cluster_id']]['parent_idx']  = hidx
+                            self.HP[hi['parent_cluster_id']][ch['child_cluster_id']]['child_idx']  = chidx
+                            #print(f"{ch['child_cluster_id']}",end=', ')
+                #print() # newline for readability
+
+
+    def setPhases(self):
+        """
+        Set phase definitions for analysis.
+        
+        Args:
+            phases: Phase definitions
+        """
+        self.Phases = self.clustering_result.data.phase_ids
+
+    def singleHP(self, roi, parent_id, child_id,printout = False, nodirs=False, bestscore=False):  
+        parent_idx = self.HP[parent_id][child_id]['parent_idx']
+        child_idx = self.HP[parent_id][child_id]['child_idx']       
+        if not self.hierarchy[parent_idx]['children'][child_idx][roi]['no_parent_side']:
+            self.getOri(roi, parent_id, child_id)
+            self.getInterface(roi,parent_id, child_id)
+            self.getHBmatches(roi,parent_id, child_id)
+            if printout:
+                self.printHBmatches(roi,parent_id, child_id, nodirs=nodirs, bestscore=bestscore)
+        else:
+            print(f"No interface between parent_id {parent_id} and child_id {child_id} within roi {roi}")
+    def getOri(self, roi, parent_id, child_id):
+        self.Ln = {}
+        for key in self.Phases.keys():
+            self.Ln[key] = np.array([la/np.linalg.norm(la) for la in self.clustering_result.data.phases[key]['L'].T]).T
+        parent_idx = self.HP[parent_id][child_id]['parent_idx']
+        child_idx = self.HP[parent_id][child_id]['child_idx']       
+        #for roi in ['semi_roi_1','semi_roi_2']:
+        titles = 'G2Cryst_red G2Cryst_red_avg G2Sampl_red G2Sampl_red_avg <100>PF <100>PF_avg'
+        self.HP[parent_id][child_id][roi] = {}
+        for title in titles.split():
+            self.HP[parent_id][child_id][roi][title] = {}
+        for key in self.Phases.keys():
+            if key == self.austenite:
+                keyname = 'parent_side'
+            else:
+                keyname = 'child_side'
+            self.HP[parent_id][child_id][roi]['G2Cryst_red'][key] = self.hierarchy[parent_idx]['children'][child_idx][roi][keyname]['M_best_sym']
+            self.HP[parent_id][child_id][roi]['G2Sampl_red'][key]=np.transpose(self.HP[parent_id][child_id][roi]['G2Cryst_red'][key],axes=(0,2,1))
+            self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][key]=self.hierarchy[parent_idx]['children'][child_idx][roi][keyname]['M_mean']
+            self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][key]=self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][key].T
+            
+
+            pfi=[]
+            for di in self.Ln[key].T:
+                pfi.append(orilistMult(self.HP[parent_id][child_id][roi]['G2Sampl_red'][key],di))            
+            self.HP[parent_id][child_id][roi]['<100>PF'][key] = np.hstack((pfi[0],pfi[1],pfi[2]))
+            self.HP[parent_id][child_id][roi]['<100>PF_avg'][key] = self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][key].dot(self.Ln[key])
+
+        self.getClosestOR(roi, parent_id, child_id)
+        
+        ORi=self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][self.keyma].dot(self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][self.keyau])
+        axis_angle = Rotation.from_matrix(ORi).to_axes_angles()
+        self.HP[parent_id][child_id][roi]['OR'] = { f'OR:{self.keyau}-{self.keyma}':ORi,'axis':np.array([axis_angle.axis.x[0],axis_angle.axis.y[0],axis_angle.axis.z[0]]),'angle':np.rad2deg(axis_angle.angle)[0]}
+
+    def getClosestOR(self, roi, parent_id, child_id):
+        """
+        Find martensite variant with orientation relationship closest to EBSD data.
+        
+        Args:
+            seli: Selection index
+            
+        Compares experimental OR with theoretical variants to find best match.
+        """
+    
+        self.G2Cryst_red_ma_avg_alleq = np.tensordot(self.clustering_result.data.phases[self.keyma]['symops'], [self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][self.keyma]], axes=[[-1], [-2]]).transpose([2, 0, 1, 3])[0,:,:,:]
+        self.HP[parent_id][child_id][roi]['T_AM_ebsd'] = np.tensordot(self.G2Cryst_red_ma_avg_alleq, [self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][self.keyau]], axes=[[-1], [-2]]).transpose([2, 0, 1, 3])[0,:,:,:]
+        T_AM_T = np.array(self.T_AM).T
+        D = np.tensordot(self.HP[parent_id][child_id][roi]['T_AM_ebsd'],T_AM_T, axes=[[-1], [-2]]).transpose([2, 0, 1, 3])
+        tr = np.trace(D, axis1=2, axis2=3)
+        neg = tr < -1.0
+        tr[neg] = -tr[neg]
+        idxs=np.unravel_index(np.argmax(tr),tr.shape)
+        Cmp = self.compareEbsdTheory(roi,parent_id,child_id,idxs[0],idxs[1])
+        self.HP[parent_id][child_id][roi]['Closest Variant'] = idxs[0]
+        for key in Cmp.keys():
+            self.HP[parent_id][child_id][roi][key] = copy.deepcopy(Cmp[key])
+            self.HP[parent_id][child_id][roi][key+'_allvars'] = [] 
+        for vari in range(self.T_AM.shape[2]):
+            D = np.tensordot(self.HP[parent_id][child_id][roi]['T_AM_ebsd'],T_AM_T[vari:vari+1,:,:], axes=[[-1], [-2]]).transpose([2, 0, 1, 3])
+            tr = np.trace(D, axis1=2, axis2=3)
+            neg = tr < -1.0
+            tr[neg] = -tr[neg]
+            idxs=np.unravel_index(np.argmax(tr),tr.shape)
+            Cmp = self.compareEbsdTheory(roi,parent_id,child_id,vari,idxs[1])
+            for key in Cmp.keys():
+                self.HP[parent_id][child_id][roi][key+'_allvars'].append(copy.deepcopy(Cmp[key]))
+
+    def compareEbsdTheory(self, roi, parent_id, child_id, varIdx, equivalIdx):
+        """
+        Compare experimental EBSD data with theoretical predictions.
+        
+        Args:
+            roi: Region of interest index
+            parent_id: Parent cluster ID
+            child_id: Child cluster ID
+            varIdx: Variant index
+            equivalIdx: Equivalent orientation index
+            
+        Returns:
+            dict: Comparison results including misorientation and strains
+        """
+        Cmp={}
+        titles = ['Closes equivalent G2Cryst','Theory G2Cryst','Theory <100>PF_avg','Theory <100>PF_avg_symop']
+        for title in titles:
+            Cmp[title]={}
+            
+        Cmp['Martensite symop'] = self.clustering_result.data.phases[self.keyma]['symops'][equivalIdx]
+        Cmp['Closes equivalent G2Cryst'][self.keyma]=self.G2Cryst_red_ma_avg_alleq[equivalIdx,:,:]
+        Cmp['Closest Theory OR'] = self.T_AM[:,:,varIdx]
+        Cmp['Exp OR'] = self.HP[parent_id][child_id][roi]['T_AM_ebsd'][equivalIdx,:,:]
+        Cmp['Theory G2Cryst'][self.keyma] = self.T_AM[:,:,varIdx].dot(self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][self.keyau])
+        Cmp['Theory <100>PF_avg'][self.keyma] = Cmp['Theory G2Cryst'][self.keyma].T.dot(self.Ln[self.keyma])
+        Cmp['Theory <100>PF_avg_symop'][self.keyma] = Cmp['Theory G2Cryst'][self.keyma].T.dot(Cmp['Martensite symop'].dot(self.Ln[self.keyma]))
+        Cmp['dR OR'] = Rotation.from_matrix(Cmp['Theory G2Cryst'][self.keyma].dot(Cmp['Closes equivalent G2Cryst'][self.keyma].T))
+        Cmp['Misori OR'] = np.rad2deg(Cmp['dR OR'].to_axes_angles().angle)[0]
+        Cmp['Transformation strain']=[]
+        for ldiri in np.eye(3):
+            ldir=self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][self.keyau].dot(ldiri)
+            Cmp['Transformation strain'].append({f'along {ldiri} [-]':np.sqrt(ldir.dot(self.F_AM[:,:,varIdx].T.dot(self.F_AM[:,:,varIdx].dot(ldir))))-1})
+        return Cmp
+    def getHBmatches(self,roi, parent_id, child_id):
+        """
+        Find matching habit plane candidates between phases.
+        
+        Args:
+            roi: Region of interest index
+            parent_id: Parent cluster ID
+            child_id: Child cluster ID
+            
+        Matches crystallographic planes and directions that are consistent
+        with observed interface traces in both phases.
+        """
+              
+        HP_guess={}
+        for phase in self.Phases.keys():
+            interface_trace=self.HP[parent_id][child_id][roi]['Interfaces']['interface_trace'][phase]
+            interfacenorm_trace=self.HP[parent_id][child_id][roi]['Interfaces']['interfacenorm_trace'][phase]
+            G2Sampl = self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][phase]
+            LrI = self.clustering_result.data.phases[phase]['LrI']
+            Lr = self.clustering_result.data.phases[phase]['Lr']
+            LI = self.clustering_result.data.phases[phase]['LI']
+            L = self.clustering_result.data.phases[phase]['L']
+            
+            HP_guess[phase] = self.getNormals(interface_trace, interfacenorm_trace,LrI,Lr,G2Sampl,self.hklsDict[phase])
+            idxs = np.argsort(HP_guess[phase]['HPvsTrace_angle'])[::-1]
+            for key in HP_guess[phase].keys():
+                HP_guess[phase][key]=HP_guess[phase][key][idxs]
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_guess']=HP_guess
+        
+        HP_matches = {}
+        HP_matches['Score']={}
+        for title in ['low index habit plane', 'mean misalignment', 'number of corresponding directions','overall', 'fitcorresp']:
+            HP_matches['Score'][title] = []
+        for phase in self.Phases.keys():
+            HP_matches[phase]={}
+            HP_matches[phase]['Habit plane normal']={}
+            HP_matches[phase]['Habit plane normal']['misalign']=[]
+            HP_matches[phase]['Habit plane direction']={}
+            HP_matches[phase]['Habit plane direction']['misalign']=[]
+            for key in HP_matches[phase].keys():
+                for key2 in HP_guess[self.keyau].keys():
+                    HP_matches[phase][key][key2]=[]
+        for n1,n_vec in enumerate(HP_guess[self.keyau]['n_miller_normvec_sampl']):
+            for n2,n_vec2 in enumerate(HP_guess[self.keyma]['n_miller_normvec_sampl']):
+                hb_misalign = np.arccos(abs(n_vec.dot(n_vec2)))*180/np.pi
+                if hb_misalign <= self.maxnormaldev:
+                    DP_guess={}
+                    for phase,n in zip(self.Phases.keys(),[n1,n2]):
+                        interface_trace=HP_guess[phase]['n_miller_normvec'][n]
+                        interfacenorm_trace=perpendicular_vector(interface_trace)
+                        G2Sampl = self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][phase]
+                        LI = self.clustering_result.data.phases[phase]['LI']
+                        L = self.clustering_result.data.phases[phase]['L']                
+                        DP_guess[phase] = self.getNormals(interface_trace, interfacenorm_trace,LI,L,G2Sampl,self.hklsDict[phase],maxdevfrom90deg=0.)
+                    v1=DP_guess[self.keyau]
+                    v2=DP_guess[self.keyma]
+                    dpmatch=[]
+                    for d1,d_vec in enumerate(v1['n_miller_normvec_sampl']):
+                        for d2,d_vec2 in enumerate(v2['n_miller_normvec_sampl']):
+                            dp_misalign = np.arccos(abs(d_vec.dot(d_vec2)))*180/np.pi
+                            if dp_misalign <= self.maxdirdev:
+                                isin=False
+                                for isinidx,idxs in enumerate(dpmatch):
+                                    if idxs[0]==d1:
+                                        isin=True
+                                        break
+                                if not isin:
+                                    dpmatch.append((d1,d2,dp_misalign))
+                                else:
+                                    if dp_misalign<idxs[2]:
+                                        dpmatch[isinidx]=(d1,d2,dp_misalign)
+                    if len(dpmatch)>0:
+                        for key in HP_guess[phase]:
+                            HP_matches[self.keyau]['Habit plane normal'][key].append(HP_guess[self.keyau][key][n1])
+                            HP_matches[self.keyma]['Habit plane normal'][key].append(HP_guess[self.keyma][key][n2])
+                            HP_matches[self.keyau]['Habit plane direction'][key].append(v1[key][[idxs[0] for idxs in dpmatch]])
+                            HP_matches[self.keyma]['Habit plane direction'][key].append(v2[key][[idxs[1] for idxs in dpmatch]])
+                        
+                        fitcorresp=True
+                        vari=self.HP[parent_id][child_id][roi]['Closest Variant']
+                        for idxs in dpmatch:
+                            dp_ma = v2['n_miller'][idxs[1]]
+                            dp_au = v1['n_miller'][idxs[0]]
+                            dp_ma2 = vector2miller(self.HP[parent_id][child_id][roi]['Martensite symop'].dot(self.CD[self.keyau][:,:,vari].dot(dp_au)))
+                            if not ((dp_ma2==dp_ma).all() or (-1*dp_ma2==dp_ma).all()):                                      
+                                fitcorresp = False
+                        hb_au = HP_guess[self.keyau]['n_miller'][n1]
+                        hb_ma = HP_guess[self.keyma]['n_miller'][n2]
+                        hb_ma2 = vector2miller(self.HP[parent_id][child_id][roi]['Martensite symop'].dot(self.CP[self.keyau][:,:,vari].dot(hb_au)))
+                        if not ((hb_ma2==hb_ma).all() or (-1*hb_ma2==hb_ma).all()):
+                            fitcorresp = False
+                            
+                        HP_matches[self.keyma]['Habit plane normal']['misalign'].append(hb_misalign)
+                        HP_matches[self.keyma]['Habit plane direction']['misalign'].append([idxs[2] for idxs in dpmatch])
+                        HP_matches[self.keyau]['Habit plane normal']['misalign'].append(hb_misalign)
+                        HP_matches[self.keyau]['Habit plane direction']['misalign'].append([idxs[2] for idxs in dpmatch])
+                        HP_matches['Score']['low index habit plane'].append(np.sum(np.abs(HP_guess[self.keyau]['n_miller'][n1]))+np.sum(np.abs(HP_guess[self.keyma]['n_miller'][n2])))
+                        allmisalign = [abs(idxs[2]) for idxs in dpmatch]
+                        allmisalign.append(abs(HP_guess[self.keyau]['HPvsTrace_angle'][n1]-90))
+                        allmisalign.append(abs(HP_guess[self.keyma]['HPvsTrace_angle'][n2]-90))
+                        allmisalign.append(hb_misalign)
+                        HP_matches['Score']['mean misalignment'].append(np.mean(allmisalign))
+                        HP_matches['Score']['number of corresponding directions'].append(len(dpmatch))
+                        HP_matches['Score']['overall'].append(HP_matches['Score']['low index habit plane'][-1]/HP_matches['Score']['number of corresponding directions'][-1]+HP_matches['Score']['mean misalignment'][-1])
+                        if fitcorresp:
+                            HP_matches['Score']['fitcorresp'].append('yes')
+                        else:
+                            HP_matches['Score']['fitcorresp'].append('no')
+        if True:
+            idxs = np.argsort(HP_matches['Score']['overall'])
+            for phase in self.Phases.keys():
+                for key1 in HP_matches[phase].keys():
+                    for key in HP_matches[phase][key1].keys():
+                        HP_matches[phase][key1][key]=[HP_matches[phase][key1][key][idx] for idx in idxs]
+            for key in HP_matches['Score'].keys():
+                HP_matches['Score'][key]=[HP_matches['Score'][key][idx] for idx in idxs]            
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_matches'] = HP_matches    
+    def getNormals(self,interface_trace, interfacenorm_trace, LrI, Lr, G2Sampl, hklsDict, angles = np.linspace(0,180,361),maxdevfrom90deg=None, maxmillerindex=None):
+        """
+        Generate candidate plane normals perpendicular to interface trace.
+        
+        Args:
+            interface_trace: Interface trace direction
+            interfacenorm_trace: Normal to interface trace
+            LrI: Inverse reciprocal lattice matrix
+            Lr: Reciprocal lattice matrix
+            G2Sampl: Crystal to sample transformation
+            angles: Rotation angles to test
+            maxdevfrom90deg: Maximum deviation from 90 degrees
+            maxmillerindex: Maximum Miller index
+            
+        Returns:
+            dict: Candidate plane normals meeting criteria
+        """
+        N_guess={}
+        titles = 'n_vec n_vec_sampl n_miller n_miller_family n_miller_normvec n_miller_normvec_sampl HPvsTrace_angle'.split()
+        for title in titles:
+            N_guess[f'{title}'] =[]
+
+        if maxdevfrom90deg is None:
+            maxdevfrom90deg=self.maxdevfrom90deg
+            
+        if maxmillerindex is None:
+            maxmillerindex=self.maxmillerindex
+        for an in angles:
+            var = {}
+            var['n_vec'] = Rotation.from_axes_angles(interface_trace, an, degrees=True).to_matrix().dot(interfacenorm_trace)[0,:]
+            var['n_vec_sampl'] = G2Sampl.dot(var['n_vec'])
+            var['n_miller'] = np.round(vector2millerround(LrI.dot(var['n_vec'])))           
+            if np.abs(var['n_miller']).max()>self.maxmillerindex:
+                var['n_miller'] = np.round(vector2millerround(LrI.dot(var['n_vec']),MIN=False))
+            var['n_miller_normvec'] = Lr.dot(var['n_miller'])
+            var['n_miller_normvec'] /= np.linalg.norm(var['n_miller_normvec'])
+            var['n_miller_normvec_sampl'] = G2Sampl.dot(var['n_miller_normvec'])
+            var['HPvsTrace_angle'] = np.arccos(abs(var['n_miller_normvec'].dot(interface_trace)))*180/np.pi
+            if np.abs(var['n_miller']).max()<=maxmillerindex and abs(var['HPvsTrace_angle']-90)<=maxdevfrom90deg:
+                var['n_miller_family'] = hklsDict[tuple(var['n_miller'])]
+                isin=False
+                for nm in N_guess['n_miller']:
+                    if (nm==var['n_miller']).all() or (nm==-1*var['n_miller']).all():
+                        isin=True
+                if not isin:
+                    for title in titles:
+                        N_guess[f'{title}'].append(var[f'{title}'])
+
+        for key in N_guess.keys():
+            N_guess[key]=np.array(N_guess[key])
+        return N_guess
+
+    def getInterface(self,roi, parent_id, child_id):
+        parent_idx = self.HP[parent_id][child_id]['parent_idx']
+        child_idx = self.HP[parent_id][child_id]['child_idx']       
+
+        Xv=np.hstack((self.hierarchy[parent_idx]['children'][child_idx][roi]['parent_side']['X'], self.hierarchy[parent_idx]['children'][child_idx][roi]['child_side']['X']))
+        Yv=np.hstack((self.hierarchy[parent_idx]['children'][child_idx][roi]['parent_side']['Y'], self.hierarchy[parent_idx]['children'][child_idx][roi]['child_side']['Y']))
+        
+        linfit = np.polyfit(Xv, Yv, 1)
+        my=Yv.mean()
+        mx=Xv.mean()
+        interface_trace = np.array([1,linfit[0],0])
+        interface_trace/=np.sqrt(interface_trace.dot(interface_trace))
+        interfacenorm_trace = np.array([1,-1/linfit[0],0])
+        interfacenorm_trace/=np.sqrt(interfacenorm_trace.dot(interfacenorm_trace))
+        self.HP[parent_id][child_id][roi]['Interfaces']={'x':Xv,'y':Yv,
+                                                    'linfit':linfit,'linfitnorm':np.array([-1/linfit[0],my+mx/linfit[0]]),
+                                                    'interface_trace_sample':interface_trace,'interfacenorm_trace_sample':interfacenorm_trace}
+        self.HP[parent_id][child_id][roi]['Interfaces']['interface_trace']={}
+        self.HP[parent_id][child_id][roi]['Interfaces']['interfacenorm_trace']={}
+        for key in self.Phases.keys():
+            self.HP[parent_id][child_id][roi]['Interfaces']['interface_trace'][key]=self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][key].dot(self.CrystalRef2Spatial.dot(interface_trace))
+            self.HP[parent_id][child_id][roi]['Interfaces']['interfacenorm_trace'][key]=self.HP[parent_id][child_id][roi]['G2Cryst_red_avg'][key].dot(self.CrystalRef2Spatial.dot(interfacenorm_trace))
+
+    def printHBmatches(self,roi, parent_id, child_id, nodirs=False, bestscore=False):
+        """
+        Print habit plane matching results.
+        
+        Args:
+            roi: Region of interest index
+            parent_id: Parent cluster ID
+            child_id: Child cluster ID
+            nodirs (bool): Skip direction information
+            bestscore (bool): Only show best match
+        """
+        print('---------------------------------------------------------')
+        print(f'Interface between parent cluster {parent_id} and child cluster {child_id} within ROI {roi}:')
+        print('---------------------------------------------------------')
+        HP_matches = self.HP[parent_id][child_id][roi]['Interfaces']['HP_matches']
+        if not bestscore:
+            idxs=range(len(HP_matches[self.keyau]['Habit plane normal']['n_vec']))
+        else:
+            idxs=[0]
+        for idx in idxs:
+            key = 'Habit plane normal'
+            an = HP_matches[self.keyau][key]['HPvsTrace_angle'][idx]
+            an2 = HP_matches[self.keyma][key]['HPvsTrace_angle'][idx]
+            n_miller = HP_matches[self.keyau][key]['n_miller'][idx]
+            n_miller_fam = HP_matches[self.keyau][key]['n_miller_family'][idx]
+            n_miller2 = HP_matches[self.keyma][key]['n_miller'][idx]
+            n_miller2_fam = HP_matches[self.keyma][key]['n_miller_family'][idx]
+            vdv = HP_matches[self.keyma][key]['misalign'][idx]
+            CV = self.HP[parent_id][child_id][roi]['Closest Variant']
+            TR = np.round(self.HP[parent_id][child_id][roi]['Transformation strain_allvars'][CV][0]['along [1. 0. 0.] [-]'],decimals=4)
+            print(f"Fitting Closest LCV {CV}:{HP_matches['Score']['fitcorresp'][idx]}, Score:{np.round(HP_matches['Score']['overall'][idx],decimals=2)},  mean misalignment:{np.round(HP_matches['Score']['mean misalignment'][idx],decimals=2)}")
+            print(f"Transformation strain along sample [100] from the closest LCV {CV}: {TR}")
+            print(f"Normals: misalignment:{np.round(vdv,decimals=2)}, {n_miller}_A|{{{n_miller_fam}}}_A ({np.round(an,decimals=2)})/{n_miller2}_M|{{{n_miller2_fam}}}_M ({np.round(an2,decimals=2)})")
+            if not nodirs:
+                for idd in range(len(HP_matches[self.keyau]['Habit plane direction']['n_miller'][idx])):
+                    key = 'Habit plane direction'
+                    an = HP_matches[self.keyau][key]['HPvsTrace_angle'][idx][idd]
+                    an2 = HP_matches[self.keyma][key]['HPvsTrace_angle'][idx][idd]
+                    n_miller = HP_matches[self.keyau][key]['n_miller'][idx][idd]
+                    n_miller_fam = HP_matches[self.keyau][key]['n_miller_family'][idx][idd]
+                    n_miller2 = HP_matches[self.keyma][key]['n_miller'][idx][idd]
+                    n_miller2_fam = HP_matches[self.keyma][key]['n_miller_family'][idx][idd]
+                    vdv = HP_matches[self.keyma][key]['misalign'][idx][idd]
+                    print(f"Directions: misalignment:{np.round(vdv,decimals=2)},{n_miller}_A|<{n_miller_fam}>_A ({np.round(an,decimals=2)})/{n_miller2}_M|<{n_miller2_fam}>_M ({np.round(an2,decimals=2)})")
+            print("====================================================================================")
+
+    def getHB(self,roi, parent_id, child_id,VarIdx=None,name='NiTi'):
+        """
+        Determine habit plane candidates for interfaces.
+        
+        Args:
+            roi: Region of interest index
+            parent_id: Parent cluster ID
+            child_id: Child cluster ID
+            VarIdx: Variant index
+            name (str): Name identifier
+            
+        Finds crystallographic planes that could correspond to observed
+        interface traces in both phases.
+        """
+        interface_trace=self.HP[parent_id][child_id][roi]['Interfaces']['interface_trace'][self.phase4HPguess]
+        interfacenorm_trace=self.HP[parent_id][child_id][roi]['Interfaces']['interfacenorm_trace'][self.phase4HPguess]
+        G2Sampl = self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][self.phase4HPguess]
+        if self.phase4HPguess==self.keyau:
+            interface_trace2=self.HP[parent_id][child_id][roi]['Interfaces']['interface_trace'][self.keyma]
+            interfacenorm_trace2=self.HP[parent_id][child_id][roi]['Interfaces']['interfacenorm_trace'][self.keyma]
+            G2Sampl2 = self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][self.keyma]
+        else:
+            interface_trace2=self.HP[parent_id][child_id][roi]['Interfaces']['interface_trace'][self.keyau]
+            interfacenorm_trace2=self.HP[parent_id][child_id][roi]['Interfaces']['interfacenorm_trace'][self.keyau]
+            G2Sampl2 = self.HP[parent_id][child_id][roi]['G2Sampl_red_avg'][self.keyau]
+            
+        if VarIdx is None:
+            VarIdx = self.HP[parent_id][child_id][roi]['Closest Variant']
+        if self.phase4HPguess == self.keyau:
+            self.phase2ndHPguess = self.keyma
+            Lr2 = self.clustering_result.data.phases[self.keyma]['Lr'] 
+            L2 = self.clustering_result.data.phases[self.keyma]['L'] 
+        else:
+            self.phase2ndHPguess = self.keyau
+            Lr2 = self.clustering_result.data.phases[self.keyau]['Lr'] 
+            L2 = self.clustering_result.data.phases[self.keyau]['L'] 
+            
+        #get guesses in one phase
+        HP_guess = self.getNormals(interface_trace, interfacenorm_trace,
+                                    self.clustering_result.data.phases[self.phase4HPguess]['LrI'],self.clustering_result.data.phases[self.phase4HPguess]['Lr'],G2Sampl,self.hklsDict[self.phase4HPguess])
+        #get corresponding guesses in the other phase for the variant providing closest math with the experimental OR
+        HP_guess2ndphase, HP_guess2ndphase_allvars = self.getCorrespNormals(HP_guess, interface_trace2, 
+                                                    self.CP[self.phase4HPguess][:,:,self.HP[parent_id][child_id][roi]['Closest Variant']],Lr2,LCall=self.CP[self.phase4HPguess])
+
+        sortidxs = np.argsort(HP_guess['HPvsTrace_angle']+np.array(HP_guess2ndphase['HPvsTrace_angle']))[::-1]
+
+        for key in HP_guess.keys():
+            HP_guess[key] = (HP_guess[key])[sortidxs]
+        for key in HP_guess2ndphase.keys():
+            HP_guess2ndphase[key] = np.array(HP_guess2ndphase[key])[sortidxs]
+        for key in HP_guess2ndphase_allvars.keys():
+            HP_guess2ndphase_allvars[key] = np.array(HP_guess2ndphase_allvars[key])[sortidxs]
+            
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_guess']={}
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_guess'][self.phase4HPguess]=HP_guess
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_guess'][self.phase2ndHPguess]={}
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_guess'][self.phase2ndHPguess]['Closest Variant'] = HP_guess2ndphase
+        self.HP[parent_id][child_id][roi]['Interfaces']['HP_guess'][self.phase2ndHPguess]['allvars'] = HP_guess2ndphase_allvars
+
+        DP_guess = self.getNormals(interfacenorm_trace,interface_trace,
+                                    self.clustering_result.data.phases[self.phase4HPguess]['LI'], self.clustering_result.data.phases[self.phase4HPguess]['L'],G2Sampl,self.hklsDict[self.phase4HPguess])
+        
+        DP_guess2ndphase, DP_guess2ndphase_allvars = self.getCorrespNormals(DP_guess, interfacenorm_trace2, 
+                                                    self.CD[self.phase4HPguess][:,:,self.HP[parent_id][child_id][roi]['Closest Variant']],L2,LCall=self.CD[self.phase4HPguess],hklsDict=self.hklsDict[self.phase2ndHPguess])
+
+        sortidxs = np.argsort(DP_guess['HPvsTrace_angle']+np.array(DP_guess2ndphase['HPvsTrace_angle']))[::-1]
+
+        for key in DP_guess.keys():
+            DP_guess[key] = (DP_guess[key])[sortidxs]
+        for key in DP_guess2ndphase.keys():
+            DP_guess2ndphase[key] = np.array(DP_guess2ndphase[key])[sortidxs]
+        for key in DP_guess2ndphase_allvars.keys():
+            DP_guess2ndphase_allvars[key] = np.array(DP_guess2ndphase_allvars[key])[sortidxs]
+            
+        self.HP[parent_id][child_id][roi]['Interfaces']['DP_guess']={}
+        self.HP[parent_id][child_id][roi]['Interfaces'][self.phase4HPguess]=DP_guess
+        self.HP[parent_id][child_id][roi]['Interfaces'][self.phase2ndHPguess]={}
+        self.HP[parent_id][child_id][roi]['Interfaces'][self.phase2ndHPguess]['Closest Variant'] = DP_guess2ndphase
+        self.HP[parent_id][child_id][roi]['Interfaces'][self.phase2ndHPguess]['allvars'] = DP_guess2ndphase_allvars
+    def getCorrespNormals(self,N_guess, interface_trace2, LC, Lr2, hklsDict, LCall=None):
+        """
+        Get corresponding normals in second phase using orientation relationship.
+        
+        Args:
+            N_guess: Candidate normals in first phase
+            interface_trace2: Interface trace in second phase
+            LC: Lattice correspondence matrix
+            Lr2: Reciprocal lattice matrix for second phase
+            LCall: All variant correspondence matrices
+            
+        Returns:
+            tuple: Corresponding normals for closest variant and all variants
+        """
+        titles = 'n_miller n_miller_normvec HPvsTrace_angle'.split()
+        N_guess2ndphase={}
+        N_guess2ndphase_allvars={}
+        for title in titles:
+            N_guess2ndphase[f'{title}'] =[]
+            N_guess2ndphase_allvars[f'{title}'] =[]
+        for n_miller in N_guess['n_miller']:
+            N_guess2ndphase['n_miller'].append(LC.dot(n_miller))
+            N_guess2ndphase['n_miller_family'].append(hklsDict[tuple(N_guess2ndphase['n_miller'][-1])])
+            N_guess2ndphase['n_miller_normvec'].append(Lr2.dot(N_guess2ndphase['n_miller'][-1]))
+            N_guess2ndphase['n_miller_normvec'][-1]=N_guess2ndphase['n_miller_normvec'][-1]/np.linalg.norm(N_guess2ndphase['n_miller_normvec'][-1])
+            N_guess2ndphase['HPvsTrace_angle'].append(np.arccos(abs(N_guess2ndphase['n_miller_normvec'][-1].dot(interface_trace2)))*180/np.pi)
+            if LCall is not None:
+                N_guess2ndphase_vari={}
+                for title in titles:
+                    N_guess2ndphase_vari[f'{title}'] =[]
+                for vari in range(self.T_AM .shape[2]):
+                    N_guess2ndphase_vari['n_miller'].append(LCall[:,:,vari].dot(n_miller))
+                    N_guess2ndphase_vari['n_miller_family'].append(hklsDict[tuple(N_guess2ndphase_vari['n_miller'][-1])])
+                    N_guess2ndphase_vari['n_miller_normvec'].append(Lr2.dot(N_guess2ndphase_vari['n_miller'][-1]))
+                    N_guess2ndphase_vari['n_miller_normvec'][-1]=N_guess2ndphase_vari['n_miller_normvec'][-1]/np.linalg.norm(N_guess2ndphase_vari['n_miller_normvec'][-1])
+                    N_guess2ndphase_vari['HPvsTrace_angle'].append(np.arccos(abs(N_guess2ndphase_vari['n_miller_normvec'][-1].dot(interface_trace2)))*180/np.pi)
+
+                for title in titles:
+                   N_guess2ndphase_allvars[f'{title}'].append(N_guess2ndphase_vari[title])
+                
+        if LCall is not None:
+            return N_guess2ndphase,N_guess2ndphase_allvars
+        else:
+            return N_guess2ndphase
 class EbsdInterfaceAnalyzer(getPhases):
     """
     EBSD-specific analyzer for interface characterization between phases.

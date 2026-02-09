@@ -1,0 +1,55 @@
+\documentclass[a4paper,10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{fancyvrb}
+%opening
+\title{Structure of the variable parent\_child\_hierarchy\_with\_boundaries containing hierarchy of parent-child interfaces}
+\author{L. Heller}
+
+\begin{document}
+\maketitle
+\begin{verbatim}
+parent_cluster_idx → dict [11 keys]
+          parent_cluster_id → int
+          parent_phase_id → int
+          parent_n_pixels → int
+          n_children → int
+          children → list [1 items]
+               [0] → dict [6 keys]
+                    child_cluster_id → int
+                    child_phase_id → int
+                    child_n_pixels → int
+                    relationship → str: 'enclosed'
+                    interface → dict [3 keys]
+                         n_boundary_pixels → int
+                         parent_side → dict [9 keys]
+                              indices → array[8] <int32>
+                              coords → array[8×2] <float64>
+                              X → array[8] <float32>
+                              Y → array[8] <float32>
+                              q_mean → array[4] <float64>
+                              M_mean → array[3×3] <float64>
+                              q_best_cluster → array[8×4] <float64>
+                              M_best_cluster → array[8×3×3] <float64>
+                              n_pixels → int
+                         child_side → dict [9 keys]
+                              indices → array[8] <int32>
+                              coords → array[8×2] <float64>
+                              X → array[8] <float32>
+                              Y → array[8] <float32>
+                              q_mean → array[4] <float64>
+                              M_mean → array[3×3] <float64>
+                              q_best_cluster → array[8×4] <float64>
+                              M_best_cluster → array[8×3×3] <float64>
+                              n_pixels → int
+                    is_lamellar → int
+          parent_boundary_indices_all → array[8] <int64>
+          child_boundary_indices_all → array[8] <int64>
+          parent_boundary_mask → array[64493] <bool>
+          child_boundary_mask → array[64493] <bool>
+          parent_boundary_avgori_all → array[64493×3×3] <float64>
+          child_boundary_avgori_all → array[64493×3×3] <float64>
+\end{verbatim}
+
+
+
+\end{document}

@@ -1,0 +1,47 @@
+\documentclass[a4paper,10pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{fancyvrb}
+%opening
+\title{Structure of the variable lamellar\_child\_clusters containing information about martensite lamellea}
+\author{L. Heller}
+
+\begin{document}
+\maketitle
+\begin{verbatim}
+child_cluster_idx → dict [20 keys]
+          cluster_id → int
+          phase_id → int
+          phase_name → str: 'M'
+          aspect_ratio → float
+          length → float
+          width → float
+          orientation_angle → float
+          principal_direction → array[2] <float32>
+          perpendicular_direction → array[2] <float32>
+          centroid → array[2] <float32>
+          end_point_1 → array[2] <float32>
+          end_point_2 → array[2] <float32>
+          area → float
+          n_pixels → int
+          eigenvalues → array[2] <float32>
+          pca_method → str: 'sklearn'
+          is_lamellar → bool
+          units → str: 'physical'
+          elongation_info → dict [14 keys]
+               cluster_id → int
+               principal_direction → array[2] <float32>
+               perpendicular_direction → array[2] <float32>
+               principal_angle → float
+               aspect_ratio → float
+               length → float
+               width → float
+               centroid → array[2] <float32>
+               eigenvalues → array[2] <float32>
+               end_point_1 → array[2] <float32>
+               end_point_2 → array[2] <float32>
+               area → float
+               n_pixels → int
+               pca_method → str: 'sklearn'
+          length_scale → float
+\end{verbatim}
+\end{document}
