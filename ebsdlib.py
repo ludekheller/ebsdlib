@@ -3287,7 +3287,7 @@ class MisorientationClustering(ClusteringAlgorithm):
         # Perform clustering (using your existing algorithm)
         labels, com, cluster_phase_map = self._cluster_multiphase(
             data.X, data.Y, data.quaternions, data.sym_quats_dict,
-            neighbors, sel, data.phases_id,
+            neighbors, sel, data.phases_id, data.phase_ids,
             ang_thr=self.ang_thr,
             dmax=self.dmax,
             minidxs=self.minidxs)
@@ -3300,12 +3300,12 @@ class MisorientationClustering(ClusteringAlgorithm):
                                     'roi':self.roi,
                                     'distance':self.distance,
                                     'perimeteronly':self.perimeteronly,
-                                    'distance_convention':self.distance_convention
+                                    'distance_convention':self.distance_convention,
                                     }, cluster_phases_id=cluster_phase_map, com=com)
         
         return result
     
-    def _cluster_multiphase(self,X, Y, Q, sym_quats_dict, neighbors, Sel, phases_id,
+    def _cluster_multiphase(self,X, Y, Q, sym_quats_dict, neighbors, Sel, phases_id, phase_ids,
                        ang_thr=5.0, dmax=1.5, minidxs=1):
         """
         Multi-phase clustering wrapper that runs clustering sequentially for each phase.
@@ -3347,6 +3347,7 @@ class MisorientationClustering(ClusteringAlgorithm):
         cluster_phase_map = {}
         
         unique_phases = np.unique(phases_id)
+        unique_phases = np.array(list((phase_ids.values())))
         current_cluster_offset = 0
         
         print(f"Clustering {len(unique_phases)} phases sequentially...")
@@ -3720,7 +3721,7 @@ class ClusteringResult:
 
     @property
     def unique_phases(self):
-        return np.unique(self.data.phases_id)
+        return np.array(list((self.data.phase_ids.values())))#np.unique(self.data.phases_id)
            
     @property
     def cluster_phases_id(self):
@@ -3783,7 +3784,7 @@ class ClusteringResult:
     def get_phase_labels(self):
         """Group labels by phase_id"""
         self.labels_by_phase={}
-        for phase_id in np.unique(self.data.phases_id):
+        for phase_id in np.array(list((self.data.phase_ids.values()))):#np.unique(self.data.phases_id):
             self.labels_by_phase[self.data.phase_names[phase_id]] = np.array([label for label in self.get_unique_clusters() if int(self._cluster_phases_id[label])==phase_id])
             #self.labels_by_phase[phase_id] = 
     
@@ -7815,7 +7816,7 @@ class KamGND:
             m = self.nneighbors * (kam * distance).sum(axis=1) - kam.sum(axis=1) * distance.sum()
             m /= self.nneighbors * (distance**2).sum() - (distance.sum()) ** 2
 
-            b = 2.54e-10  # Burgers vector [m]
+            
             grad_mag = m*np.pi/180*1e6 # conversion from deg/um to rad/m
             if pi==0:
                 GND = grad_mag / self.burgersv
