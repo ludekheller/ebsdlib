@@ -43,7 +43,20 @@ _SIN60 = 0.5 * 3.0**0.5  # sin(60deg)
 import h5py
 from scipy.spatial.transform import Rotation as ScipyRotation
 
-
+def _generate_distinct_colors(n):
+    """
+    Generate n visually distinct, evenly-spaced colors (as RGB tuples in
+    [0,1]) using golden-angle hue stepping -- good spacing regardless of
+    n, no need to know the count in advance.
+    """
+    import colorsys
+    golden_ratio_conjugate = 0.618033988749895
+    hue = 0.0
+    colors = []
+    for _ in range(n):
+        hue = (hue + golden_ratio_conjugate) % 1.0
+        colors.append(colorsys.hsv_to_rgb(hue, 0.85, 0.85))
+    return colors
 def save_to_hdf5(filename, data, key='data'):
     """
     Save data (dict or list of dicts) to HDF5.
@@ -2508,14 +2521,14 @@ class EBSDData(getPhases):
                 mask_by_phase[self.phase_names[phase_id]] = (self.phases_id==phase_id)*self.rois.masks[0]
             self.rois.masks_by_phase.append(mask_by_phase)
 
-        for selPath in self.selector.selPaths:
+        for selPath, selVert in zip(self.selector.selPaths,self.selector.selVerts):
             self.rois.masks.append(selPath.contains_points(np.vstack((self.X,self.Y)).T))
             mask_by_phase={}
             for phase_id in self.phase_names:
                 mask_by_phase[self.phase_names[phase_id]] = (self.phases_id==phase_id)*self.rois.masks[-1]
             self.rois.masks_by_phase.append(mask_by_phase)
-        self.selector.selPaths.insert(0,SelPaths)
-        self.selector.selVerts.insert(0,SelVerts)
+        self.selector.selPaths.insert(0,selPath)
+        self.selector.selVerts.insert(0,selVert)
         mask_by_phase={}
         
 
@@ -3143,6 +3156,8 @@ class selectROI(object):
             self.selPaths.append(mpltPath.Path(verts))
 
         #print(self.verts)
+        #print(self.selVerts)
+        #print(self.selPaths)
         self.canvas.draw_idle()
 
     def disconnect(self):
@@ -4728,7 +4743,1827 @@ class ClusteringResult:
         new_result._cluster_sphericities = None
         
         return new_result  
+    
+    
+    def plot_cluster_ipf4cubic(self, cluster_id, direction=(0, 0, 1), phase=None, roi=None,
+                                equalarea=False, scale='sqrt', nlevels=10,
+                                fig=None, ax=None, cmap=None, return_val=False,
+                                plot_avg=False, avg_kwargs=None,
+                                zoom_to_triangle=True, zoom_margin=0.05, **kwargs):
+        """
+        ... (same docstring as before) ...
 
+        Notes
+        -----
+        If ax is provided (reused from a previous call), the new title line
+        is appended below the existing title (separated by a newline)
+        instead of replacing it — useful for overlaying multiple
+        clusters/directions on the same axes. If ax is created fresh, this
+        has no visible effect since the starting title is empty.
+        """
+        mask, resolved_phase = self._getMask(roi=roi, cluster_id=cluster_id, phase=phase)
+        idxs = np.where(mask)[0]
+
+        if idxs.shape[0] == 0:
+            raise ValueError(f"No pixels found for cluster_id={cluster_id} (phase={resolved_phase})")
+
+        pixel_quats = self.data.quaternions[idxs]
+        M = np.array([quat_to_mat(q) for q in pixel_quats])  # (n_pixels, 3, 3), sample -> crystal
+
+        direction = np.asarray(direction, dtype=float)
+        direction = direction / np.linalg.norm(direction)
+
+        data = np.einsum('nij,j->ni', M, direction).T  # (3, n_pixels), crystal-frame
+
+        if cmap is None:
+            cmap = get_cmap([(1, 1, 1), (1, 0, 0)])
+
+        result = stereaotriangle_hist(data, equalarea=equalarea, scale=scale, nlevels=nlevels,
+                                    fig=fig, ax=ax, cmap=cmap, return_val=True, **kwargs)
+        fig, ax, spsel, hist = result
+
+        cluster_id_list = [cluster_id] if isinstance(cluster_id, (int, np.integer)) else list(cluster_id)
+        n_clusters = len(cluster_id_list)
+
+        if plot_avg:
+            style = {
+                'marker': 'o', 'markersize': 20, 'markeredgewidth': 2,
+                'markeredgecolor': 'k', 'markerfacecolor': 'b', 'alpha': 0.7,
+            }
+            if avg_kwargs:
+                style.update(avg_kwargs)
+
+            avg_mats = np.array([self.avg_orientations[c] for c in cluster_id_list
+                                if c in self.avg_orientations])
+            missing = [c for c in cluster_id_list if c not in self.avg_orientations]
+            if missing:
+                print(f"Warning: no average orientation available for clusters {missing}, skipping overlay for them.")
+
+            if avg_mats.shape[0] > 0:
+                data_avg = np.einsum('nij,j->ni', avg_mats, direction).T
+                #data_avg = data_avg[:, data_avg[2, :] > 0]
+
+                if data_avg.shape[1] > 0:
+                    if equalarea:
+                        spsel_avg = equalarea_intotriangle_fast(data_avg)
+                    else:
+                        spsel_avg = stereoprojection_intotriangle_fast(data_avg)
+                    ax.plot(spsel_avg[0, :], spsel_avg[1, :], linestyle='None', **style)
+
+        if zoom_to_triangle:
+            xlim, ylim = stereotriangle_bbox(equalarea=equalarea, margin=zoom_margin)
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            ax.set_aspect('equal')
+
+        new_title = (f"IPF {tuple(round(float(v), 2) for v in direction)} "
+                    f"— {resolved_phase}, {n_clusters} cluster(s) of id(s) {cluster_id_list}, {idxs.shape[0]} px")
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
+
+        if return_val:
+            return fig, ax, spsel, hist
+        return fig, ax
+    def plot_cluster_pole_figure_ini(self, cluster_id, uvw=(1, 0, 0), phase=None, roi=None,
+                              equalarea=False, scale='sqrt', nlevels=10, hemi='upper',
+                              fig=None, ax=None, cmap=None, return_val=False,
+                              plot_avg=False, avg_kwargs=None, **kwargs):
+        """
+        ... (same docstring as before) ...
+
+        Notes
+        -----
+        If ax is provided (reused from a previous call), the new title line
+        is appended below the existing title (separated by a newline)
+        instead of replacing it — useful for overlaying multiple
+        clusters/directions on the same axes and keeping a running label of
+        what's been plotted. If ax is created fresh, this has no visible
+        effect since the starting title is empty.
+        """
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        mask, resolved_phase = self._getMask(roi=roi, cluster_id=cluster_id, phase=phase)
+        idxs = np.where(mask)[0]
+
+        if idxs.shape[0] == 0:
+            raise ValueError(f"No pixels found for cluster_id={cluster_id} (phase={resolved_phase})")
+
+        pixel_quats = self.data.quaternions[idxs]
+        M = np.array([quat_to_mat(q) for q in pixel_quats])  # (n_pixels, 3, 3), sample -> crystal
+        Minv = M.transpose(0, 2, 1)                           # crystal -> sample
+
+        symops = np.array(self.data.phases[resolved_phase]['symops'])
+
+        uvw = np.asarray(uvw, dtype=float)
+        uvwsb = set(tuple(v) for v in np.round(np.dot(symops, uvw), 8))
+        uvwsb = np.asarray(list(uvwsb))
+
+        XYZ = np.tensordot(Minv, uvwsb.T, axes=[[-1], [-2]]).transpose([0, 2, 1])
+        XYZ = XYZ.reshape(-1, 3).T  # (3, n_pixels * n_variants)
+
+        if cmap is None:
+            cmap = get_cmap([(1, 1, 1), (1, 0, 0)])
+
+        result = polefigure_hist(XYZ, equalarea=equalarea, scale=scale, nlevels=nlevels,
+                                hemi=hemi, fig=fig, ax=ax, cmap=cmap, return_val=True, **kwargs)
+        fig, ax, sp, hist = result
+
+        cluster_id_list = [cluster_id] if isinstance(cluster_id, (int, np.integer)) else list(cluster_id)
+        n_clusters = len(cluster_id_list)
+
+        if plot_avg:
+            style = {
+                'marker': 'o', 'markersize': 20, 'markeredgewidth': 2,
+                'markeredgecolor': 'k', 'markerfacecolor': 'b', 'alpha': 0.7,
+            }
+            if avg_kwargs:
+                style.update(avg_kwargs)
+
+            avg_mats = np.array([self.avg_orientations[c] for c in cluster_id_list
+                                if c in self.avg_orientations])
+            missing = [c for c in cluster_id_list if c not in self.avg_orientations]
+            if missing:
+                print(f"Warning: no average orientation available for clusters {missing}, skipping overlay for them.")
+
+            if avg_mats.shape[0] > 0:
+                avg_Minv = avg_mats.transpose(0, 2, 1)
+                XYZavg = np.tensordot(avg_Minv, uvwsb.T, axes=[[-1], [-2]]).transpose([0, 2, 1])
+                XYZavg = XYZavg.reshape(-1, 3).T
+
+                if hemi == 'upper':
+                    XYZavg = XYZavg[:, XYZavg[2, :] >= 0]
+                else:
+                    XYZavg = XYZavg[:, XYZavg[2, :] <= 0]
+
+                if XYZavg.shape[1] > 0:
+                    if equalarea:
+                        sp_avg = equalarea_directions(XYZavg)
+                    else:
+                        sp_avg = stereoprojection_directions(XYZavg)
+                    ax.plot(sp_avg[0, :], sp_avg[1, :], linestyle='None', **style)
+
+        new_title = (f"Pole figure {tuple(int(v) for v in np.round(uvw))} "
+                    f"— {resolved_phase}, {n_clusters} cluster(s) of id(s) {cluster_id_list}, {idxs.shape[0]} px")
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
+
+        if return_val:
+            return fig, ax, sp, hist
+        return fig, ax
+
+    def plot_cluster_pole_figure(self, cluster_id, uvw=(1, 0, 0), phase=None, roi=None,
+                                equalarea=False, hemi='upper', fig=None, ax=None,
+                                pixel_plot='symbols', pixel_pooled=False,
+                                pixel_symbol_kwargs=None, pixel_hist_kwargs=None,
+                                avg_plot=None, avg_symbol_kwargs=None, avg_hist_kwargs=None,
+                                sample_transform=None, min_size=None,
+                                show_legend=True, return_val=False):
+        """
+        Plot pole positions for one or more clusters, on a stereographic
+        (Wulff) or equal-area (Schmidt) net.
+
+        Pixel orientations and average orientations are controlled
+        INDEPENDENTLY: each can be shown as symbols (scatter), a density
+        histogram, both, or omitted entirely -- with independent style.
+
+        Parameters
+        ----------
+        cluster_id : int, list of int, or None/'all'
+            Cluster label(s). None or 'all' selects every cluster in
+            `phase` (min_size-filtered), sorted by pixel size descending.
+        uvw : array-like (3,)
+            Crystal direction/pole to plot.
+        phase : str, optional
+            Required if cluster_id is None/'all'. Otherwise inferred via
+            self._getMask.
+        roi : optional
+            ROI index, passed to self._getMask.
+        equalarea : bool
+            Equal-area (Schmidt) vs. stereographic (Wulff) net/projection.
+        hemi : {'upper', 'lower'}
+            Which hemisphere to plot.
+        fig, ax : matplotlib Figure, Axes, optional
+            Existing fig/ax. If ax is None, a new one is created (net drawn
+            once via wulffnet/schmidtnet).
+
+        pixel_plot : {None, 'symbols', 'histogram', 'both'}, optional
+            How to show individual PIXEL orientations. Default 'symbols'.
+        pixel_pooled : bool, optional
+            Only matters when multiple clusters are selected. If False
+            (default), each cluster is plotted separately with its own
+            auto-generated color/colormap (one histogram per cluster if
+            pixel_plot involves 'histogram'). If True, ALL selected
+            clusters' pixels are POOLED into a single combined scatter/
+            histogram with one shared color/colormap -- i.e. "orientations
+            of all pixels of all clusters" as one dataset.
+        pixel_symbol_kwargs : dict, optional
+            Style for pixel symbols (used if pixel_plot in
+            {'symbols','both'}). Defaults: {'color': None, 's': 2,
+            'alpha': 0.5}. 'color' is ignored (auto per-cluster instead)
+            when pixel_pooled=False and multiple clusters are selected.
+            Extra keys forwarded to ax.scatter.
+        pixel_hist_kwargs : dict, optional
+            Histogram settings for pixels (used if pixel_plot in
+            {'histogram','both'}). Defaults: {'scale': 'sqrt', 'nlevels': 10,
+            'bins': 256, 'cmap': None, 'vmax': None}. 'cmap' is ignored
+            (auto white->hue per cluster instead) when pixel_pooled=False
+            and multiple clusters are selected; default pooled/single-
+            cluster cmap is white->red. 'vmax', if given, caps the contour
+            level range (see polefigure_plot); default None uses the
+            histogram's own max. Extra keys forwarded to ax.contourf.
+
+        avg_plot : {None, 'symbols', 'histogram', 'both'}, optional
+            How to show cluster AVERAGE orientations. Default None (off).
+        avg_symbol_kwargs : dict, optional
+            Style for average-orientation symbols (used if avg_plot in
+            {'symbols','both'}). Defaults: {'marker': 'o', 'markersize': 20,
+            'markeredgewidth': 2, 'markeredgecolor': 'k',
+            'markerfacecolor': 'b', 'alpha': 0.7}. 'markerfacecolor' is
+            ignored (auto per-cluster instead) when pixel_pooled=False and
+            multiple clusters are selected.
+        avg_hist_kwargs : dict, optional
+            Histogram settings for average orientations (used if avg_plot
+            in {'histogram','both'}). Defaults: {'scale': 'sqrt',
+            'nlevels': 10, 'bins': 256, 'cmap': None, 'vmax': None} (default
+            cmap white->blue). ALWAYS POOLED across all selected clusters
+            into ONE histogram regardless of pixel_pooled (a per-cluster
+            histogram of a single average point isn't meaningful), and
+            ALWAYS WEIGHTED by each cluster's pixel size (self.cluster_sizes)
+            -- so the histogram reflects the population of pixels each
+            average represents, not just a count of cluster averages.
+
+        sample_transform : (3,3) array, optional
+            Rotation applied to every projected SAMPLE-frame vector (pixel
+            and average), after the crystal->sample transform (M.T).
+        min_size : int, optional
+            Minimum pixel count for a cluster to be included, when
+            cluster_id is None/'all' or an explicit list/'all'.
+        show_legend : bool, optional
+            Show a legend mapping colors to cluster IDs, only shown when
+            pixel_pooled=False and multiple clusters are plotted. Default True.
+        return_val : bool, optional
+            If True, also return a dict with whatever was computed:
+            {'pixel': {...}, 'avg': {...}}, keyed by cluster_id when
+            per-cluster, or under 'pooled' when pooled. Each pixel/avg
+            histogram entry includes both 'hist' (the array) and
+            'contourf' (the QuadContourSet artist, for building a colorbar
+            via fig.colorbar(entry['contourf'], ax=ax)).
+
+        Returns
+        -------
+        fig, ax : matplotlib Figure, Axes
+        results : dict, only if return_val=True
+
+        Notes
+        -----
+        self.data.quaternions (via quat_to_mat) give M, sample -> crystal
+        (v_crystal = M @ v_sample). Pole figures need crystal -> sample:
+        v_sample = M.T @ uvw. sample_transform is applied after that.
+        """
+        if ax is None:
+            if equalarea:
+                fig, ax = schmidtnet(ax=None, basedirs=False, facecolor='None')
+            else:
+                fig, ax = wulffnet(ax=None, basedirs=False, facecolor='None')
+        fig = ax.figure
+
+        uvw = np.asarray(uvw, dtype=float)
+        sizes = self.cluster_sizes
+
+        if cluster_id is None or (isinstance(cluster_id, str) and cluster_id == 'all'):
+            if phase is None:
+                raise ValueError("phase is required when cluster_id is None or 'all'")
+            cluster_list = sorted(self.labels_by_phase[phase], key=lambda c: -sizes.get(c, 0))
+        elif isinstance(cluster_id, (int, np.integer)):
+            cluster_list = [cluster_id]
+        else:
+            cluster_list = sorted(cluster_id, key=lambda c: -sizes.get(c, 0))
+
+        if min_size is not None:
+            cluster_list = [c for c in cluster_list if sizes.get(c, 0) >= min_size]
+        if not cluster_list:
+            raise ValueError("No clusters left after filtering (check phase/min_size).")
+
+        # ---- resolve style defaults ----
+        p_sym = {'color': None, 's': 2, 'alpha': 0.5}
+        if pixel_symbol_kwargs:
+            p_sym.update(pixel_symbol_kwargs)
+
+        p_hist = {'scale': 'sqrt', 'nlevels': 10, 'bins': 256, 'cmap': None, 'vmax': None}
+        if pixel_hist_kwargs:
+            p_hist.update(pixel_hist_kwargs)
+
+        a_sym = {'marker': 'o', 'markersize': 20, 'markeredgewidth': 2,
+                'markeredgecolor': 'k', 'markerfacecolor': 'b', 'alpha': 0.7}
+        if avg_symbol_kwargs:
+            a_sym.update(avg_symbol_kwargs)
+
+        a_hist = {'scale': 'sqrt', 'nlevels': 10, 'bins': 256, 'cmap': None, 'vmax': None}
+        if avg_hist_kwargs:
+            a_hist.update(avg_hist_kwargs)
+
+        use_distinct_colors = (not pixel_pooled) and len(cluster_list) > 1
+        colors = _generate_distinct_colors(len(cluster_list)) if use_distinct_colors else [None] * len(cluster_list)
+
+        def _project(XYZ):
+            if hemi == 'upper':
+                XYZ = XYZ[:, XYZ[2, :] >= 0]
+            else:
+                XYZ = XYZ[:, XYZ[2, :] <= 0]
+            if XYZ.shape[1] == 0:
+                return np.zeros((2, 0))
+            return equalarea_directions(XYZ) if equalarea else stereoprojection_directions(XYZ)
+
+        def _cluster_pixel_XYZ(c):
+            mask, resolved_phase = self._getMask(roi=roi, cluster_id=c, phase=phase)
+            idxs = np.where(mask)[0]
+            if idxs.shape[0] == 0:
+                return None, None, None
+            pixel_quats = self.data.quaternions[idxs]
+            M = np.array([quat_to_mat(q) for q in pixel_quats])
+            Minv = M.transpose(0, 2, 1)
+            symops = np.array(self.data.phases[resolved_phase]['symops'])
+            uvwsb = set(tuple(v) for v in np.round(np.dot(symops, uvw), 8))
+            uvwsb = np.asarray(list(uvwsb))
+            XYZ = np.tensordot(Minv, uvwsb.T, axes=[[-1], [-2]]).transpose([0, 2, 1])
+            XYZ = XYZ.reshape(-1, 3).T
+            if sample_transform is not None:
+                XYZ = np.asarray(sample_transform) @ XYZ
+            return XYZ, uvwsb, idxs.shape[0]
+
+        def _cluster_avg_XYZ(c, uvwsb):
+            if c not in self.avg_orientations:
+                return None
+            avg_M = self.avg_orientations[c]
+            XYZavg = (avg_M.T).dot(uvwsb.T).T.T  # (3, n_variants)
+            if sample_transform is not None:
+                XYZavg = np.asarray(sample_transform) @ XYZavg
+            return XYZavg
+
+        results = {'pixel': {}, 'avg': {}}
+        legend_handles = []
+
+        # ==================== PIXEL PLOTTING ====================
+        if pixel_plot is not None:
+            if use_distinct_colors:
+                for c, base_color in zip(cluster_list, colors):
+                    XYZ, uvwsb, n_px = _cluster_pixel_XYZ(c)
+                    if XYZ is None:
+                        continue
+                    cmap = get_cmap([(1, 1, 1), base_color])
+                    if pixel_plot in ('symbols', 'both'):
+                        sp = _project(XYZ)
+                        style = {k: v for k, v in p_sym.items() if k != 'color'}
+                        ax.scatter(sp[0, :], sp[1, :], color=base_color, **style)
+                        results['pixel'].setdefault(c, {})['sp'] = sp
+                    if pixel_plot in ('histogram', 'both'):
+                        hist, sp, extent = polefigure_histogram(
+                            XYZ, equalarea=equalarea, scale=p_hist['scale'],
+                            bins=p_hist['bins'], hemi=hemi)
+                        extra = {k: v for k, v in p_hist.items()
+                                if k not in ('scale', 'nlevels', 'bins', 'cmap', 'vmax')}
+                        fig, ax, _cs = polefigure_plot(hist, equalarea=equalarea, nlevels=p_hist['nlevels'],
+                                                        vmax=p_hist['vmax'], fig=fig, ax=ax, draw_net=False,
+                                                        cmap=cmap, **extra)
+                        results['pixel'].setdefault(c, {})['hist'] = hist
+                        results['pixel'].setdefault(c, {})['contourf'] = _cs
+                    legend_handles.append(
+                        plt.Line2D([0], [0], marker='o', linestyle='None',
+                                markerfacecolor=base_color, markeredgecolor='k',
+                                label=f"{c} ({n_px} px)")
+                    )
+            else:
+                XYZ_all = []
+                uvwsb_ref = None
+                for c in cluster_list:
+                    XYZ, uvwsb, n_px = _cluster_pixel_XYZ(c)
+                    if XYZ is None:
+                        continue
+                    XYZ_all.append(XYZ)
+                    uvwsb_ref = uvwsb
+                if XYZ_all:
+                    XYZ_all = np.concatenate(XYZ_all, axis=1)
+                    if pixel_plot in ('symbols', 'both'):
+                        sp = _project(XYZ_all)
+                        ax.scatter(sp[0, :], sp[1, :], **p_sym)
+                        results['pixel'].setdefault('pooled', {})['sp'] = sp
+                    if pixel_plot in ('histogram', 'both'):
+                        cmap = p_hist['cmap'] or get_cmap([(1, 1, 1), (1, 0, 0)])
+                        hist, sp, extent = polefigure_histogram(
+                            XYZ_all, equalarea=equalarea, scale=p_hist['scale'],
+                            bins=p_hist['bins'], hemi=hemi)
+                        extra = {k: v for k, v in p_hist.items()
+                                if k not in ('scale', 'nlevels', 'bins', 'cmap', 'vmax')}
+                        fig, ax, _cs = polefigure_plot(hist, equalarea=equalarea, nlevels=p_hist['nlevels'],
+                                                        vmax=p_hist['vmax'], fig=fig, ax=ax, draw_net=False,
+                                                        cmap=cmap, **extra)
+                        results['pixel'].setdefault('pooled', {})['hist'] = hist
+                        results['pixel'].setdefault('pooled', {})['contourf'] = _cs
+
+        # ==================== AVERAGE ORIENTATION PLOTTING ====================
+        if avg_plot is not None:
+            avg_style_no_face = {k: v for k, v in a_sym.items() if k != 'markerfacecolor'}
+
+            if avg_plot in ('symbols', 'both'):
+                for c, base_color in zip(cluster_list, colors):
+                    _, uvwsb, _ = _cluster_pixel_XYZ(c)
+                    if uvwsb is None:
+                        continue
+                    XYZavg = _cluster_avg_XYZ(c, uvwsb)
+                    if XYZavg is None:
+                        continue
+                    sp_avg = _project(XYZavg)
+                    if sp_avg.shape[1] == 0:
+                        continue
+                    if use_distinct_colors:
+                        ax.plot(sp_avg[0, :], sp_avg[1, :], linestyle='None',
+                                markerfacecolor=base_color, **avg_style_no_face)
+                    else:
+                        ax.plot(sp_avg[0, :], sp_avg[1, :], linestyle='None', **a_sym)
+                    results['avg'].setdefault(c, {})['sp'] = sp_avg
+
+            if avg_plot in ('histogram', 'both'):
+                # ALWAYS pooled across cluster_list, weighted by pixel size
+                XYZavg_all = []
+                weights_all = []
+                for c in cluster_list:
+                    _, uvwsb, _ = _cluster_pixel_XYZ(c)
+                    if uvwsb is None:
+                        continue
+                    XYZavg = _cluster_avg_XYZ(c, uvwsb)
+                    if XYZavg is None:
+                        continue
+                    n_variants = XYZavg.shape[1]
+                    XYZavg_all.append(XYZavg)
+                    weights_all.append(np.full(n_variants, sizes.get(c, 0), dtype=float))
+                if XYZavg_all:
+                    XYZavg_all = np.concatenate(XYZavg_all, axis=1)
+                    weights_all = np.concatenate(weights_all)
+                    cmap = a_hist['cmap'] or get_cmap([(1, 1, 1), (0, 0, 1)])
+                    hist, sp, extent = polefigure_histogram(
+                        XYZavg_all, weights=weights_all, equalarea=equalarea,
+                        scale=a_hist['scale'], bins=a_hist['bins'], hemi=hemi)
+                    extra = {k: v for k, v in a_hist.items()
+                            if k not in ('scale', 'nlevels', 'bins', 'cmap', 'vmax')}
+                    fig, ax, _cs = polefigure_plot(hist, equalarea=equalarea, nlevels=a_hist['nlevels'],
+                                                    vmax=a_hist['vmax'], fig=fig, ax=ax, draw_net=False,
+                                                    cmap=cmap, **extra)
+                    results['avg']['pooled_hist'] = hist
+                    results['avg']['pooled_contourf'] = _cs
+
+        if show_legend and use_distinct_colors and legend_handles:
+            ax.legend(handles=legend_handles, loc='upper left',
+                    bbox_to_anchor=(1.02, 1.0), fontsize=8, title='Cluster (size)')
+
+        n_clusters = len(cluster_list)
+        total_px = sum(sizes.get(c, 0) for c in cluster_list)
+        new_title = (f"Pole figure {tuple(int(v) for v in np.round(uvw))} "
+                    f"— {n_clusters} cluster(s), {total_px} px")
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
+
+        return (fig, ax, results) if return_val else (fig, ax)
+    def annotate_sample_transform(ax, sample_transform):
+        """
+        Append a note to ax's title reporting where the standard sample
+        axes x=[1,0,0], y=[0,1,0], z=[0,0,1] land under sample_transform --
+        i.e. the coordinate system the pole figure is actually plotted in,
+        when a non-identity sample_transform was used.
+
+        Parameters
+        ----------
+        ax : matplotlib Axes
+            Axes returned by plot_cluster_pole_figure (or any function
+            following the same title-append convention).
+        sample_transform : (3,3) array
+            The same matrix passed as sample_transform to
+            plot_cluster_pole_figure.
+        """
+        T = np.asarray(sample_transform)
+
+        def _fmt(vec):
+            return tuple(float(round(v, 2)) for v in vec)
+
+        x_new = _fmt(T.dot([1.0, 0.0, 0.0]))
+        y_new = _fmt(T.dot([0.0, 1.0, 0.0]))
+        z_new = _fmt(T.dot([0.0, 0.0, 1.0]))
+
+        note = f"plotted in rotated frame:\nx={x_new}, y={y_new}, z={z_new}"
+
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{note}" if existing_title else note)
+    def symmetrize_to_reference_ini(self, reference, cluster_ids, phase=None,
+                                ref_lattice_direction=None,
+                                return_clustering_result=False):
+        """
+        Re-express pixel orientations (and average orientations) of the
+        given clusters using a SINGLE, per-cluster symmetry operation that
+        brings each cluster's own (already self-consistent) average
+        orientation closest to a fixed reference orientation.
+
+        Unlike resolving each pixel independently against the reference
+        (which can split a single physically coherent cluster's pixels
+        across multiple different symmetric branches when the reference
+        sits near-equidistant between two candidate branches -- confirmed
+        empirically: one real dataset showed a cluster's 1408 pixels split
+        across 6 different symops despite an internal pixel-to-pixel spread
+        of only ~6 deg to its own orientation), this finds ONE symop per
+        cluster (via the cluster's converged average, self.avg_orientations)
+        and applies it uniformly to every pixel in that cluster. This
+        guarantees the relabeling can never mix branches within a single
+        cluster.
+
+        Since this only ever applies a single rigid relabeling per cluster,
+        ALL misorientation-derived quantities between any two of the
+        processed clusters (pole coincidences, disorientation angles, twin
+        checks) are mathematically guaranteed unchanged -- only the
+        reference frame used for display shifts.
+
+        Does NOT modify self.data.quaternions or self.avg_orientations in
+        place -- returns a new dict (or, if return_clustering_result=True,
+        a new ClusteringResult with a shallow-copied self.data whose
+        quaternions array has been overwritten only for the affected
+        pixels).
+
+        Parameters
+        ----------
+        reference : int, (3,3) array, or (4,) array
+            Fixed reference orientation. If int, treated as a cluster ID
+            and self.avg_orientations[reference] is used. If (3,3), used
+            directly as an orientation matrix. If (4,), used directly as a
+            quaternion.
+        cluster_ids : int, list of int, or 'all'
+            Cluster(s) to resolve relative to `reference`. If 'all', uses
+            every cluster in `phase` (phase then required).
+        phase : str, optional
+            Phase for symops lookup. If None, inferred from the first
+            cluster via self.cluster_phases_id. All clusters in cluster_ids
+            should share this phase.
+        ref_lattice_direction : array-like (3,), optional
+            If given, the REFERENCE orientation is first replaced by the
+            symmetrically-equivalent variant equiRefOri such that
+            equiRefOri.T @ ref_lattice_direction (i.e. this crystal-frame
+            direction expressed in the SAMPLE frame) is closest to sample
+            [0,0,1] (ND). All symmetry-equivalent variants of `reference`
+            are searched; the one maximizing the dot product with [0,0,1]
+            is selected as the new reference before proceeding. Default
+            None (use `reference` as-is).
+
+            Note: ref_lattice_direction is treated as already Cartesian in
+            the crystal frame -- for a non-cubic phase where you're
+            starting from Miller indices, convert via the phase's structure
+            matrix first (ref_lattice_direction =
+            self.data.phases[phase]['L'].dot(uvw)), same as
+            get_zone_axis_transform does.
+        return_clustering_result : bool, optional
+            If False (default), return the plain result dict. If True,
+            instead return a NEW ClusteringResult whose pixel quaternions
+            (for the affected pixels only) and avg_orientations/avg_quats
+            (for the affected clusters only) reflect the symmetrized
+            values. self and self.data are left untouched -- both self and
+            self.data are shallow-copied, with self.data's underlying
+            quaternion array (self.data._quaternions, since `quaternions`
+            is a read-only property) specifically deep-copied before the
+            affected pixels are overwritten.
+
+        Returns
+        -------
+        result : dict {cluster_id: dict}, if return_clustering_result=False
+            'idxs' : pixel indices into self.data arrays
+            'pixel_quats', 'pixel_mats' : symmetrized pixel orientations
+            'avg_quat', 'avg_mat' : symmetrized cluster average
+            'symop_idx' : index into this phase's symops of the single
+                operation applied to this cluster
+        new_result : ClusteringResult, if return_clustering_result=True
+        """
+        import copy
+        from scipy.spatial.transform import Rotation as _R
+
+        if isinstance(cluster_ids, str) and cluster_ids == 'all':
+            if phase is None:
+                raise ValueError("phase is required when cluster_ids='all'")
+            cluster_ids = list(self.labels_by_phase[phase])
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[cluster_ids[0]]]
+        symops = np.array(self.data.phases[phase]['symops'])
+
+        if isinstance(reference, (int, np.integer)):
+            if reference not in self.avg_orientations:
+                raise ValueError(f"No average orientation available for reference cluster {reference}")
+            ref_mat = self.avg_orientations[reference]
+        else:
+            reference = np.asarray(reference)
+            if reference.shape == (3, 3):
+                ref_mat = reference
+            elif reference.shape == (4,):
+                ref_mat = quat_to_mat(reference)
+            else:
+                raise ValueError(f"reference must be a cluster id, (3,3) matrix, or (4,) quaternion, "
+                                f"got shape {reference.shape}")
+
+        if ref_lattice_direction is not None:
+            v = np.asarray(ref_lattice_direction, dtype=float)
+            v = v / np.linalg.norm(v)
+            equi_mats = np.einsum('sij,jk->sik', symops, ref_mat)  # (Ns,3,3), S @ ref_mat
+            sample_dirs = np.einsum('sji,j->si', equi_mats, v)     # (M.T @ v) per variant
+            target = np.array([0.0, 0.0, 1.0])
+            dots = np.clip(sample_dirs @ target, -1.0, 1.0)
+            ref_mat = equi_mats[np.argmax(dots)]
+
+        result = {}
+        for c in cluster_ids:
+            idxs = np.where(self.labels == c)[0]
+            if idxs.shape[0] == 0 or c not in self.avg_orientations:
+                continue
+
+            M_c = self.avg_orientations[c]
+
+            # find the SINGLE symop S minimizing disorientation between
+            # S @ M_c and ref_mat -- applied uniformly to the whole cluster
+            candidates = np.einsum('sij,jk->sik', symops, M_c)   # (Ns,3,3), S @ M_c
+            rel = np.einsum('sij,kj->sik', candidates, ref_mat)   # candidates @ ref_mat.T
+            q = _R.from_matrix(rel).as_quat()
+            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+            ang = 2.0 * np.arccos(w)
+            best_s = int(np.argmin(ang))
+            S = symops[best_s]
+
+            new_avg_mat = S.dot(M_c)
+
+            pixel_mats_old = np.array([quat_to_mat(qi) for qi in self.data.quaternions[idxs]])
+            pixel_mats_new = np.einsum('ij,njk->nik', S, pixel_mats_old)
+            pixel_quats_new = np.array([mat_to_quat(m) for m in pixel_mats_new])
+
+            result[c] = {
+                'idxs': idxs,
+                'pixel_quats': pixel_quats_new,
+                'pixel_mats': pixel_mats_new,
+                'avg_quat': mat_to_quat(new_avg_mat),
+                'avg_mat': new_avg_mat,
+                'symop_idx': best_s,
+            }
+
+        if not return_clustering_result:
+            return result
+
+        new_data = copy.copy(self.data)
+        new_quaternions = self.data.quaternions.copy()
+        for c, r in result.items():
+            new_quaternions[r['idxs']] = r['pixel_quats']
+        new_data._quaternions = new_quaternions
+
+        new_result = copy.copy(self)
+        new_result.data = new_data
+        new_result.avg_orientations = dict(self.avg_orientations)
+        new_result.avg_quats = dict(self.avg_quats)
+        for c, r in result.items():
+            new_result.avg_orientations[c] = r['avg_mat']
+            new_result.avg_quats[c] = r['avg_quat']
+
+        return new_result
+
+    def symmetrize_clusters(self, cluster_ids='all', phase=None,
+                            max_iter=10, tol=1e-6,
+                            ref_lattice_direction=None, reference_cluster_id=None,
+                            return_clustering_result=False):
+        """
+        ... (same docstring as before, plus a note:)
+
+        NOTE: the branch-search loops below (when ref_lattice_direction is
+        given) are restricted to PROPER rotations only (det > 0), using
+        symops_proper -- a filtered copy of the phase's symops, NOT a
+        modification of the original. This is required because the search
+        result gets applied to M_mean/M_best_cluster and then converted via
+        mat_to_quat, which assumes a proper rotation matrix; feeding it an
+        improper (det=-1, reflection) matrix silently produces a garbage
+        quaternion with no error raised -- confirmed empirically: every
+        pixel in one affected cluster showed ~20 deg of round-trip
+        corruption despite the pre-conversion matrix math being correct
+        (~1.8 deg). The get_avg_orientations call below is UNCHANGED and
+        still receives the full (proper+improper) symops set, since it
+        already handles that correctly and other code (e.g. disorimat)
+        depends on self.data.phases[phase]['symops'] containing the full set.
+        """
+        import copy
+
+        if isinstance(cluster_ids, str) and cluster_ids == 'all':
+            if phase is None:
+                raise ValueError("phase is required when cluster_ids='all'")
+            cluster_ids = list(self.labels_by_phase[phase])
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[cluster_ids[0]]]
+        symops = np.array(self.data.phases[phase]['symops'])  # full set, unchanged, for get_avg_orientations
+
+        dets = np.array([np.linalg.det(s) for s in symops])
+        symops_proper = symops[dets > 0]  # local filtered copy, for the search loops only
+
+        v = None
+        if ref_lattice_direction is not None:
+            L = np.asarray(self.data.phases[phase]['L'])
+            uvw = np.asarray(ref_lattice_direction, dtype=float)
+            v = L.dot(uvw)
+            v = v / np.linalg.norm(v)
+
+        v_ref = None
+        ref_entry = None
+        if reference_cluster_id is not None:
+            if v is None:
+                raise ValueError("reference_cluster_id requires ref_lattice_direction to also be given")
+            ref_idxs = np.where(self.labels == reference_cluster_id)[0]
+            if ref_idxs.shape[0] == 0:
+                raise ValueError(f"reference_cluster_id {reference_cluster_id} has no pixels")
+
+            q_mean_ref, M_mean_ref, M_best_cluster_ref, q_best_cluster_ref = get_avg_orientations(
+                self.data.quaternions[ref_idxs], symops, ref_idx=0,
+                max_iter=max_iter, tol=tol
+            )
+            v_ref = M_mean_ref.T.dot(v)
+            ref_entry = {
+                'idxs': ref_idxs,
+                'avg_mat': M_mean_ref,
+                'avg_quat': q_mean_ref,
+                'pixel_mats': M_best_cluster_ref,
+                'pixel_quats': q_best_cluster_ref,
+            }
+
+        sizes = self.cluster_sizes
+        cluster_ids = [c for c in cluster_ids if c != reference_cluster_id]
+        cluster_ids = sorted(cluster_ids, key=lambda c: -sizes.get(c, 0))
+
+        result = {}
+        best_sym_ref = None
+
+        for c in cluster_ids:
+            idxs = np.where(self.labels == c)[0]
+            if idxs.shape[0] == 0:
+                continue
+
+            q_mean, M_mean, M_best_cluster, q_best_cluster = get_avg_orientations(
+                self.data.quaternions[idxs], symops, ref_idx=0,
+                max_iter=max_iter, tol=tol
+            )
+
+            if v is not None and v_ref is not None:
+                best_dot = -np.inf
+                best_sym = None
+
+                if c == cluster_ids[0]:
+                    for sym_ref in symops_proper:
+                        target = M_mean_ref.T.dot(sym_ref.dot(v))
+                        for sym in symops_proper:
+                            v_c = M_mean.T.dot(sym.dot(v))
+                            dot = abs(v_c.dot(target))
+                            if dot > best_dot:
+                                best_dot = dot
+                                best_sym = sym
+                                best_sym_ref = sym_ref
+                else:
+                    target = M_mean_ref.T.dot(best_sym_ref.dot(v))
+                    for sym in symops_proper:
+                        v_c = M_mean.T.dot(sym.dot(v))
+                        dot = abs(v_c.dot(target))
+                        if dot > best_dot:
+                            best_dot = dot
+                            best_sym = sym
+
+                M_mean = best_sym.T.dot(M_mean)
+                q_mean = mat_to_quat(M_mean)
+                M_best_cluster = np.einsum('ij,njk->nik', best_sym.T, M_best_cluster)
+                q_best_cluster = np.array([mat_to_quat(m) for m in M_best_cluster])
+
+            result[c] = {
+                'idxs': idxs,
+                'pixel_quats': q_best_cluster,
+                'pixel_mats': M_best_cluster,
+                'avg_quat': q_mean,
+                'avg_mat': M_mean,
+            }
+
+        if ref_entry is not None and best_sym_ref is not None:
+            M_mean_ref_new = best_sym_ref.T.dot(ref_entry['avg_mat'])
+            q_mean_ref_new = mat_to_quat(M_mean_ref_new)
+            M_best_ref_new = np.einsum('ij,njk->nik', best_sym_ref.T, ref_entry['pixel_mats'])
+            q_best_ref_new = np.array([mat_to_quat(m) for m in M_best_ref_new])
+
+            result[reference_cluster_id] = {
+                'idxs': ref_entry['idxs'],
+                'pixel_quats': q_best_ref_new,
+                'pixel_mats': M_best_ref_new,
+                'avg_quat': q_mean_ref_new,
+                'avg_mat': M_mean_ref_new,
+            }
+        elif ref_entry is not None:
+            result[reference_cluster_id] = {
+                'idxs': ref_entry['idxs'],
+                'pixel_quats': ref_entry['pixel_quats'],
+                'pixel_mats': ref_entry['pixel_mats'],
+                'avg_quat': ref_entry['avg_quat'],
+                'avg_mat': ref_entry['avg_mat'],
+            }
+
+        if not return_clustering_result:
+            return result
+
+        new_data = copy.copy(self.data)
+        new_quaternions = self.data.quaternions.copy()
+        for c, r in result.items():
+            new_quaternions[r['idxs']] = r['pixel_quats']
+        new_data._quaternions = new_quaternions
+
+        new_result = copy.copy(self)
+        new_result.data = new_data
+        new_result.avg_orientations = dict(self.avg_orientations)
+        new_result.avg_quats = dict(self.avg_quats)
+        for c, r in result.items():
+            new_result.avg_orientations[c] = r['avg_mat']
+            new_result.avg_quats[c] = r['avg_quat']
+
+        return new_result    
+
+
+    def get_symmetrize_to_reference_oris(self, reference, cluster_ids, phase=None, max_iter=1, tol=1e-6):
+        """
+        ... (same docstring, plus in the cluster_ids entry:)
+
+        cluster_ids : int, list of int, or 'all'
+            Cluster(s) to resolve relative to `reference`. If 'all', uses
+            every cluster in `phase` (phase is then required).
+        """
+        if isinstance(cluster_ids, str) and cluster_ids == 'all':
+            if phase is None:
+                raise ValueError("phase is required when cluster_ids='all'")
+            cluster_ids = list(self.labels_by_phase[phase])
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[cluster_ids[0]]]
+        symops = np.array(self.data.phases[phase]['symops'])
+
+        if isinstance(reference, (int, np.integer)):
+            if reference not in self.avg_orientations:
+                raise ValueError(f"No average orientation available for reference cluster {reference}")
+            ref_quat = self.avg_quats[reference]
+        else:
+            reference = np.asarray(reference)
+            if reference.shape == (3, 3):
+                ref_quat = mat_to_quat(reference)
+            elif reference.shape == (4,):
+                ref_quat = reference
+            else:
+                raise ValueError(f"reference must be a cluster id, (3,3) matrix, or (4,) quaternion, "
+                                f"got shape {reference.shape}")
+
+        result = {}
+        for c in cluster_ids:
+            idxs = np.where(self.labels == c)[0]
+            if idxs.shape[0] == 0:
+                continue
+
+            q_mean, M_mean, M_best_cluster, q_best_cluster = get_avg_orientations(
+                self.data.quaternions[idxs], symops, ref_idx=0,
+                max_iter=max_iter, tol=tol, q_ref=ref_quat
+            )
+
+            result[c] = {
+                'idxs': idxs,
+                'pixel_quats': q_best_cluster,
+                'pixel_mats': M_best_cluster,
+                'avg_quat': q_mean,
+                'avg_mat': M_mean,
+            }
+
+        return result
+
+    def get_cluster_pixel_orientations(self, cluster_id):
+        """
+        Get individual pixel orientations for a specific cluster, alongside
+        the cluster's average orientation.
+
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster label
+
+        Returns
+        -------
+        result : dict
+            'cluster_id' : int
+            'idxs' : (n_pixels,) ndarray
+                Indices into self.data arrays for pixels in this cluster.
+            'X', 'Y' : (n_pixels,) ndarray
+                Pixel coordinates.
+            'pixel_quats' : (n_pixels, 4) ndarray
+                Individual per-pixel orientation quaternions.
+            'pixel_mats' : (n_pixels, 3, 3) ndarray
+                Individual per-pixel orientation matrices.
+            'avg_quat' : (4,) ndarray or None
+                Cluster average orientation, quaternion form.
+            'avg_mat' : (3, 3) ndarray or None
+                Cluster average orientation, matrix form.
+            'phase_id' : int
+            'phase_name' : str
+        """
+        if cluster_id not in self.get_unique_clusters():
+            raise ValueError(f"Cluster {cluster_id} not found")
+
+        idxs = np.where(self.labels == cluster_id)[0]
+        pixel_quats = self.data.quaternions[idxs]
+        pixel_mats = np.array([quat_to_mat(q) for q in pixel_quats])
+
+        phase_id = self.cluster_phases_id[cluster_id]
+
+        return {
+            'cluster_id': cluster_id,
+            'idxs': idxs,
+            'X': self.data.X[idxs],
+            'Y': self.data.Y[idxs],
+            'pixel_quats': pixel_quats,
+            'pixel_mats': pixel_mats,
+            'avg_quat': self.avg_quats.get(cluster_id),
+            'avg_mat': self.avg_orientations.get(cluster_id),
+            'phase_id': phase_id,
+            'phase_name': self.data.phase_names[phase_id],
+        }
+
+    def get_zone_axis_transform(self, cluster_id, uvw=(0, 0, 1), second_uvw=None, phase=None):
+        """
+        Build a sample_transform matrix for plot_cluster_pole_figure that
+        aligns the pole-figure viewing axis (always +z) EXACTLY with a
+        given zone axis [uvw] of a reference cluster's crystal, and
+        OPTIONALLY also fixes the remaining azimuthal "twist" around that
+        axis by aligning a second zone axis [second_uvw] as closely as
+        possible to sample +x.
+
+        Composing this as sample_transform = R_twist @ R_align @ M1
+        (M1 = reference cluster's avg_orientations, sample->crystal) means:
+        - The reference cluster's own [uvw] direction lands EXACTLY on the
+        pole figure's viewing axis (z).
+        - If second_uvw is given, the reference cluster's own [second_uvw]
+        direction lands with its in-plane (xy) component pointing along
+        +x -- i.e. this fully and exactly constrains the reference's
+        orientation in the plotted frame (up to the residual ambiguity of
+        [second_uvw] having a component along z itself, which is
+        unavoidable and only matters if the two directions are close to
+        parallel).
+        - Without second_uvw, aligning [uvw] to z alone leaves that
+        azimuthal twist UNCONSTRAINED -- the minimal-rotation formula used
+        picks an arbitrary one, which is why a second target you also
+        care about (e.g. from ref_lattice_directions in
+        symmetrize_to_reference) can end up nowhere near where you'd
+        expect even though the primary [uvw] axis is correctly centered.
+
+        Unlike symmetrize_to_reference's ref_lattice_directions (which
+        picks the closest DISCRETE crystal-symmetry-equivalent branch, so
+        alignment is only approximate, limited by how close a symmetric
+        variant happens to be to the target), this applies a CONTINUOUS
+        rotation, so both directions land exactly at their targets (as
+        exactly as floating point allows) regardless of how close any
+        symmetric branch happens to be.
+
+        Parameters
+        ----------
+        cluster_id : int
+            Reference cluster whose crystal frame defines the zone axis(es).
+        uvw : array-like (3,), optional
+            Zone axis in Miller-index (real-space lattice) notation, in the
+            reference cluster's crystal frame, aligned EXACTLY to sample z.
+            Default (0,0,1).
+        second_uvw : array-like (3,), optional
+            A second zone axis, also in Miller-index notation. If given,
+            an additional rotation about the now-fixed z axis is applied so
+            that this direction's in-plane (xy) component points along
+            sample +x. Default None (no twist-fixing; z-alignment only,
+            original behavior).
+        phase : str, optional
+            Phase of the reference cluster, to look up L. If None, inferred
+            from cluster_id via self.cluster_phases_id.
+
+        Returns
+        -------
+        sample_transform : (3,3) ndarray
+            Pass directly as sample_transform to plot_cluster_pole_figure.
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_id not in self.avg_orientations:
+            raise ValueError(f"No average orientation available for cluster {cluster_id}")
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[cluster_id]]
+
+        L = np.asarray(self.data.phases[phase]['L'])
+        uvw = np.asarray(uvw, dtype=float)
+
+        zone_axis = L.dot(uvw)
+        norm = np.linalg.norm(zone_axis)
+        if norm < 1e-12:
+            raise ValueError(f"Zone axis {uvw} maps to a near-zero vector under L for phase {phase}")
+        zone_axis = zone_axis / norm
+
+        z = np.array([0.0, 0.0, 1.0])
+        axis = np.cross(zone_axis, z)
+        axis_norm = np.linalg.norm(axis)
+        dot = np.clip(zone_axis @ z, -1.0, 1.0)
+
+        if axis_norm < 1e-8:
+            if dot > 0:
+                R_align = np.eye(3)
+            else:
+                R_align = _R.from_rotvec(np.pi * np.array([1.0, 0.0, 0.0])).as_matrix()
+        else:
+            angle = np.arccos(dot)
+            R_align = _R.from_rotvec(axis / axis_norm * angle).as_matrix()
+
+        M1 = self.avg_orientations[cluster_id]
+        transform = R_align @ M1
+
+        if second_uvw is not None:
+            second_uvw = np.asarray(second_uvw, dtype=float)
+            second_axis = L.dot(second_uvw)
+            second_norm = np.linalg.norm(second_axis)
+            if second_norm < 1e-12:
+                raise ValueError(f"second_uvw {second_uvw} maps to a near-zero vector under L for phase {phase}")
+            second_axis = second_axis / second_norm
+
+            # where second_axis's pole currently lands, after z-alignment
+            # but before twist-fixing: crystal -> sample (M1.T) -> current
+            # display frame (transform)
+            w = transform.dot(M1.T.dot(second_axis))
+
+            w_proj = w - z * w[2]
+            w_proj_norm = np.linalg.norm(w_proj)
+            if w_proj_norm < 1e-8:
+                print(f"Warning: second_uvw {second_uvw} is (nearly) parallel to uvw {uvw} "
+                        f"after z-alignment -- cannot fix azimuthal twist from a direction with "
+                        f"no in-plane component. Returning z-alignment only.")
+            else:
+                current_angle = np.arctan2(w_proj[1], w_proj[0])
+                R_twist = _R.from_rotvec(-current_angle * z).as_matrix()
+                transform = R_twist @ transform
+        return transform
+
+    def check_twin_relationship(self, cluster_a, cluster_b, system, mode,
+                                tol_deg=5.0, symmetric=True):
+        """
+        Check whether the orientation relationship between two clusters'
+        average orientations corresponds to a known twinning mode, via the
+        rotation axis/angle of the relative misorientation compared against
+        the mode's tabulated crystallographic vectors.
+
+        Convention: M = G2 @ G1.T (G1, G2 = self.avg_orientations for
+        cluster_a, cluster_b) transforms a vector expressed in cluster_a's
+        crystal frame into cluster_b's crystal frame, for the same physical
+        (sample-frame) vector. Its rotation axis/angle (axis taken in
+        [0,180] via a sign-consistent quaternion, so axis is unique up to
+        the natural line ambiguity of a rotation axis) is compared against
+        THREE independent conditions, ANY ONE of which is sufficient to
+        report a match:
+
+        1. axis ~ K2_a and angle ~ shear_angle (both within tol_deg)
+        -- rotation about the twinning shear-plane normal K2, by the
+        characteristic shear angle.
+        2. axis ~ K1_a and angle ~ 180 deg (within tol_deg)
+        -- type I twin: 180 deg rotation about the twin plane normal.
+        3. axis ~ eta1_a and angle ~ 180 deg (within tol_deg)
+        -- type II twin: 180 deg rotation about the shear direction.
+
+        K1_a, K2_a, eta1_a are each lists of 12 crystallographically
+        equivalent vectors (matching the 12 equivalent C_a variants of the
+        original correspondence-matrix formulation this replaces) -- for
+        each condition, the extracted rotation axis is compared against ALL
+        12 variants and the closest one is used (axis_dev = minimum over
+        variants), with the matching variant index recorded.
+
+        Axis comparison is SIGN-INDEPENDENT (|axis . target| used), treating
+        both the extracted rotation axis and the stored crystallographic
+        vectors as undirected lines -- appropriate for the two 180 deg
+        conditions (where R(n,180)=R(-n,180) exactly) and assumed also
+        appropriate for K2_a/shear_angle unless K2_a's sign is meaningful in
+        your convention, in which case this would need adjusting.
+
+        NOTE: no additional phase-symmetry search is applied to G1/G2 (or to
+        M) before extracting axis/angle -- this compares the SPECIFIC
+        symmetric representative that G1, G2 happen to be stored as. If
+        average orientations weren't resolved to a common symmetric branch
+        beforehand (e.g. via symmetrize_to_reference), a true match could be
+        missed because a symmetrically-equivalent rotation would satisfy a
+        condition but the untransformed one doesn't.
+
+        Parameters
+        ----------
+        cluster_a, cluster_b : int
+            Cluster IDs. cluster_a is treated as the "matrix" (parent),
+            cluster_b as the "twin". Both should be the same phase --
+            twin relationships are only meaningful within one phase.
+        system : str
+            Alloy/system key, e.g. 'NiTi'.
+        mode : str
+            Twin mode key, e.g. '114'. Looks up
+            self.data.twinSys[system][mode]['K1_a'], ['K2_a'], ['eta1_a']
+            (each a list of 12 equivalent (3,) vectors), and
+            ['shear_angle'] (scalar, degrees). Call getTwinSys() first if
+            self.data.twinSys hasn't been populated yet.
+        tol_deg : float, optional
+            Deviation angle below which BOTH axis and angle must fall for a
+            condition to count as a match. Default 5.0 degrees.
+        symmetric : bool, optional
+            If True (default), also test the reverse direction (G1 as twin,
+            G2 as matrix). Direction/condition selection logic:
+            - If a match exists in only one direction, that direction is
+            used, regardless of raw deviation scores.
+            - If both directions match, the direction with the smaller
+            combined (axis_dev + angle_dev) for its best condition is
+            used.
+            - If neither direction matches, the direction with the smaller
+            combined deviation is used purely for diagnostic reporting
+            (angle_dev/axis_dev of the closest attempt); is_match stays
+            False either way.
+            This ensures a genuine match is never discarded in favor of a
+            numerically closer non-match in the other direction.
+
+        Returns
+        -------
+        result : dict
+            'cluster_a', 'cluster_b' : IDs, reordered so cluster_a is
+                whichever role gave the selected direction's "matrix" side
+            'system', 'mode' : as given
+            'is_match' : bool
+                True if ANY of the three conditions matched (within
+                tol_deg) in the selected direction.
+            'best_condition' : str
+                Name of the best-matching condition for the selected
+                direction ('K2_shear', 'K1_180', or 'eta1_180'), by
+                smallest combined (axis_dev + angle_dev).
+            'axis_dev_deg', 'angle_dev_deg' : float
+                Deviations for best_condition.
+            'checks' : dict {condition_name: dict}
+                All three conditions' results for the selected direction,
+                each with 'axis_dev_deg', 'angle_dev_deg', 'is_match',
+                'variant_idx' (which of the 12 equivalent target vectors
+                gave the smallest axis deviation).
+            'axis' : (3,) ndarray
+                Extracted rotation axis (unit vector) for the selected
+                direction.
+            'angle_deg' : float
+                Extracted rotation angle for the selected direction.
+            'swapped' : bool
+                True if the reverse direction (G1 as twin, G2 as matrix)
+                was selected.
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
+            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
+
+        phase_a = self.data.phase_names[self.cluster_phases_id[cluster_a]]
+        phase_b = self.data.phase_names[self.cluster_phases_id[cluster_b]]
+        if phase_a != phase_b:
+            print(f"Warning: cluster {cluster_a} (phase {phase_a}) and cluster {cluster_b} "
+                f"(phase {phase_b}) are different phases; twin relationships are only "
+                f"meaningful within a single phase.")
+
+        G1 = self.avg_orientations[cluster_a]
+        G2 = self.avg_orientations[cluster_b]
+
+        twin_data = self.data.twinSys[system][mode]
+        K1_a = np.asarray(twin_data['K1_a'], dtype=float)      # (12, 3)
+        K2_a = np.asarray(twin_data['K2_a'], dtype=float)      # (12, 3)
+        eta1_a = np.asarray(twin_data['eta1_a'], dtype=float)  # (12, 3)
+        shear_angle = float(twin_data['shear_angle'])
+
+        def _axis_angle(M):
+            q = _R.from_matrix(M).as_quat()  # [x, y, z, w]
+            if q[3] < 0:
+                q = -q
+            w = np.clip(q[3], -1.0, 1.0)
+            angle = 2.0 * np.degrees(np.arccos(w))
+            s = np.sqrt(max(1.0 - w * w, 0.0))
+            if s < 1e-8:
+                axis = np.array([0.0, 0.0, 1.0])  # angle ~0, axis undefined; arbitrary
+            else:
+                axis = q[:3] / s
+            return axis, angle
+
+        def _condition_dev(axis, angle, target_axes, target_angle):
+            T = np.asarray(target_axes, dtype=float)
+            T = T / np.linalg.norm(T, axis=1, keepdims=True)
+            cosang = np.clip(np.abs(T @ axis), -1.0, 1.0)  # (12,)
+            axis_devs = np.degrees(np.arccos(cosang))
+            variant_idx = int(np.argmin(axis_devs))
+            axis_dev = float(axis_devs[variant_idx])
+            angle_dev = abs(angle - target_angle)
+            return axis_dev, angle_dev, variant_idx
+
+        def _evaluate(M):
+            axis, angle = _axis_angle(M)
+            checks = {}
+            for name, (t_axes, t_angle) in {
+                'K2_shear': (K2_a, shear_angle),
+                'K1_180': (K1_a, 180.0),
+                'eta1_180': (eta1_a, 180.0),
+            }.items():
+                axis_dev, angle_dev, variant_idx = _condition_dev(axis, angle, t_axes, t_angle)
+                checks[name] = {
+                    'axis_dev_deg': axis_dev,
+                    'angle_dev_deg': angle_dev,
+                    'is_match': (axis_dev < tol_deg) and (angle_dev < tol_deg),
+                    'variant_idx': variant_idx,
+                }
+            best_name = min(checks, key=lambda k: checks[k]['axis_dev_deg'] + checks[k]['angle_dev_deg'])
+            return axis, angle, checks, best_name
+
+        M_fwd = G2 @ G1.T
+        axis_fwd, angle_fwd, checks_fwd, best_fwd = _evaluate(M_fwd)
+        score_fwd = checks_fwd[best_fwd]['axis_dev_deg'] + checks_fwd[best_fwd]['angle_dev_deg']
+        match_fwd = any(v['is_match'] for v in checks_fwd.values())
+
+        axis, angle, checks, best_condition, score = axis_fwd, angle_fwd, checks_fwd, best_fwd, score_fwd
+        swapped = False
+        is_match = match_fwd
+
+        if symmetric:
+            M_rev = G1 @ G2.T
+            axis_rev, angle_rev, checks_rev, best_rev = _evaluate(M_rev)
+            score_rev = checks_rev[best_rev]['axis_dev_deg'] + checks_rev[best_rev]['angle_dev_deg']
+            match_rev = any(v['is_match'] for v in checks_rev.values())
+
+            if match_fwd and match_rev:
+                # both match: prefer the tighter fit
+                if score_rev < score_fwd:
+                    axis, angle, checks, best_condition, score = axis_rev, angle_rev, checks_rev, best_rev, score_rev
+                    swapped = True
+                is_match = True
+            elif match_rev and not match_fwd:
+                # only rev matches: take it regardless of raw score
+                axis, angle, checks, best_condition, score = axis_rev, angle_rev, checks_rev, best_rev, score_rev
+                swapped = True
+                is_match = True
+            elif not match_rev and not match_fwd:
+                # neither matches: fall back to whichever is numerically closer,
+                # purely for diagnostic reporting; is_match stays False
+                if score_rev < score_fwd:
+                    axis, angle, checks, best_condition, score = axis_rev, angle_rev, checks_rev, best_rev, score_rev
+                    swapped = True
+            # else: match_fwd and not match_rev -> keep fwd as-is (already set above)
+
+        return {
+            'cluster_a': cluster_b if swapped else cluster_a,
+            'cluster_b': cluster_a if swapped else cluster_b,
+            'system': system,
+            'mode': mode,
+            'is_match': is_match,
+            'best_condition': best_condition,
+            'axis_dev_deg': checks[best_condition]['axis_dev_deg'],
+            'angle_dev_deg': checks[best_condition]['angle_dev_deg'],
+            'checks': checks,
+            'axis': axis,
+            'angle_deg': angle,
+            'swapped': swapped,
+        }   
+    
+    def check_twin_relationship_ini(self, cluster_a, cluster_b, system, mode,
+                                tol_deg=5.0, symmetric=True):
+        """
+        Check whether the orientation relationship between two clusters'
+        average orientations corresponds to a known twinning mode.
+
+        Convention: M = G2 @ G1.T (G1, G2 = self.avg_orientations for
+        cluster_a, cluster_b) transforms a vector expressed in cluster_a's
+        crystal frame into cluster_b's crystal frame, for the same physical
+        (sample-frame) vector -- the same convention as the stored twin
+        matrices C_a = -I + 2*outer(a1_a, a1_a), which transform real
+        vectors from the "matrix" (parent) crystal frame to the "twin"
+        crystal frame.
+
+        M is compared against all 12 crystallographically equivalent C_a
+        variants stored in self.data.twinSys[system][mode]['C_a'] (call
+        getTwinSys() first if this hasn't been populated yet). Assumes the
+        12 stored variants already span the relevant symmetry equivalents
+        -- no additional phase-symmetry search is applied to G1/G2
+        themselves here.
+
+        Parameters
+        ----------
+        cluster_a, cluster_b : int
+            Cluster IDs. cluster_a is treated as the "matrix" (parent),
+            cluster_b as the "twin". Both should be the same phase --
+            twin relationships are only meaningful within one phase.
+        system : str
+            Alloy/system key, e.g. 'NiTi'.
+        mode : str
+            Twin mode key, e.g. '114'.
+        tol_deg : float, optional
+            Deviation angle below which the relationship is reported as a
+            match. Default 5.0 degrees.
+        symmetric : bool, optional
+            If True (default), also test the reverse direction (G1 as twin,
+            G2 as matrix) and report whichever direction gives the smaller
+            deviation -- useful since which cluster is "matrix" vs "twin"
+            is often not known a priori.
+
+        Returns
+        -------
+        result : dict
+            'cluster_a', 'cluster_b' : IDs, reordered so cluster_a is
+                whichever role gave the best match's "matrix" side
+            'system', 'mode' : as given
+            'angle_deg' : float
+                Minimum deviation angle (degrees) to the best-matching
+                C_a variant.
+            'best_variant_idx' : int
+                Index (0-11) of the best-matching C_a variant.
+            'is_match' : bool
+                True if angle_deg < tol_deg.
+            'swapped' : bool
+                True if the reverse direction gave the better match.
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
+            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
+
+        phase_a = self.data.phase_names[self.cluster_phases_id[cluster_a]]
+        phase_b = self.data.phase_names[self.cluster_phases_id[cluster_b]]
+        if phase_a != phase_b:
+            print(f"Warning: cluster {cluster_a} (phase {phase_a}) and cluster {cluster_b} "
+                f"(phase {phase_b}) are different phases; twin relationships are only "
+                f"meaningful within a single phase.")
+
+        G1 = self.avg_orientations[cluster_a]
+        G2 = self.avg_orientations[cluster_b]
+
+        C_a_list = np.asarray(self.data.twinSys[system][mode]['C_a'])  # (12, 3, 3)
+
+        def _min_angle(M, C_list):
+            rel = np.einsum('ij,njk->nik', M, C_list.transpose(0, 2, 1))  # M @ C.T per variant
+            q = _R.from_matrix(rel).as_quat()
+            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+            ang = np.degrees(2 * np.arccos(w))
+            idx = int(np.argmin(ang))
+            return float(ang[idx]), idx
+
+        M_fwd = G2 @ G1.T
+        angle_fwd, idx_fwd = _min_angle(M_fwd, C_a_list)
+
+        swapped = False
+        angle, idx = angle_fwd, idx_fwd
+
+        if symmetric:
+            M_rev = G1 @ G2.T
+            angle_rev, idx_rev = _min_angle(M_rev, C_a_list)
+            if angle_rev < angle_fwd:
+                angle, idx = angle_rev, idx_rev
+                swapped = True
+
+        return {
+            'cluster_a': cluster_b if swapped else cluster_a,
+            'cluster_b': cluster_a if swapped else cluster_b,
+            'system': system,
+            'mode': mode,
+            'angle_deg': angle,
+            'best_variant_idx': idx,
+            'is_match': angle < tol_deg,
+            'swapped': swapped,
+        }
+
+    def map_twin_relationships(self, phase, system, modes, tol_deg=5.0, min_size=None,
+                                cluster_ids=None):
+        """
+        Check the orientation relationship between EVERY pair of clusters
+        (within one phase) against one or more twinning modes, in one
+        vectorized pass per mode rather than looping check_twin_relationship
+        pair-by-pair.
+
+        Same convention as check_twin_relationship: for clusters a, b with
+        average orientations G1, G2, M = G2 @ G1.T is compared against the
+        12 crystallographically equivalent C_a variants stored in
+        self.data.twinSys[system][mode]['C_a']. Both directions (a-as-matrix
+        vs b-as-matrix) are tested; the reverse direction's M is simply
+        M.T, so it costs nothing extra to include.
+
+        Parameters
+        ----------
+        phase : str
+            Phase to restrict clusters to. Twin relationships are only
+            meaningful within a single phase.
+        system : str
+            Alloy/system key into self.data.twinSys, e.g. 'NiTi'.
+        modes : str or list of str
+            Twin mode key(s) to check, e.g. '114' or ['114', 'TypeII'].
+            Call getTwinSys() beforehand if self.data.twinSys isn't
+            populated yet.
+        tol_deg : float, optional
+            Deviation angle below which a pair is reported as a match.
+            Default 5.0 degrees.
+        min_size : int, optional
+            Clusters smaller than this (pixels) are excluded entirely.
+        cluster_ids : list of int, optional
+            Explicit cluster subset to check, overriding phase-based
+            selection. Must still all belong to `phase`.
+
+        Returns
+        -------
+        pairs_results : list of dict
+            One entry per cluster pair (i < j in cluster_ids order), each:
+            'cluster_a', 'cluster_b' : IDs, reordered so cluster_a is
+                whichever role gave the best match's "matrix" side
+            'best_mode' : str
+                Mode with the smallest deviation angle across all `modes`
+                tested for this pair.
+            'angle_deg' : float
+                That minimum deviation angle.
+            'best_variant_idx' : int
+                Index (0-11) of the best-matching C_a variant, for best_mode.
+            'is_match' : bool
+                True if angle_deg < tol_deg.
+            'swapped' : bool
+                True if the reverse direction gave the better match.
+            'angles_by_mode' : dict {mode: angle_deg}
+                Per-mode minimum angle, for inspecting near-misses against
+                other modes too.
+        matches : list of dict
+            Subset of pairs_results where is_match is True, sorted by
+            angle_deg ascending (convenience view).
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if isinstance(modes, str):
+            modes = [modes]
+
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase])
+        cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+        if min_size is not None:
+            sizes = self.cluster_sizes
+            cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+
+        n = len(cluster_ids)
+        if n < 2:
+            return [], []
+
+        G = np.array([self.avg_orientations[c] for c in cluster_ids])  # (n,3,3)
+        pair_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        P = len(pair_idx)
+        ii = np.array([i for i, _ in pair_idx])
+        jj = np.array([j for _, j in pair_idx])
+
+        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])  # (P,3,3) = G[j] @ G[i].T
+        M_rev = M_fwd.transpose(0, 2, 1)                  # = G[i] @ G[j].T
+
+        def _min_angle_batch(M_batch, C_list):
+            # M_batch: (P,3,3), C_list: (12,3,3) -> angle (P,), idx (P,)
+            C_T = C_list.transpose(0, 2, 1)
+            rel = np.einsum('pij,njk->pnik', M_batch, C_T)      # (P,12,3,3)
+            q = _R.from_matrix(rel.reshape(-1, 3, 3)).as_quat().reshape(P, len(C_list), 4)
+            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+            ang = np.degrees(2 * np.arccos(w))                   # (P,12)
+            idx = np.argmin(ang, axis=1)
+            return ang[np.arange(P), idx], idx
+
+        # per-mode best angle/variant/direction for every pair
+        angles_by_mode = {}    # mode -> (P,) angle
+        per_mode_best = {}     # mode -> (angle(P,), idx(P,), swapped(P,) bool)
+
+        for mode in modes:
+            C_a_list = np.asarray(self.data.twinSys[system][mode]['C_a'])  # (12,3,3)
+            angle_fwd, idx_fwd = _min_angle_batch(M_fwd, C_a_list)
+            angle_rev, idx_rev = _min_angle_batch(M_rev, C_a_list)
+
+            swapped = angle_rev < angle_fwd
+            angle = np.where(swapped, angle_rev, angle_fwd)
+            idx = np.where(swapped, idx_rev, idx_fwd)
+
+            angles_by_mode[mode] = angle
+            per_mode_best[mode] = (angle, idx, swapped)
+
+        # across modes, pick the best (smallest angle) per pair
+        stacked_angles = np.stack([angles_by_mode[m] for m in modes], axis=1)  # (P, n_modes)
+        best_mode_idx = np.argmin(stacked_angles, axis=1)
+
+        pairs_results = []
+        for p in range(P):
+            m = modes[best_mode_idx[p]]
+            angle, idx, swapped = per_mode_best[m]
+            cluster_a = cluster_ids[jj[p]] if swapped[p] else cluster_ids[ii[p]]
+            cluster_b = cluster_ids[ii[p]] if swapped[p] else cluster_ids[jj[p]]
+
+            pairs_results.append({
+                'cluster_a': int(cluster_a),
+                'cluster_b': int(cluster_b),
+                'best_mode': m,
+                'angle_deg': float(angle[p]),
+                'best_variant_idx': int(idx[p]),
+                'is_match': bool(angle[p] < tol_deg),
+                'swapped': bool(swapped[p]),
+                'angles_by_mode': {mode: float(angles_by_mode[mode][p]) for mode in modes},
+            })
+
+        matches = sorted([r for r in pairs_results if r['is_match']], key=lambda r: r['angle_deg'])
+
+        return pairs_results, matches
+    def merge_clusters_by_orientation(self, threshold_deg=2.0, phase=None, min_size=None,
+                                        return_disor_matrices=False):
+        """
+        Merge clusters within the same phase whose average orientations are
+        close, with NO spatial/adjacency constraint. Uses your orilib.disorimat
+        for the disorientation calculation (full symmetry group, including
+        improper operations, handled internally by disorimat — pass the
+        complete symops set as stored in self.data.phases[phase]['symops'],
+        NOT pre-filtered to proper rotations only).
+
+        Uses greedy COMPLETE-linkage grouping: a cluster only joins a group if
+        its disorientation to EVERY existing member is below threshold_deg,
+        so all pairs within a merged group are guaranteed below threshold
+        (unlike single-linkage/union-find chaining).
+
+        Actually relabels self.labels, so downstream analysis transparently
+        sees merged super-clusters.
+
+        Parameters
+        ----------
+        threshold_deg : float
+            Disorientation threshold (degrees). Default 2.0.
+        phase : str or list of str, optional
+            Phase(s) to merge within. Default: all phases in
+            self.labels_by_phase. Never merges across phases.
+        min_size : int, optional
+            Clusters smaller than this (pixels) are excluded from merge
+            consideration and kept as-is.
+        return_disor_matrices : bool, optional
+            If True, also return the NxN disorientation matrices used for
+            grouping (one per phase processed).
+
+        Returns
+        -------
+        new_result : ClusteringResult
+        merge_groups : dict {phase: {root_id: [fragment cluster ids]}}
+        disor_matrices : dict {phase: (cluster_ids, matrix)}, only if
+            return_disor_matrices=True.
+        """
+        import copy
+
+        if phase is None:
+            phases_to_process = list(self.labels_by_phase.keys())
+        elif isinstance(phase, str):
+            phases_to_process = [phase]
+        else:
+            phases_to_process = list(phase)
+
+        if not hasattr(self, 'avg_orientations') or self.avg_orientations is None:
+            self.getAvgOri()
+
+        sizes = self.cluster_sizes
+        new_labels = self.labels.copy()
+        merge_groups_all = {}
+        disor_matrices = {}
+
+        for ph in phases_to_process:
+            cluster_ids = [c for c in self.labels_by_phase[ph] if c in self.avg_orientations]
+            if min_size is not None:
+                cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+
+            if len(cluster_ids) < 2:
+                merge_groups_all[ph] = {int(c): [int(c)] for c in cluster_ids}
+                if return_disor_matrices:
+                    disor_matrices[ph] = (cluster_ids, np.zeros((len(cluster_ids),) * 2))
+                continue
+
+            # disorimat extends symops with improper operations internally,
+            # so pass the full stored symmetry set as-is (not filtered to
+            # proper rotations), and as a plain list (it does .append()
+            # internally).
+            symops = list(np.array(self.data.phases[ph]['symops']))
+
+            M = np.array([self.avg_orientations[c] for c in cluster_ids])
+            n = M.shape[0]
+
+            # --- build NxN disorientation matrix using disorimat directly ---
+            disor_matrix = np.asarray(disorimat(M, symops), dtype=float)
+            np.fill_diagonal(disor_matrix, 0.0)  # numerical safety; diagonal should already be ~0
+
+            if return_disor_matrices:
+                disor_matrices[ph] = (cluster_ids, disor_matrix)
+
+            # --- greedy complete-linkage grouping using the matrix ---
+            order = sorted(range(n), key=lambda i: -sizes.get(cluster_ids[i], 0))
+            groups = []
+
+            for i in order:
+                placed = False
+                for g in groups:
+                    if np.all(disor_matrix[i, g] < threshold_deg):
+                        g.append(i)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([i])
+
+            phase_groups = {}
+            for g in groups:
+                frag_ids = [cluster_ids[i] for i in g]
+                root = min(frag_ids)
+                phase_groups[root] = frag_ids
+            merge_groups_all[ph] = {int(r): [int(f) for f in fr] for r, fr in phase_groups.items()}
+
+            for root, fragments in phase_groups.items():
+                for frag in fragments:
+                    if frag != root:
+                        new_labels[self.labels == frag] = root
+
+        new_result = copy.copy(self)
+        new_result.labels = new_labels
+
+        new_result._clusters_unique = None
+        new_result._cluster_sizes = None
+        new_result._cluster_sizes_by_phase = None
+        new_result._cluster_phases_id = None
+        new_result._com = None
+        new_result._cluster_areas = None
+        new_result._cluster_perimeters = None
+        new_result._cluster_equivalent_diameters = None
+        new_result._cluster_sphericities = None
+
+        _ = new_result.cluster_phases_id
+        new_result.get_phase_labels()
+        new_result.getAvgOri()
+        _ = new_result.com
+
+        if return_disor_matrices:
+            return new_result, merge_groups_all, disor_matrices
+        return new_result, merge_groups_all
+
+
+    def merge_clusters_by_orientation_single_linkage(self, threshold_deg=2.0, phase=None, min_size=None):
+        """
+        Merge clusters within the same phase whose average orientations are
+        close, with NO spatial/adjacency constraint — unlike flood-fill
+        clustering, merged clusters need not touch or even be neighbours.
+
+        SINGLE-LINKAGE (union-find): a cluster merges into a group if it is
+        within threshold_deg of AT LEAST ONE existing member. This means
+        disorientation is only guaranteed to be below threshold_deg along a
+        *chain* of links — two clusters at opposite ends of a merged group
+        can end up with a disorientation well above threshold_deg if they
+        were connected only through intermediate clusters. See
+        merge_clusters_by_orientation() for the complete-linkage variant that
+        avoids this chaining behavior.
+
+        Same union-find/disorientation logic as reconstruct_physical_grains_ini(),
+        but actually relabels self.labels, so downstream analysis
+        (get_cluster_areas, get_cluster_sphericities, avg_quats, printCorresp,
+        etc.) transparently sees merged super-clusters rather than the
+        original spatial fragments.
+
+        Parameters
+        ----------
+        threshold_deg : float
+            Disorientation threshold (degrees, proper-rotation symmetry of
+            each phase) below which two clusters are merged. Default 2.0.
+        phase : str or list of str, optional
+            Phase(s) to merge within. Default: all phases in
+            self.labels_by_phase. Clusters are only ever merged within the
+            same phase — never across phases.
+        min_size : int, optional
+            If given, clusters smaller than this (pixels) are excluded from
+            merge consideration and kept as-is. Prevents tiny noise clusters
+            dragging larger ones together near the threshold.
+
+        Returns
+        -------
+        new_result : ClusteringResult
+            New result with merged labels. self is left untouched.
+        merge_groups : dict {phase: {root_id: [fragment cluster ids]}}
+            Merge groups actually applied, per phase.
+        """
+        import copy
+        from scipy.spatial.transform import Rotation as _R
+        from collections import defaultdict
+
+        if phase is None:
+            phases_to_process = list(self.labels_by_phase.keys())
+        elif isinstance(phase, str):
+            phases_to_process = [phase]
+        else:
+            phases_to_process = list(phase)
+
+        if not hasattr(self, 'avg_orientations') or self.avg_orientations is None:
+            self.getAvgOri()
+
+        sizes = self.cluster_sizes
+        new_labels = self.labels.copy()
+        merge_groups_all = {}
+
+        for ph in phases_to_process:
+            cluster_ids = [c for c in self.labels_by_phase[ph] if c in self.avg_orientations]
+            if min_size is not None:
+                cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+
+            if len(cluster_ids) < 2:
+                merge_groups_all[ph] = {int(c): [int(c)] for c in cluster_ids}
+                continue
+
+            symops_all = np.array(self.data.phases[ph]['symops'])
+            symops = symops_all[np.array([round(np.linalg.det(s)) == 1
+                                        for s in symops_all])]
+
+            M = np.stack([self.avg_orientations[c] for c in cluster_ids])
+            pairs = [(i, j) for i in range(len(cluster_ids))
+                            for j in range(i + 1, len(cluster_ids))]
+
+            parent_map = {c: c for c in cluster_ids}
+
+            def _find(x):
+                while parent_map[x] != x:
+                    parent_map[x] = parent_map[parent_map[x]]
+                    x = parent_map[x]
+                return x
+
+            if pairs:
+                A = np.stack([M[i] for i, _ in pairs])
+                B = np.stack([M[j] for _, j in pairs])
+                R_ab = np.einsum("pij,pkj->pik", B, A)
+                R_eq = np.einsum("sij,pjk->spik", symops, R_ab).reshape(-1, 3, 3)
+                q = _R.from_matrix(R_eq).as_quat().reshape(len(symops), len(pairs), 4)
+                w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+                ang = np.degrees(2 * np.arccos(w))
+                min_ang = ang.min(axis=0)
+
+                for (i, j), d in zip(pairs, min_ang):
+                    if d < threshold_deg:
+                        a, b = cluster_ids[i], cluster_ids[j]
+                        ra, rb = _find(a), _find(b)
+                        if ra != rb:
+                            parent_map[rb] = ra
+
+            groups = defaultdict(list)
+            for c in cluster_ids:
+                groups[_find(c)].append(c)
+
+            groups = {max(fr, key=lambda cid: sizes.get(cid, 0)): fr for fr in groups.values()}
+            merge_groups_all[ph] = {int(r): [int(f) for f in fr] for r, fr in groups.items()}
+
+            for root, fragments in groups.items():
+                for frag in fragments:
+                    if frag != root:
+                        new_labels[self.labels == frag] = root
+
+        new_result = copy.copy(self)
+        new_result.labels = new_labels
+
+        # Invalidate caches so everything recomputes on the merged labels
+        new_result._clusters_unique = None
+        new_result._cluster_sizes = None
+        new_result._cluster_sizes_by_phase = None
+        new_result._cluster_phases_id = None
+        new_result._com = None
+        new_result._cluster_areas = None
+        new_result._cluster_perimeters = None
+        new_result._cluster_equivalent_diameters = None
+        new_result._cluster_sphericities = None
+
+        _ = new_result.cluster_phases_id   # force lazy recompute before get_phase_labels
+        new_result.get_phase_labels()
+        new_result.getAvgOri()             # recompute avg orientation/quat per merged cluster
+        _ = new_result.com
+
+        return new_result, merge_groups_all
+    def print_clusters_by_size(self, phase=None, ascending=False):
+        """
+        Print clusters sorted by pixel count, with their phase.
+
+        Parameters
+        ----------
+        phase : str or list of str, optional
+            Restrict to cluster(s) in this phase (or phases). Default: all
+            phases.
+        ascending : bool, optional
+            Sort smallest-first. Default False (largest first).
+        """
+        if phase is None:
+            cluster_ids = self.get_unique_clusters()
+        elif isinstance(phase, str):
+            cluster_ids = self.labels_by_phase[phase]
+        else:
+            cluster_ids = np.concatenate([self.labels_by_phase[p] for p in phase])
+
+        sizes = self.cluster_sizes
+        phases = self.cluster_phases_id
+        phase_names = self.data.phase_names
+
+        ordered = sorted(cluster_ids, key=lambda c: sizes[c], reverse=not ascending)
+
+        print(f"{'Cluster':>8} {'Size (px)':>10} {'Phase':>8}")
+        print("-" * 30)
+        for c in ordered:
+            print(f"{c:>8} {sizes[c]:>10} {phase_names[phases[c]]:>8}")
     # ============================================================================
     # LAMELLAR CLUSTER IDENTIFICATION METHODS
     # ============================================================================
@@ -4872,6 +6707,118 @@ class ClusteringResult:
             'n_pixels': n_pixels,
             'pca_method': 'sklearn' if use_sklearn else 'numpy'
         }
+
+    def get_pixel_to_average_misorientation(self, cluster_id):
+        """
+        Misorientation (deg) of every individual pixel in a cluster to that
+        cluster's average orientation (self.avg_orientations[cluster_id]),
+        using the full symmetry of the cluster's phase.
+
+        Useful for quantifying how much true pixel-level spread exists
+        within a cluster -- e.g. after merge_clusters_by_orientation, where
+        the merge criterion only bounds distances between cluster AVERAGES,
+        not the spread of the underlying pixel populations, so large
+        apparent spread post-merge is expected and this quantifies it
+        directly.
+
+        Parameters
+        ----------
+        cluster_id : int
+
+        Returns
+        -------
+        angles : (n_pixels,) ndarray
+            Misorientation (deg) of each pixel to the cluster average.
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_id not in self.avg_orientations:
+            raise ValueError(f"No average orientation available for cluster {cluster_id}")
+
+        idxs = np.where(self.labels == cluster_id)[0]
+        if idxs.shape[0] == 0:
+            raise ValueError(f"Cluster {cluster_id} has no pixels")
+
+        phase_id = self.cluster_phases_id[cluster_id]
+        phase_name = self.data.phase_names[phase_id]
+        symops_all = np.array(self.data.phases[phase_name]['symops'])
+        symops = symops_all[np.array([round(np.linalg.det(s)) == 1 for s in symops_all])]
+
+        avg_M = self.avg_orientations[cluster_id]
+
+        pixel_quats = self.data.quaternions[idxs]
+        M_pix = np.array([quat_to_mat(q) for q in pixel_quats])  # (P,3,3)
+
+        R_ab = np.einsum('pij,kj->pik', M_pix, avg_M)  # M_pix @ avg_M.T per pixel
+        R_eq = np.einsum('sij,pjk->spik', symops, R_ab).reshape(-1, 3, 3)
+        q = _R.from_matrix(R_eq).as_quat().reshape(len(symops), len(idxs), 4)
+        w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+        ang = np.degrees(2 * np.arccos(w))
+        min_ang = np.min(ang, axis=0)
+
+        return min_ang
+
+
+    def summarize_pixel_to_average_misorientation(self, cluster_ids=None, phase=None):
+        """
+        Compute mean/std/max misorientation of pixels to their cluster's
+        average orientation, for one or more clusters.
+
+        Parameters
+        ----------
+        cluster_ids : int or list of int, optional
+            Clusters to evaluate. Default: all clusters (in `phase` if
+            given, else all phases).
+        phase : str, optional
+            Restrict to clusters of this phase. Ignored if cluster_ids is
+            given explicitly.
+
+        Returns
+        -------
+        summary : dict {cluster_id: dict}
+            Each value: {'n_pixels', 'mean_deg', 'std_deg', 'max_deg'}
+        """
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase]) if phase is not None \
+                        else list(self.get_unique_clusters())
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        summary = {}
+        for c in cluster_ids:
+            angles = self.get_pixel_to_average_misorientation(c)
+            summary[int(c)] = {
+                'n_pixels': int(angles.shape[0]),
+                'mean_deg': float(np.mean(angles)),
+                'std_deg': float(np.std(angles)),
+                'max_deg': float(np.max(angles)),
+            }
+        return summary
+
+
+    def print_pixel_to_average_misorientation_summary(self, cluster_ids=None, phase=None,
+                                                        sort_by='mean_deg', ascending=False):
+        """
+        Print per-cluster pixel-to-average misorientation statistics,
+        sorted by the worst (or best) spread first.
+
+        Parameters
+        ----------
+        cluster_ids, phase : see summarize_pixel_to_average_misorientation.
+        sort_by : {'mean_deg', 'std_deg', 'max_deg', 'n_pixels'}, optional
+            Default 'mean_deg'.
+        ascending : bool, optional
+            Default False (largest spread first).
+        """
+        summary = self.summarize_pixel_to_average_misorientation(cluster_ids, phase)
+        ordered = sorted(summary.items(), key=lambda kv: kv[1][sort_by], reverse=not ascending)
+
+        print(f"{'Cluster':>8} {'Pixels':>8} {'Mean (deg)':>11} {'Std (deg)':>10} {'Max (deg)':>10}")
+        print("-" * 52)
+        for c, s in ordered:
+            print(f"{c:>8} {s['n_pixels']:>8} {s['mean_deg']:>11.3f} {s['std_deg']:>10.3f} {s['max_deg']:>10.3f}")
+
+        return summary
 
     def identify_lamellar_clusters(self, phase_id=None, phase_name=None, 
                                 min_aspect_ratio=None,
@@ -7123,7 +9070,172 @@ class ClusteringResult:
         
         return fig, ax, roi_info
     
+# ============================================================================
+# MISORIENTATION ANALYZER
+# ============================================================================
+    def compute_pixel_neighbor_misorientations(self, phase, distance=1, perimeteronly=True,
+                                                distance_convention="OIM", roi=None):
+        """
+        Vectorized per-pixel, per-neighbor-slot misorientation angles (deg),
+        via batched orientation-matrix rotation composition (same approach
+        as compute_cluster_boundary_misorientations_fast), looping only over
+        neighbor slots (typically 6-12) rather than over pixels or pixel
+        pairs individually.
 
+        Shared core for:
+        - get_pixel_boundary_misorientations (pairs straddling an actual
+        cluster boundary, i.e. self.labels differs)
+        - get_pixel_max_neighbor_misorientation (per-pixel max across all
+        neighbors, matching the legacy KAM-style
+        "mis = np.max(misang, axis=1)" pattern used for map coloring)
+
+        Parameters
+        ----------
+        phase : str
+            Phase to restrict to. Only pixel pairs where BOTH pixels belong
+            to this phase are considered; other entries stay -1 (invalid).
+        distance, perimeteronly, distance_convention, roi :
+            Passed through to self.data.compute_neighbors().
+
+        Returns
+        -------
+        misang : (N, n_neighbors) ndarray
+            Misorientation angle (deg), pixel i to its k-th neighbor.
+            -1 where the neighbor is missing, outside ROI, or outside phase.
+        neighbors : (N, n_neighbors) ndarray
+            The neighbor index array used (from self.data.compute_neighbors).
+        phase_mask : (N,) bool ndarray
+            The phase+ROI mask used.
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        phase_id = self.data.phase_ids[phase]
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        symops = symops_all[np.array([round(np.linalg.det(s)) == 1 for s in symops_all])]
+
+        neighbors = self.data.compute_neighbors(
+            distance=distance, perimeteronly=perimeteronly,
+            distance_convention=distance_convention, roi=roi
+        )
+
+        if roi is None:
+            sel = self.data.rois.masks[0]
+        else:
+            sel = self.data.rois.masks[roi]
+
+        phase_mask = (self.data.phases_id == phase_id) & sel
+
+        N = self.data.N
+        n_neighbors = neighbors.shape[1]
+        misang = np.full((N, n_neighbors), -1.0, dtype=float)
+
+        # Convert quaternions -> matrices once, only for pixels in this
+        # phase/ROI (not the whole map).
+        idxs = np.where(phase_mask)[0]
+        M_all = np.full((N, 3, 3), np.nan)
+        M_all[idxs] = np.array([quat_to_mat(q) for q in self.data.quaternions[idxs]])
+
+        for k in range(n_neighbors):
+            j = neighbors[:, k]
+            valid = phase_mask & (j >= 0)
+            valid[valid] &= phase_mask[j[valid]]
+            if not np.any(valid):
+                continue
+
+            i_idx = np.where(valid)[0]
+            j_idx = j[i_idx]
+
+            A = M_all[i_idx]  # (P,3,3)
+            B = M_all[j_idx]  # (P,3,3)
+
+            R_ab = np.einsum("pij,pkj->pik", B, A, optimize=True)
+            R_eq = np.einsum("sij,pjk->spik", symops, R_ab, optimize=True).reshape(-1, 3, 3)
+
+            q = _R.from_matrix(R_eq).as_quat().reshape(len(symops), len(i_idx), 4)
+            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+            ang = np.degrees(2 * np.arccos(w))
+            min_ang = np.min(ang, axis=0)
+
+            misang[i_idx, k] = min_ang
+
+        return misang, neighbors, phase_mask
+
+
+    def get_pixel_boundary_misorientations(self, phase, distance=1, perimeteronly=True,
+                                            distance_convention="OIM", roi=None):
+        """
+        Misorientation angles (deg) for pixel-pairs straddling an actual
+        cluster boundary (self.labels differs), built from
+        compute_pixel_neighbor_misorientations.
+
+        Returns
+        -------
+        angles : (M,) ndarray
+            One value per unique boundary pixel-pair (each physical pair
+            counted once).
+        pair_cluster_ids : (M, 2) ndarray
+            The two (sorted) cluster labels for each pair.
+        """
+        misang, neighbors, phase_mask = self.compute_pixel_neighbor_misorientations(
+            phase, distance=distance, perimeteronly=perimeteronly,
+            distance_convention=distance_convention, roi=roi
+        )
+
+        labels = self.labels
+        n_neighbors = misang.shape[1]
+
+        angles_list = []
+        pairs_list = []
+        seen = set()
+
+        for k in range(n_neighbors):
+            j = neighbors[:, k]
+            valid = misang[:, k] >= 0
+            if not np.any(valid):
+                continue
+            i_idx = np.where(valid)[0]
+            j_idx = j[i_idx]
+
+            li = labels[i_idx]
+            lj = labels[j_idx]
+            boundary = (li != lj) & (li > 0) & (lj > 0)
+            if not np.any(boundary):
+                continue
+
+            i_b = i_idx[boundary]
+            j_b = j_idx[boundary]
+            ang_b = misang[i_b, k]
+
+            for ii, jj, aa in zip(i_b, j_b, ang_b):
+                key = (ii, jj) if ii < jj else (jj, ii)
+                if key in seen:
+                    continue
+                seen.add(key)
+                angles_list.append(aa)
+                pairs_list.append(tuple(sorted((int(labels[ii]), int(labels[jj])))))
+
+        return np.array(angles_list), np.array(pairs_list)
+
+
+    def get_pixel_max_neighbor_misorientation(self, phase, distance=1, perimeteronly=True,
+                                            distance_convention="OIM", roi=None):
+        """
+        Per-pixel maximum misorientation to its neighbors (deg) -- vectorized
+        equivalent of the legacy KAM-style "mis = np.max(misang, axis=1)"
+        pattern, used to build a color array highlighting grain boundaries
+        on a map.
+
+        Returns
+        -------
+        mis : (N,) ndarray
+            Per-pixel max neighbor misorientation. -1 outside phase/ROI or
+            for pixels with zero valid neighbors.
+        """
+        misang, neighbors, phase_mask = self.compute_pixel_neighbor_misorientations(
+            phase, distance=distance, perimeteronly=perimeteronly,
+            distance_convention=distance_convention, roi=roi
+        )
+        return np.max(misang, axis=1)
 
     
 
@@ -13874,7 +15986,7 @@ class EbsdHPAnalyzer():
         story.append(Paragraph(
             '6. Methodological Notes and Warnings', s_h1))
         # Section 5: warnings
-        story.append(Paragraph('5. Methodological Notes and Warnings', s_h1))
+        story.append(Paragraph('Methodological Notes and Warnings', s_h1))
         for w in results.get('warnings', []):
             story.append(Paragraph(f'• {w}', s_note))
 
