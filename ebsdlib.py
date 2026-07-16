@@ -42,7 +42,35 @@ _SIN60 = 0.5 * 3.0**0.5  # sin(60deg)
 
 import h5py
 from scipy.spatial.transform import Rotation as ScipyRotation
+def annotate_sample_transform(ax, sample_transform):
+    """
+    Append a note to ax's title reporting where the standard sample
+    axes x=[1,0,0], y=[0,1,0], z=[0,0,1] land under sample_transform --
+    i.e. the coordinate system the pole figure is actually plotted in,
+    when a non-identity sample_transform was used.
 
+    Parameters
+    ----------
+    ax : matplotlib Axes
+        Axes returned by plot_cluster_pole_figure (or any function
+        following the same title-append convention).
+    sample_transform : (3,3) array
+        The same matrix passed as sample_transform to
+        plot_cluster_pole_figure.
+    """
+    T = np.asarray(sample_transform)
+
+    def _fmt(vec):
+        return tuple(float(round(v, 2)) for v in vec)
+
+    x_new = _fmt(T.dot([1.0, 0.0, 0.0]))
+    y_new = _fmt(T.dot([0.0, 1.0, 0.0]))
+    z_new = _fmt(T.dot([0.0, 0.0, 1.0]))
+
+    note = f"plotted in rotated frame:\nx={x_new}, y={y_new}, z={z_new}"
+
+    existing_title = ax.get_title()
+    ax.set_title(f"{existing_title}\n{note}" if existing_title else note)
 def _generate_distinct_colors(n):
     """
     Generate n visually distinct, evenly-spaced colors (as RGB tuples in
@@ -5224,35 +5252,7 @@ class ClusteringResult:
         ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
 
         return (fig, ax, results) if return_val else (fig, ax)
-    def annotate_sample_transform(ax, sample_transform):
-        """
-        Append a note to ax's title reporting where the standard sample
-        axes x=[1,0,0], y=[0,1,0], z=[0,0,1] land under sample_transform --
-        i.e. the coordinate system the pole figure is actually plotted in,
-        when a non-identity sample_transform was used.
 
-        Parameters
-        ----------
-        ax : matplotlib Axes
-            Axes returned by plot_cluster_pole_figure (or any function
-            following the same title-append convention).
-        sample_transform : (3,3) array
-            The same matrix passed as sample_transform to
-            plot_cluster_pole_figure.
-        """
-        T = np.asarray(sample_transform)
-
-        def _fmt(vec):
-            return tuple(float(round(v, 2)) for v in vec)
-
-        x_new = _fmt(T.dot([1.0, 0.0, 0.0]))
-        y_new = _fmt(T.dot([0.0, 1.0, 0.0]))
-        z_new = _fmt(T.dot([0.0, 0.0, 1.0]))
-
-        note = f"plotted in rotated frame:\nx={x_new}, y={y_new}, z={z_new}"
-
-        existing_title = ax.get_title()
-        ax.set_title(f"{existing_title}\n{note}" if existing_title else note)
     def symmetrize_to_reference_ini(self, reference, cluster_ids, phase=None,
                                 ref_lattice_direction=None,
                                 return_clustering_result=False):
