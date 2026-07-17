@@ -2570,6 +2570,8 @@ class EBSDData(getPhases):
         #self.rois.masks.append(SelPaths.contains_points(np.vstack((self.X,self.Y)).T))
         #self.rois.allroidx = len(self.rois.masks)-1
         self.rois.masks.append(SelPaths.contains_points(np.vstack((self.X,self.Y)).T))
+
+
         return SelVerts, SelPaths
         
 
@@ -3185,7 +3187,7 @@ class selectROI(object):
 
         #print(self.verts)
         #print(self.selVerts)
-        #print(self.selPaths)
+        print(len(self.selPaths))
         self.canvas.draw_idle()
 
     def disconnect(self):
@@ -5425,30 +5427,217 @@ class ClusteringResult:
             new_result.avg_quats[c] = r['avg_quat']
 
         return new_result
+    
+    def evaluate_lattice_direction_homogeneity(self, anchor_cluster_id, lattice_vec, phase=None,
+                                                cluster_ids='all', units='deg',
+                                                print_result=False, plot_result=False):
+        """
+        For a fixed sample-frame anchor derived from anchor_cluster_id's
+        average orientation, evaluate the orientation homogeneity of a
+        pooled pixel population (across cluster_ids) for EVERY
+        symmetrically-equivalent variant of a given Miller-index lattice
+        direction.
+
+        For each equivalent variant lv of lattice_vec (found via
+        self.data.phases[phase]['symops']):
+        - cartesian_vec = L.dot(lv), normalized
+        - d = avg_mat.T.dot(cartesian_vec) -- a fixed SAMPLE-frame direction,
+        anchored to anchor_cluster_id's average orientation for this variant
+        - every pooled pixel's crystal-frame representation of that SAME d
+        (pixel_mats . d) is folded into the fundamental cubic triangle
+        (full proper+improper symmetry, required by
+        stereoprojection_intotriangle_fast)
+        - homogeneity is the angular spread (mean/max angle to the mean of
+        the FOLDED directions) of the pooled population, in `units`
+
+        Parameters
+        ----------
+        anchor_cluster_id : int
+            Cluster whose average orientation defines the fixed sample-
+            frame anchor d for each variant. Not necessarily included in
+            the pooled pixel population being evaluated (see cluster_ids).
+        lattice_vec : array-like (3,)
+            Miller-index (real-space lattice-vector) direction. Its full
+            set of symmetrically-equivalent variants (via symops) is tested.
+        phase : str, optional
+            Phase for symops/L lookup. If None, inferred from
+            anchor_cluster_id via self.cluster_phases_id.
+        cluster_ids : int, list of int, or 'all', optional
+            Which clusters' pixels to pool for the homogeneity evaluation.
+            Default 'all' (every cluster in `phase`).
+        units : {'deg', 'rad'}, optional
+            Units for the reported/printed/plotted angular spread. Default 'deg'.
+        print_result : bool, optional
+            If True, print a table of all tested variants, sorted from most
+            to least homogeneous (ascending mean angular spread). Default False.
+        plot_result : bool, optional
+            If True, plot the folded fundamental-triangle positions for the
+            most and least homogeneous variants side by side. Default False.
+
+        Returns
+        -------
+        results_sorted : list of dict, sorted ascending by 'mean_spread'
+            (most homogeneous first). Each dict:
+            'lattice_vec' : (3,) ndarray, this variant's Miller indices
+            'd' : (3,) ndarray, the sample-frame anchor direction used
+            'mean_spread', 'max_spread' : float, in `units`
+            'proj' : (2, N) ndarray, folded triangle coordinates for every
+                pooled pixel (always included; only used for plotting when
+                plot_result=True)
+        """
+        if units not in ('deg', 'rad'):
+            raise ValueError(f"units must be 'deg' or 'rad', got {units!r}")
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[anchor_cluster_id]]
+
+        if isinstance(cluster_ids, str) and cluster_ids == 'all':
+            cluster_ids = list(self.labels_by_phase[phase])
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        L = np.asarray(self.data.phases[phase]['L'])
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        symops_full = list(symops_all) + [-s.T for s in symops_all]
+
+        avg_mat = self.avg_orientations[anchor_cluster_id]
+
+        idxs = np.where(np.isin(self.labels, cluster_ids))[0]
+        pixel_quats = self.data.quaternions[idxs]
+        pixel_mats = np.array([quat_to_mat(q) for q in pixel_quats])
+
+        lattice_vec = np.asarray(lattice_vec, dtype=float)
+        equiv_lattice_vecs = np.unique(np.round(np.dot(symops_all, lattice_vec), 6), axis=0)
+
+        results = []
+        for lv in equiv_lattice_vecs:
+            cartesian_vec = L.dot(lv)
+            cartesian_vec = cartesian_vec / np.linalg.norm(cartesian_vec)
+            d = avg_mat.T.dot(cartesian_vec)
+
+            dirs_crystal = np.einsum('nij,j->ni', pixel_mats, d)  # (N, 3)
+
+            proj, out = stereoprojection_intotriangle_fast(
+                dirs_crystal.T, symops=symops_full, geteqdirs=True
+            )
+            eqdirs = out['eqdirs']  # (3, N), folded
+
+            mean_dir = eqdirs.mean(axis=1)
+            mean_dir = mean_dir / np.linalg.norm(mean_dir)
+            cos_ang = np.clip(eqdirs.T @ mean_dir, -1.0, 1.0)
+            ang_rad = np.arccos(cos_ang)
+            ang = ang_rad if units == 'rad' else np.degrees(ang_rad)
+
+            results.append({
+                'lattice_vec': lv,
+                'd': d,
+                'mean_spread': float(ang.mean()),
+                'max_spread': float(ang.max()),
+                'proj': proj,
+            })
+
+        results_sorted = sorted(results, key=lambda r: r['mean_spread'])
+
+        if print_result:
+            unit_label = units
+            print(f"{'lattice_vec':>18} {'mean_spread(' + unit_label + ')':>18} "
+                f"{'max_spread(' + unit_label + ')':>18}")
+            print("-" * 56)
+            for r in results_sorted:
+                lv_str = np.array2string(r['lattice_vec'], precision=1, suppress_small=True)
+                print(f"{lv_str:>18} {r['mean_spread']:>18.4f} {r['max_spread']:>18.4f}")
+
+            best = results_sorted[0]
+            worst = results_sorted[-1]
+            print(f"\nMost homogeneous: lattice_vec={best['lattice_vec']}, "
+                f"mean_spread={best['mean_spread']:.4f} {unit_label}")
+            print(f"Least homogeneous: lattice_vec={worst['lattice_vec']}, "
+                f"mean_spread={worst['mean_spread']:.4f} {unit_label}")
+
+        if plot_result:
+            best = results_sorted[0]
+            worst = results_sorted[-1]
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            for ax, r, label in zip(axes, [best, worst], ['most homogeneous', 'least homogeneous']):
+                stereotriangle(ax=ax, basedirs=False, equalarea=False)
+                ax.scatter(r['proj'][0, :], r['proj'][1, :], s=3, alpha=0.5, color='red')
+                ax.set_title(f"{label}\nlattice_vec={r['lattice_vec']}\n"
+                            f"mean_spread={r['mean_spread']:.3f} {units}")
+            fig.tight_layout()
+
+        return results_sorted
 
     def symmetrize_clusters(self, cluster_ids='all', phase=None,
                             max_iter=10, tol=1e-6,
                             ref_lattice_direction=None, reference_cluster_id=None,
+                            anchor_disorientation_threshold_deg=10.0,
                             return_clustering_result=False):
         """
-        ... (same docstring as before, plus a note:)
+        For each cluster, resolve crystal-symmetry ambiguity of its own
+        pixels using get_avg_orientations with NO external reference --
+        each cluster converges to its own self-consistent mean.
 
-        NOTE: the branch-search loops below (when ref_lattice_direction is
-        given) are restricted to PROPER rotations only (det > 0), using
-        symops_proper -- a filtered copy of the phase's symops, NOT a
-        modification of the original. This is required because the search
-        result gets applied to M_mean/M_best_cluster and then converted via
-        mat_to_quat, which assumes a proper rotation matrix; feeding it an
-        improper (det=-1, reflection) matrix silently produces a garbage
-        quaternion with no error raised -- confirmed empirically: every
-        pixel in one affected cluster showed ~20 deg of round-trip
-        corruption despite the pre-conversion matrix math being correct
-        (~1.8 deg). The get_avg_orientations call below is UNCHANGED and
-        still receives the full (proper+improper) symops set, since it
-        already handles that correctly and other code (e.g. disorimat)
-        depends on self.data.phases[phase]['symops'] containing the full set.
+        If ref_lattice_direction and reference_cluster_id are both given,
+        an additional branch-selection step aligns each cluster's v =
+        ref_lattice_direction (Miller indices, converted to Cartesian via
+        L, normalized) as closely as possible to the reference cluster's
+        OWN v, expressed in the sample frame.
+
+        The symop pairing (best_sym_ref) that establishes the reference's
+        own branch is found via a JOINT search against one "anchor"
+        cluster -- NOT simply the largest cluster overall. The anchor is
+        instead the LARGEST cluster whose WHOLE-ORIENTATION disorientation
+        to the reference exceeds anchor_disorientation_threshold_deg. This
+        avoids anchoring the joint search on a cluster that happens to have
+        a near-identical orientation to the reference (whole-orientation
+        misorientation close to 0), where the branch-selection problem can
+        be poorly constrained/near-degenerate along a single shared
+        direction; a cluster that is clearly misoriented overall but still
+        shares v (the ref_lattice_direction) gives a more meaningful,
+        better-constrained anchor for fixing best_sym_ref. If no cluster
+        exceeds the threshold, falls back to the largest cluster overall
+        (with a warning).
+
+        Once the anchor's best_sym_ref is fixed, every OTHER cluster
+        (including ones below the threshold) is resolved against it via a
+        single-sided search, same as before.
+
+        Parameters
+        ----------
+        cluster_ids : int, list of int, or 'all', optional
+            Cluster(s) to process. Default 'all' (every cluster in `phase`).
+        phase : str, optional
+            Phase for symops/L lookup. If None, inferred from the first
+            cluster via self.cluster_phases_id.
+        max_iter, tol : passed to get_avg_orientations.
+        ref_lattice_direction : array-like (3,), optional
+            Miller indices, converted to Cartesian via
+            self.data.phases[phase]['L'].dot(ref_lattice_direction), then
+            normalized.
+        reference_cluster_id : int, optional
+            Cluster ID whose converged average orientation is used as the
+            alignment reference. Requires ref_lattice_direction to also be
+            given. Excluded from cluster_ids' main loop (processed
+            separately) but included in the returned result, with its
+            orientation updated via best_sym_ref.
+        anchor_disorientation_threshold_deg : float, optional
+            Minimum whole-orientation disorientation (degrees) to the
+            reference required for a cluster to be eligible as the anchor
+            used to establish best_sym_ref. Default 10.0. Only relevant
+            when ref_lattice_direction and reference_cluster_id are given.
+        return_clustering_result : bool, optional
+            If False (default), return the plain result dict. If True,
+            return a new ClusteringResult instead.
+
+        Returns
+        -------
+        result : dict {cluster_id: dict}, if return_clustering_result=False
+            'idxs', 'pixel_quats', 'pixel_mats', 'avg_quat', 'avg_mat'
+            (includes reference_cluster_id's entry if given)
+        new_result : ClusteringResult, if return_clustering_result=True
         """
         import copy
+        from scipy.spatial.transform import Rotation as _R
 
         if isinstance(cluster_ids, str) and cluster_ids == 'all':
             if phase is None:
@@ -5459,10 +5648,10 @@ class ClusteringResult:
 
         if phase is None:
             phase = self.data.phase_names[self.cluster_phases_id[cluster_ids[0]]]
-        symops = np.array(self.data.phases[phase]['symops'])  # full set, unchanged, for get_avg_orientations
+        symops = np.array(self.data.phases[phase]['symops'])  # full set, for get_avg_orientations
 
         dets = np.array([np.linalg.det(s) for s in symops])
-        symops_proper = symops[dets > 0]  # local filtered copy, for the search loops only
+        symops_proper = symops[dets > 0]  # local filtered copy, for branch-search loops only
 
         v = None
         if ref_lattice_direction is not None:
@@ -5473,6 +5662,7 @@ class ClusteringResult:
 
         v_ref = None
         ref_entry = None
+        M_mean_ref = None
         if reference_cluster_id is not None:
             if v is None:
                 raise ValueError("reference_cluster_id requires ref_lattice_direction to also be given")
@@ -5497,24 +5687,66 @@ class ClusteringResult:
         cluster_ids = [c for c in cluster_ids if c != reference_cluster_id]
         cluster_ids = sorted(cluster_ids, key=lambda c: -sizes.get(c, 0))
 
-        result = {}
-        best_sym_ref = None
+        def _disorientation_deg(Ma, Mb, syms):
+            candidates = np.einsum('sij,jk->sik', syms, Ma)
+            rel = np.einsum('sij,kj->sik', candidates, Mb)
+            q = _R.from_matrix(rel).as_quat()
+            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+            ang = 2.0 * np.degrees(np.arccos(w))
+            return float(ang.min())
 
+        # ---- precompute each cluster's own self-consistent orientation ----
+        cluster_avg_data = {}
         for c in cluster_ids:
             idxs = np.where(self.labels == c)[0]
             if idxs.shape[0] == 0:
                 continue
-
             q_mean, M_mean, M_best_cluster, q_best_cluster = get_avg_orientations(
                 self.data.quaternions[idxs], symops, ref_idx=0,
                 max_iter=max_iter, tol=tol
             )
+            cluster_avg_data[c] = {
+                'idxs': idxs, 'q_mean': q_mean, 'M_mean': M_mean,
+                'M_best_cluster': M_best_cluster, 'q_best_cluster': q_best_cluster,
+            }
+
+        # ---- select the anchor cluster for establishing best_sym_ref ----
+        anchor_id = None
+        if v is not None and v_ref is not None:
+            eligible = []
+            for c in cluster_ids:
+                if c not in cluster_avg_data:
+                    continue
+                dis = _disorientation_deg(cluster_avg_data[c]['M_mean'], M_mean_ref, symops_proper)
+                if dis > anchor_disorientation_threshold_deg:
+                    eligible.append(c)
+
+            if eligible:
+                anchor_id = max(eligible, key=lambda c: sizes.get(c, 0))
+            else:
+                anchor_id = cluster_ids[0]
+                print(f"Warning: no cluster exceeds anchor_disorientation_threshold_deg="
+                    f"{anchor_disorientation_threshold_deg} deg from the reference; "
+                    f"falling back to largest cluster {anchor_id} as anchor.")
+
+            # process the anchor first
+            cluster_ids = [anchor_id] + [c for c in cluster_ids if c != anchor_id]
+
+        result = {}
+        best_sym_ref = None
+
+        for c in cluster_ids:
+            if c not in cluster_avg_data:
+                continue
+            idxs = cluster_avg_data[c]['idxs']
+            M_mean = cluster_avg_data[c]['M_mean']
+            M_best_cluster = cluster_avg_data[c]['M_best_cluster']
 
             if v is not None and v_ref is not None:
                 best_dot = -np.inf
                 best_sym = None
 
-                if c == cluster_ids[0]:
+                if c == anchor_id:
                     for sym_ref in symops_proper:
                         target = M_mean_ref.T.dot(sym_ref.dot(v))
                         for sym in symops_proper:
@@ -5537,6 +5769,9 @@ class ClusteringResult:
                 q_mean = mat_to_quat(M_mean)
                 M_best_cluster = np.einsum('ij,njk->nik', best_sym.T, M_best_cluster)
                 q_best_cluster = np.array([mat_to_quat(m) for m in M_best_cluster])
+            else:
+                q_mean = cluster_avg_data[c]['q_mean']
+                q_best_cluster = cluster_avg_data[c]['q_best_cluster']
 
             result[c] = {
                 'idxs': idxs,
@@ -5585,8 +5820,7 @@ class ClusteringResult:
             new_result.avg_orientations[c] = r['avg_mat']
             new_result.avg_quats[c] = r['avg_quat']
 
-        return new_result    
-
+        return new_result
 
     def get_symmetrize_to_reference_oris(self, reference, cluster_ids, phase=None, max_iter=1, tol=1e-6):
         """
@@ -6799,16 +7033,13 @@ class ClusteringResult:
     def print_pixel_to_average_misorientation_summary(self, cluster_ids=None, phase=None,
                                                         sort_by='mean_deg', ascending=False):
         """
-        Print per-cluster pixel-to-average misorientation statistics,
-        sorted by the worst (or best) spread first.
+        ... (same docstring, plus:)
 
-        Parameters
-        ----------
-        cluster_ids, phase : see summarize_pixel_to_average_misorientation.
-        sort_by : {'mean_deg', 'std_deg', 'max_deg', 'n_pixels'}, optional
-            Default 'mean_deg'.
-        ascending : bool, optional
-            Default False (largest spread first).
+        Returns
+        -------
+        summary : dict, ordered to match the printed sort order (sort_by,
+            ascending). Python dicts preserve insertion order, so iterating
+            summary.items() after this call yields the same order as printed.
         """
         summary = self.summarize_pixel_to_average_misorientation(cluster_ids, phase)
         ordered = sorted(summary.items(), key=lambda kv: kv[1][sort_by], reverse=not ascending)
@@ -6818,7 +7049,7 @@ class ClusteringResult:
         for c, s in ordered:
             print(f"{c:>8} {s['n_pixels']:>8} {s['mean_deg']:>11.3f} {s['std_deg']:>10.3f} {s['max_deg']:>10.3f}")
 
-        return summary
+        return dict(ordered)
 
     def identify_lamellar_clusters(self, phase_id=None, phase_name=None, 
                                 min_aspect_ratio=None,
