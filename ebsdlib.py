@@ -42,6 +42,279 @@ _SIN60 = 0.5 * 3.0**0.5  # sin(60deg)
 
 import h5py
 from scipy.spatial.transform import Rotation as ScipyRotation
+
+
+
+
+# =============================================================================
+#  EBSD-HP pipeline checkpoint  (save / restore derived state)
+# =============================================================================
+#  Stores the EXPENSIVE derived state (clustering, boundaries, hierarchy, HP
+#  analysis) in a single HDF5 file, and a native, inspectable "recipe" that can
+#  rebuild dataEBSD from the .oh5 (raw pixels are NOT stored).
+#
+#  Heavy objects are written as gzip-compressed pickled byte-datasets inside the
+#  HDF5 (HDF5 container; pickle for the awkward nested/custom parts).
+#
+#  Requires EBSDData and EbsdHPAnalyzer to be importable in this namespace.
+# =============================================================================
+import json
+import pickle
+import numpy as np
+import h5py
+
+_FMT, _VER = 'ebsd_hp_checkpoint', 1
+
+ 
+ 
+# ---- recipe (native, inspectable) -----------------------------------------
+def _recipe_put(group, recipe):
+    for k, v in recipe.items():
+        if isinstance(v, (bool, int, float, str, np.integer, np.floating)):
+            group.attrs[k] = v
+        else:                                   # lists / dicts / tuples -> JSON
+            group.attrs['json::' + k] = json.dumps(v)
+ 
+ 
+def _recipe_get(group):
+    out = {}
+    for k, v in group.attrs.items():
+        if k.startswith('json::'):
+            out[k[6:]] = json.loads(v)
+        else:
+            out[k] = v.item() if isinstance(v, np.generic) else v
+    return out
+ 
+ 
+# ---- pickled byte-datasets -------------------------------------------------
+def _dump_blob(g, name, obj):
+    raw = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    g.create_dataset(name, data=np.frombuffer(raw, dtype='uint8'),
+                     compression='gzip', compression_opts=4)
+ 
+ 
+def _load_blob(g, name):
+    return pickle.loads(g[name][()].tobytes())
+ 
+ 
+# ---- public API ------------------------------------------------------------
+def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
+                    hpa=None, recipe, or_results=None, aux=None):
+    """Write the derived pipeline state + recipe to an HDF5 checkpoint.
+
+    `hpa` (and `hierarchy`) are optional: you can checkpoint after clustering /
+    boundaries / hierarchy but before running the HP analysis. Whatever is None
+    is simply stored as None and skipped on restore."""
+    detach = [(clustering_result, 'data'),
+              (boundary_result, 'data'),
+              (boundary_result, 'clustering')]
+    saved = [(o, a, getattr(o, a, None)) for o, a in detach]
+    for o, a in detach:
+        if hasattr(o, a):
+            setattr(o, a, None)
+    try:
+        blobs = {
+            'clustering_result': clustering_result,
+            'boundary_result':   boundary_result,
+            'hierarchy':         hierarchy,
+            'hp':                getattr(hpa, 'HP', None) if hpa is not None else None,
+            'variant_analysis':  getattr(hpa, 'variant_analysis', None) if hpa is not None else None,
+            'or_results':        or_results,
+            'aux':               aux or {},
+        }
+        for k, obj in blobs.items():            # fail early with a clear message
+            try:
+                pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cannot pickle '{k}': {e}. Tell me the offending attribute "
+                    f"and I'll add a strip-rule before dumping.") from e
+        with h5py.File(str(path), 'w') as f:
+            f.attrs['format'], f.attrs['version'] = _FMT, _VER
+            _recipe_put(f.create_group('recipe'), recipe)
+            g = f.create_group('pickled')
+            for k, obj in blobs.items():
+                _dump_blob(g, k, obj)
+    finally:
+        for o, a, v in saved:                    # restore in-memory graph
+            setattr(o, a, v)
+    print(f"checkpoint saved -> {path}")
+
+
+def load_checkpoint(path, dataEBSD=None):
+    """Restore the pipeline. If dataEBSD is None it is rebuilt from the recipe."""
+    with h5py.File(str(path), 'r') as f:
+        if f.attrs.get('format') != _FMT:
+            raise ValueError("not an EBSD-HP checkpoint file")
+        recipe = _recipe_get(f['recipe'])
+        g = f['pickled']
+        blobs = {k: _load_blob(g, k) for k in g.keys()}
+
+    if dataEBSD is None:
+        dataEBSD = rebuild_dataEBSD(recipe)
+
+    cr = blobs['clustering_result']; cr.data = dataEBSD
+    br = blobs['boundary_result'];  br.data = dataEBSD; br.clustering = cr
+    aux = blobs.get('aux') or {}
+    if aux.get('meeting_pairs') is not None:
+        br.meeting_pairs = aux['meeting_pairs']
+    hierarchy = blobs.get('hierarchy')
+
+    dataEBSD.set_rois2d(recipe['roiID'])
+    cr.update_grid_2d()
+
+    hpa = None
+    if hierarchy is not None:
+        hpa = EbsdHPAnalyzer(hierarchy, cr, br)
+        if blobs.get('hp') is not None:
+            hpa.HP = blobs['hp']
+        if blobs.get('variant_analysis') is not None:
+            hpa.variant_analysis = blobs['variant_analysis']
+
+    return dict(dataEBSD=dataEBSD, clustering_result=cr, boundary_result=br,
+                hierarchy=hierarchy, hpa=hpa,
+                or_results=blobs.get('or_results'), aux=aux, recipe=recipe)
+ 
+ 
+def _apply_roi_verts(d, roi_verts):
+    """Rebuild the ROI selection non-interactively from stored polygon vertices."""
+    from matplotlib.path import Path
+    verts = [np.asarray(v, float) for v in roi_verts]
+ 
+    class _StoredSelector:
+        pass
+    sel = _StoredSelector()
+    sel.selVerts = list(verts)
+    sel.selPaths = [Path(v) for v in verts]
+    d.selector = sel
+    d.set_rois()
+    return d
+ 
+ 
+def rebuild_dataEBSD(recipe):
+    """Re-run the cheap setup (readEBSDdata + crystallography + ROIs).
+ 
+    Uses recipe['roi_verts'] to restore the ROI selection without any figure.
+    If they're missing, opens select_rois() interactively (you must then draw
+    the polygons and call set_rois() yourself before proceeding)."""
+    d = EBSDData()
+    d.readEBSDdata(recipe['filename'])
+    d.fromCif(recipe['cif_A'], 'A')
+    d.fromCif(recipe['cif_M'], 'M')
+    d.fromLatticeParams('A', a=recipe['aA'])
+    d.fromLatticeParams('M', a=recipe['aM'], b=recipe['bM'],
+                        c=recipe['cM'], beta=recipe['betaM'])
+    d.setPhaseID(recipe['phaseID'])
+    d.getOR()
+    d.getDefGrad()
+    d.setPlotAttributes()
+    d.getEl()
+ 
+    roi_verts = recipe.get('roi_verts')
+    if roi_verts:
+        _apply_roi_verts(d, roi_verts)
+    else:
+        d.select_rois(d=recipe['or_d'])
+        print("recipe has no 'roi_verts' — draw the polygon(s), then call "
+              "dataEBSD.set_rois() before using the restored pipeline.")
+    return d
+ 
+ 
+
+# -----------------------------------------------------------------------------
+#  ROI selection helpers (interactive once, then persisted in the recipe)
+# -----------------------------------------------------------------------------
+
+def get_roi_verts(d):
+    """Return the user-drawn polygon vertices as a JSON-serialisable list, or
+    None. Any auto-inserted full-area rectangle is skipped."""
+    sel = getattr(d, 'selector', None)
+    verts = getattr(sel, 'selVerts', None)
+    if not verts:
+        return None
+    xmax, ymax = float(d.X.max()), float(d.Y.max())
+    out = []
+    for v in verts:
+        v = np.asarray(v, float)
+        is_full = (v.shape[0] in (4, 5)
+                   and np.isclose(v[:, 0].min(), 0) and np.isclose(v[:, 1].min(), 0)
+                   and np.isclose(v[:, 0].max(), xmax) and np.isclose(v[:, 1].max(), ymax))
+        if not is_full:
+            out.append(v.tolist())
+    return out or None
+
+
+def finalize_rois(d, recipe=None):
+    """Call this AFTER you finish drawing polygons in the select_rois() figure.
+    It stores the ROI masks (set_rois) and, if a recipe is given, records the
+    polygon vertices in recipe['roi_verts'] so future runs/restores skip the
+    interactive step."""
+    verts = get_roi_verts(d)          # capture BEFORE set_rois inserts full-area
+    d.set_rois()
+    if recipe is not None and verts is not None:
+        recipe['roi_verts'] = verts
+        print(f"stored {len(verts)} ROI polygon(s) in recipe['roi_verts']")
+    return d
+
+
+# -----------------------------------------------------------------------------
+#  SETUP: rebuild dataEBSD from the recipe (raw pixels + crystallography + ROIs)
+# -----------------------------------------------------------------------------
+def build_dataEBSD(recipe, interactive=True):
+    """Read the .oh5 and redo the crystallography, then set up the ROIs.
+
+    ROI handling:
+      * recipe['roi_verts'] present  -> non-interactive: rebuild masks from the
+        stored polygons (no figure), fully ready to use.
+      * else, interactive=True       -> open select_rois() for you to draw, then
+        DOES NOT call set_rois (it must wait until you finish). Draw the
+        polygon(s) and then call  finalize_rois(dataEBSD, RECIPE).
+      * else, interactive=False      -> raise (nothing to select from).
+    """
+    d = EBSDData()
+    d.readEBSDdata(recipe['filename'])
+    d.fromCif(recipe['cif_A'], 'A')
+    d.fromCif(recipe['cif_M'], 'M')
+    d.fromLatticeParams('A', a=recipe['aA'])
+    d.fromLatticeParams('M', a=recipe['aM'], b=recipe['bM'],
+                        c=recipe['cM'], beta=recipe['betaM'])
+    d.setPhaseID(recipe['phaseID'])
+    d.getOR()
+    d.getDefGrad()          # also runs getTwinSys / setPlotAttributes / getEl
+    d.getTwinSys()
+    d.setPlotAttributes()
+    d.getEl()
+
+    roi_verts = recipe.get('roi_verts')
+    if roi_verts:
+        _apply_roi_verts(d, roi_verts)                 # non-interactive
+    elif interactive:
+        d.select_rois(d=recipe['or_d'])                # opens figure; DRAW now
+        print("\n>>> Draw ROI polygon(s) in the figure, then run:")
+        print(">>>     finalize_rois(dataEBSD, RECIPE)")
+        print(">>> (this stores the masks and saves the polygons into the recipe)\n")
+    else:
+        raise RuntimeError(
+            "recipe['roi_verts'] is empty and interactive=False — no ROI to "
+            "restore. Run build_dataEBSD(recipe, interactive=True), draw the "
+            "polygons, then finalize_rois(dataEBSD, recipe).")
+    return d
+
+
+def default_checkpoint_name(recipe):
+    """'<oh5 stem>_roi<ID>_checkpoint.h5' derived from the recipe."""
+    import os
+    stem = os.path.splitext(os.path.basename(recipe['filename']))[0]
+    return os.path.join(os.path.dirname(recipe['filename']),f"{stem}_roi{recipe['roiID']}_checkpoint.h5")
+
+
+# ---- public API ------------------------------------------------------------
+
+
+
+
+
+
 def annotate_sample_transform(ax, sample_transform):
     """
     Append a note to ax's title reporting where the standard sample
@@ -2537,6 +2810,7 @@ class EBSDData(getPhases):
         #print(selector.selVerts)
         return 
 
+
     def set_rois(self):
         """
         Set selected ROIS as masks
@@ -2559,6 +2833,13 @@ class EBSDData(getPhases):
         self.selector.selVerts.insert(0,selVert)
         mask_by_phase={}
         
+    def get_mask(self,selVerts,phase=None):
+        selPath = mpltPath.Path(selVerts)
+        if phase is None:
+            mask = selPath.contains_points(np.vstack((self.X,self.Y)).T)
+        else:
+            mask = selPath.contains_points(np.vstack((self.X,self.Y)).T)*(self.phases_id==self.getPhaseID(phase))
+        return mask
 
     def set_allroi(self):
         SelVerts = np.array([[ 0.     ,   0.],
@@ -5430,25 +5711,26 @@ class ClusteringResult:
     
     def evaluate_lattice_direction_homogeneity(self, anchor_cluster_id, lattice_vec, phase=None,
                                                 cluster_ids='all', units='deg',
-                                                print_result=False, plot_result=False):
+                                                print_result=False, plot_result=False,
+                                                return_best=False):
         """
         For a fixed sample-frame anchor derived from anchor_cluster_id's
         average orientation, evaluate the orientation homogeneity of a
         pooled pixel population (across cluster_ids) for EVERY
-        symmetrically-equivalent variant of a given Miller-index lattice
-        direction.
+        symmetrically-equivalent variant of one OR MORE Miller-index lattice
+        directions, and rank them all together.
 
-        For each equivalent variant lv of lattice_vec (found via
-        self.data.phases[phase]['symops']):
+        For each equivalent variant lv of each input direction (equivalents
+        found via self.data.phases[phase]['symops']):
         - cartesian_vec = L.dot(lv), normalized
         - d = avg_mat.T.dot(cartesian_vec) -- a fixed SAMPLE-frame direction,
-        anchored to anchor_cluster_id's average orientation for this variant
+          anchored to anchor_cluster_id's average orientation for this variant
         - every pooled pixel's crystal-frame representation of that SAME d
-        (pixel_mats . d) is folded into the fundamental cubic triangle
-        (full proper+improper symmetry, required by
-        stereoprojection_intotriangle_fast)
+          (pixel_mats . d) is folded into the fundamental cubic triangle
+          (full proper+improper symmetry, required by
+          stereoprojection_intotriangle_fast)
         - homogeneity is the angular spread (mean/max angle to the mean of
-        the FOLDED directions) of the pooled population, in `units`
+          the FOLDED directions) of the pooled population, in `units`
 
         Parameters
         ----------
@@ -5456,9 +5738,12 @@ class ClusteringResult:
             Cluster whose average orientation defines the fixed sample-
             frame anchor d for each variant. Not necessarily included in
             the pooled pixel population being evaluated (see cluster_ids).
-        lattice_vec : array-like (3,)
-            Miller-index (real-space lattice-vector) direction. Its full
-            set of symmetrically-equivalent variants (via symops) is tested.
+        lattice_vec : array-like (3,) OR (M, 3)
+            One Miller-index direction, or a list of candidate directions.
+            The full symmetry-equivalent set of EACH input is tested, and all
+            variants of all inputs are ranked together. Equivalents shared
+            between inputs are evaluated once (deduplicated), attributed to the
+            first input that produced them.
         phase : str, optional
             Phase for symops/L lookup. If None, inferred from
             anchor_cluster_id via self.cluster_phases_id.
@@ -5473,12 +5758,19 @@ class ClusteringResult:
         plot_result : bool, optional
             If True, plot the folded fundamental-triangle positions for the
             most and least homogeneous variants side by side. Default False.
+        return_best : bool, optional
+            If True, return only the single most homogeneous result dict
+            (i.e. results_sorted[0]); if False (default), return the full
+            sorted list. Backward compatible when False.
 
         Returns
         -------
         results_sorted : list of dict, sorted ascending by 'mean_spread'
-            (most homogeneous first). Each dict:
+            (most homogeneous first) -- or a single dict if return_best=True.
+            Each dict:
             'lattice_vec' : (3,) ndarray, this variant's Miller indices
+            'source_lattice_vec' : (3,) ndarray, the input direction this
+                variant was generated from
             'd' : (3,) ndarray, the sample-frame anchor direction used
             'mean_spread', 'max_spread' : float, in `units`
             'proj' : (2, N) ndarray, folded triangle coordinates for every
@@ -5506,53 +5798,80 @@ class ClusteringResult:
         pixel_quats = self.data.quaternions[idxs]
         pixel_mats = np.array([quat_to_mat(q) for q in pixel_quats])
 
+        # --- normalize lattice_vec to a list of (3,) input directions -------
         lattice_vec = np.asarray(lattice_vec, dtype=float)
-        equiv_lattice_vecs = np.unique(np.round(np.dot(symops_all, lattice_vec), 6), axis=0)
+        if lattice_vec.ndim == 1:
+            input_vecs = lattice_vec.reshape(1, 3)
+        else:
+            input_vecs = lattice_vec.reshape(-1, 3)
 
         results = []
-        for lv in equiv_lattice_vecs:
-            cartesian_vec = L.dot(lv)
-            cartesian_vec = cartesian_vec / np.linalg.norm(cartesian_vec)
-            d = avg_mat.T.dot(cartesian_vec)
+        seen = set()                       # dedup variants across all inputs
+        for src in input_vecs:
+            equiv_lattice_vecs = np.unique(np.round(np.dot(symops_all, src), 6), axis=0)
+            for lv in equiv_lattice_vecs:
+                key = tuple((np.round(lv, 6) + 0.0).tolist())   # +0.0 -> kill -0.0
+                if key in seen:
+                    continue
+                seen.add(key)
 
-            dirs_crystal = np.einsum('nij,j->ni', pixel_mats, d)  # (N, 3)
+                cartesian_vec = L.dot(lv)
+                cartesian_vec = cartesian_vec / np.linalg.norm(cartesian_vec)
+                d = avg_mat.T.dot(cartesian_vec)
 
-            proj, out = stereoprojection_intotriangle_fast(
-                dirs_crystal.T, symops=symops_full, geteqdirs=True
-            )
-            eqdirs = out['eqdirs']  # (3, N), folded
+                dirs_crystal = np.einsum('nij,j->ni', pixel_mats, d)  # (N, 3)
 
-            mean_dir = eqdirs.mean(axis=1)
-            mean_dir = mean_dir / np.linalg.norm(mean_dir)
-            cos_ang = np.clip(eqdirs.T @ mean_dir, -1.0, 1.0)
-            ang_rad = np.arccos(cos_ang)
-            ang = ang_rad if units == 'rad' else np.degrees(ang_rad)
+                proj, out = stereoprojection_intotriangle_fast(
+                    dirs_crystal.T, symops=symops_full, geteqdirs=True
+                )
+                eqdirs = out['eqdirs']  # (3, N), folded
 
-            results.append({
-                'lattice_vec': lv,
-                'd': d,
-                'mean_spread': float(ang.mean()),
-                'max_spread': float(ang.max()),
-                'proj': proj,
-            })
+                mean_dir = eqdirs.mean(axis=1)
+                mean_dir = mean_dir / np.linalg.norm(mean_dir)
+                cos_ang = np.clip(eqdirs.T @ mean_dir, -1.0, 1.0)
+                ang_rad = np.arccos(cos_ang)
+                ang = ang_rad if units == 'rad' else np.degrees(ang_rad)
+
+                results.append({
+                    'lattice_vec': lv,
+                    'source_lattice_vec': src.copy(),
+                    'd': d,
+                    'mean_spread': float(ang.mean()),
+                    'max_spread': float(ang.max()),
+                    'proj': proj,
+                })
 
         results_sorted = sorted(results, key=lambda r: r['mean_spread'])
 
         if print_result:
-            unit_label = units
-            print(f"{'lattice_vec':>18} {'mean_spread(' + unit_label + ')':>18} "
-                f"{'max_spread(' + unit_label + ')':>18}")
-            print("-" * 56)
+            u = units
+            multi = len(input_vecs) > 1
+            if multi:
+                print(f"{'source':>14} {'variant':>18} "
+                      f"{'mean_spread(' + u + ')':>18} {'max_spread(' + u + ')':>18}")
+                print("-" * 72)
+            else:
+                print(f"{'lattice_vec':>18} "
+                      f"{'mean_spread(' + u + ')':>18} {'max_spread(' + u + ')':>18}")
+                print("-" * 56)
             for r in results_sorted:
                 lv_str = np.array2string(r['lattice_vec'], precision=1, suppress_small=True)
-                print(f"{lv_str:>18} {r['mean_spread']:>18.4f} {r['max_spread']:>18.4f}")
+                if multi:
+                    src_str = np.array2string(r['source_lattice_vec'], precision=1,
+                                              suppress_small=True)
+                    print(f"{src_str:>14} {lv_str:>18} "
+                          f"{r['mean_spread']:>18.4f} {r['max_spread']:>18.4f}")
+                else:
+                    print(f"{lv_str:>18} {r['mean_spread']:>18.4f} {r['max_spread']:>18.4f}")
 
             best = results_sorted[0]
             worst = results_sorted[-1]
-            print(f"\nMost homogeneous: lattice_vec={best['lattice_vec']}, "
-                f"mean_spread={best['mean_spread']:.4f} {unit_label}")
-            print(f"Least homogeneous: lattice_vec={worst['lattice_vec']}, "
-                f"mean_spread={worst['mean_spread']:.4f} {unit_label}")
+            print(f"\nMost homogeneous: lattice_vec={best['lattice_vec']} "
+                  f"(from {best['source_lattice_vec']}), "
+                  f"mean_spread={best['mean_spread']:.4f} {u}")
+            print(f"Least homogeneous: lattice_vec={worst['lattice_vec']} "
+                  f"(from {worst['source_lattice_vec']}), "
+                  f"mean_spread={worst['mean_spread']:.4f} {u}")
 
         if plot_result:
             best = results_sorted[0]
@@ -5561,13 +5880,282 @@ class ClusteringResult:
             for ax, r, label in zip(axes, [best, worst], ['most homogeneous', 'least homogeneous']):
                 stereotriangle(ax=ax, basedirs=False, equalarea=False)
                 ax.scatter(r['proj'][0, :], r['proj'][1, :], s=3, alpha=0.5, color='red')
-                ax.set_title(f"{label}\nlattice_vec={r['lattice_vec']}\n"
-                            f"mean_spread={r['mean_spread']:.3f} {units}")
+                ax.set_title(f"{label}\nlattice_vec={r['lattice_vec']} "
+                             f"(from {r['source_lattice_vec']})\n"
+                             f"mean_spread={r['mean_spread']:.3f} {units}")
             fig.tight_layout()
 
-        return results_sorted
+        return results_sorted[0] if return_best else results_sorted
 
     def symmetrize_clusters(self, cluster_ids='all', phase=None,
+                            max_iter=10, tol=1e-6,
+                            ref_lattice_direction=None, reference_cluster_id=None,
+                            anchor_disorientation_threshold_deg=10.0,
+                            return_clustering_result=False):
+        """
+        For each cluster, resolve crystal-symmetry ambiguity of its own
+        pixels using get_avg_orientations with NO external reference --
+        each cluster converges to its own self-consistent mean.
+
+        If ref_lattice_direction and reference_cluster_id are both given,
+        an additional branch-selection step aligns each cluster's v =
+        ref_lattice_direction (Miller indices, converted to Cartesian via
+        L, normalized) as closely as possible to the reference cluster's
+        OWN v, expressed in the sample frame.
+
+        The symop pairing (best_sym_ref) that establishes the reference's
+        own branch is found via a JOINT search against one "anchor"
+        cluster -- NOT simply the largest cluster overall. The anchor is
+        instead the LARGEST cluster whose WHOLE-ORIENTATION disorientation
+        to the reference exceeds anchor_disorientation_threshold_deg. This
+        avoids anchoring the joint search on a cluster that happens to have
+        a near-identical orientation to the reference (whole-orientation
+        misorientation close to 0), where the branch-selection problem can
+        be poorly constrained/near-degenerate along a single shared
+        direction; a cluster that is clearly misoriented overall but still
+        shares v (the ref_lattice_direction) gives a more meaningful,
+        better-constrained anchor for fixing best_sym_ref. If no cluster
+        exceeds the threshold, falls back to the largest cluster overall
+        (with a warning).
+
+        Once the anchor's best_sym_ref is fixed, every OTHER cluster
+        (including ones below the threshold) is resolved against it via a
+        single-sided search, same as before.
+
+        Parameters
+        ----------
+        cluster_ids : int, list of int, or 'all', optional
+            Cluster(s) to process. Default 'all' (every cluster in `phase`).
+        phase : str, optional
+            Phase for symops/L lookup. If None, inferred from the first
+            cluster via self.cluster_phases_id.
+        max_iter, tol : passed to get_avg_orientations.
+        ref_lattice_direction : array-like (3,), optional
+            Miller indices, converted to Cartesian via
+            self.data.phases[phase]['L'].dot(ref_lattice_direction), then
+            normalized.
+        reference_cluster_id : int, optional
+            Cluster ID whose converged average orientation is used as the
+            alignment reference. Requires ref_lattice_direction to also be
+            given. Excluded from cluster_ids' main loop (processed
+            separately) but included in the returned result, with its
+            orientation updated via best_sym_ref.
+        anchor_disorientation_threshold_deg : float, optional
+            Minimum whole-orientation disorientation (degrees) to the
+            reference required for a cluster to be eligible as the anchor
+            used to establish best_sym_ref. Default 10.0. Only relevant
+            when ref_lattice_direction and reference_cluster_id are given.
+        return_clustering_result : bool, optional
+            If False (default), return the plain result dict. If True,
+            return a new ClusteringResult instead.
+
+        Returns
+        -------
+        result : dict {cluster_id: dict}, if return_clustering_result=False
+            'idxs', 'pixel_quats', 'pixel_mats', 'avg_quat', 'avg_mat'
+            (includes reference_cluster_id's entry if given)
+        new_result : ClusteringResult, if return_clustering_result=True
+        If reference_cluster_id is given but ref_lattice_direction is NOT,
+        plain WHOLE-ORIENTATION matching is used instead: each cluster's
+        own converged average is resolved to the single symop minimizing
+        its overall disorientation to the reference's average (no target
+        direction, no anchor/joint search needed -- there's no direction-
+        specific branch ambiguity to resolve first in this mode).
+        """
+        import copy
+        from scipy.spatial.transform import Rotation as _R
+
+        if isinstance(cluster_ids, str) and cluster_ids == 'all':
+            if phase is None:
+                raise ValueError("phase is required when cluster_ids='all'")
+            cluster_ids = list(self.labels_by_phase[phase])
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[cluster_ids[0]]]
+        symops = np.array(self.data.phases[phase]['symops'])
+
+        dets = np.array([np.linalg.det(s) for s in symops])
+        symops_proper = symops[dets > 0]
+
+        v = None
+        if ref_lattice_direction is not None:
+            L = np.asarray(self.data.phases[phase]['L'])
+            uvw = np.asarray(ref_lattice_direction, dtype=float)
+            v = L.dot(uvw)
+            v = v / np.linalg.norm(v)
+
+        v_ref = None
+        ref_entry = None
+        M_mean_ref = None
+        if reference_cluster_id is not None:
+            ref_idxs = np.where(self.labels == reference_cluster_id)[0]
+            if ref_idxs.shape[0] == 0:
+                raise ValueError(f"reference_cluster_id {reference_cluster_id} has no pixels")
+
+            q_mean_ref, M_mean_ref, M_best_cluster_ref, q_best_cluster_ref = get_avg_orientations(
+                self.data.quaternions[ref_idxs], symops, ref_idx=0,
+                max_iter=max_iter, tol=tol
+            )
+            if v is not None:
+                v_ref = M_mean_ref.T.dot(v)
+            ref_entry = {
+                'idxs': ref_idxs,
+                'avg_mat': M_mean_ref,
+                'avg_quat': q_mean_ref,
+                'pixel_mats': M_best_cluster_ref,
+                'pixel_quats': q_best_cluster_ref,
+            }
+
+        sizes = self.cluster_sizes
+        cluster_ids = [c for c in cluster_ids if c != reference_cluster_id]
+        cluster_ids = sorted(cluster_ids, key=lambda c: -sizes.get(c, 0))
+
+        def _disorientation_deg(Ma, Mb, syms):
+            candidates = np.einsum('sij,jk->sik', syms, Ma)
+            rel = np.einsum('sij,kj->sik', candidates, Mb)
+            q = _R.from_matrix(rel).as_quat()
+            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+            ang = 2.0 * np.degrees(np.arccos(w))
+            return float(ang.min())
+
+        cluster_avg_data = {}
+        for c in cluster_ids:
+            idxs = np.where(self.labels == c)[0]
+            if idxs.shape[0] == 0:
+                continue
+            q_mean, M_mean, M_best_cluster, q_best_cluster = get_avg_orientations(
+                self.data.quaternions[idxs], symops, ref_idx=0,
+                max_iter=max_iter, tol=tol
+            )
+            cluster_avg_data[c] = {
+                'idxs': idxs, 'q_mean': q_mean, 'M_mean': M_mean,
+                'M_best_cluster': M_best_cluster, 'q_best_cluster': q_best_cluster,
+            }
+
+        # ---- select the anchor cluster (only needed for the direction-targeted path) ----
+        anchor_id = None
+        if v is not None and v_ref is not None:
+            eligible = []
+            for c in cluster_ids:
+                if c not in cluster_avg_data:
+                    continue
+                dis = _disorientation_deg(cluster_avg_data[c]['M_mean'], M_mean_ref, symops_proper)
+                if dis > anchor_disorientation_threshold_deg:
+                    eligible.append(c)
+            if eligible:
+                anchor_id = max(eligible, key=lambda c: sizes.get(c, 0))
+            else:
+                anchor_id = cluster_ids[0]
+                print(f"Warning: no cluster exceeds anchor_disorientation_threshold_deg="
+                    f"{anchor_disorientation_threshold_deg} deg from the reference; "
+                    f"falling back to largest cluster {anchor_id} as anchor.")
+            cluster_ids = [anchor_id] + [c for c in cluster_ids if c != anchor_id]
+
+        result = {}
+        best_sym_ref = None
+
+        for c in cluster_ids:
+            if c not in cluster_avg_data:
+                continue
+            idxs = cluster_avg_data[c]['idxs']
+            M_mean = cluster_avg_data[c]['M_mean']
+            M_best_cluster = cluster_avg_data[c]['M_best_cluster']
+
+            if v is not None and v_ref is not None:
+                # ---- direction-targeted matching (unchanged from before) ----
+                best_dot = -np.inf
+                best_sym = None
+
+                if c == anchor_id:
+                    for sym_ref in symops_proper:
+                        target = M_mean_ref.T.dot(sym_ref.dot(v))
+                        for sym in symops_proper:
+                            v_c = M_mean.T.dot(sym.dot(v))
+                            dot = abs(v_c.dot(target))
+                            if dot > best_dot:
+                                best_dot = dot
+                                best_sym = sym
+                                best_sym_ref = sym_ref
+                else:
+                    target = M_mean_ref.T.dot(best_sym_ref.dot(v))
+                    for sym in symops_proper:
+                        v_c = M_mean.T.dot(sym.dot(v))
+                        dot = abs(v_c.dot(target))
+                        if dot > best_dot:
+                            best_dot = dot
+                            best_sym = sym
+
+                M_mean = best_sym.T.dot(M_mean)
+                q_mean = mat_to_quat(M_mean)
+                M_best_cluster = np.einsum('ij,njk->nik', best_sym.T, M_best_cluster)
+                q_best_cluster = np.array([mat_to_quat(m) for m in M_best_cluster])
+
+            elif reference_cluster_id is not None:
+                # ---- NEW: plain whole-orientation matching to the reference ----
+                candidates = np.einsum('sij,jk->sik', symops_proper, M_mean)   # S @ M_mean
+                rel = np.einsum('sij,kj->sik', candidates, M_mean_ref)          # (S@M_mean) @ M_mean_ref.T
+                q = _R.from_matrix(rel).as_quat()
+                w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
+                ang = 2.0 * np.degrees(np.arccos(w))
+                best_s = int(np.argmin(ang))
+                S = symops_proper[best_s]
+
+                M_mean = S.T.dot(M_mean)
+                q_mean = mat_to_quat(M_mean)
+                M_best_cluster = np.einsum('ij,njk->nik', S.T, M_best_cluster)
+                q_best_cluster = np.array([mat_to_quat(m) for m in M_best_cluster])
+
+            else:
+                q_mean = cluster_avg_data[c]['q_mean']
+                q_best_cluster = cluster_avg_data[c]['q_best_cluster']
+
+            result[c] = {
+                'idxs': idxs,
+                'pixel_quats': q_best_cluster,
+                'pixel_mats': M_best_cluster,
+                'avg_quat': q_mean,
+                'avg_mat': M_mean,
+            }
+
+        if ref_entry is not None and v is not None and best_sym_ref is not None:
+            M_mean_ref_new = best_sym_ref.T.dot(ref_entry['avg_mat'])
+            q_mean_ref_new = mat_to_quat(M_mean_ref_new)
+            M_best_ref_new = np.einsum('ij,njk->nik', best_sym_ref.T, ref_entry['pixel_mats'])
+            q_best_ref_new = np.array([mat_to_quat(m) for m in M_best_ref_new])
+            result[reference_cluster_id] = {
+                'idxs': ref_entry['idxs'], 'pixel_quats': q_best_ref_new,
+                'pixel_mats': M_best_ref_new, 'avg_quat': q_mean_ref_new, 'avg_mat': M_mean_ref_new,
+            }
+        elif ref_entry is not None:
+            # whole-orientation mode (or no branch-search at all): reference kept as-is
+            result[reference_cluster_id] = {
+                'idxs': ref_entry['idxs'], 'pixel_quats': ref_entry['pixel_quats'],
+                'pixel_mats': ref_entry['pixel_mats'], 'avg_quat': ref_entry['avg_quat'],
+                'avg_mat': ref_entry['avg_mat'],
+            }
+
+        if not return_clustering_result:
+            return result
+
+        new_data = copy.copy(self.data)
+        new_quaternions = self.data.quaternions.copy()
+        for c, r in result.items():
+            new_quaternions[r['idxs']] = r['pixel_quats']
+        new_data._quaternions = new_quaternions
+
+        new_result = copy.copy(self)
+        new_result.data = new_data
+        new_result.avg_orientations = dict(self.avg_orientations)
+        new_result.avg_quats = dict(self.avg_quats)
+        for c, r in result.items():
+            new_result.avg_orientations[c] = r['avg_mat']
+            new_result.avg_quats[c] = r['avg_quat']
+
+        return new_result
+
+    def symmetrize_clusters_ini2(self, cluster_ids='all', phase=None,
                             max_iter=10, tol=1e-6,
                             ref_lattice_direction=None, reference_cluster_id=None,
                             anchor_disorientation_threshold_deg=10.0,
@@ -6171,7 +6759,10 @@ class ClusteringResult:
         K1_a = np.asarray(twin_data['K1_a'], dtype=float)      # (12, 3)
         K2_a = np.asarray(twin_data['K2_a'], dtype=float)      # (12, 3)
         eta1_a = np.asarray(twin_data['eta1_a'], dtype=float)  # (12, 3)
-        shear_angle = float(twin_data['shear_angle'])
+        if isinstance(twin_data['shear_angle'], (list, np.ndarray)):
+            shear_angle = float(twin_data['shear_angle'][0])
+        else:
+            shear_angle = float(twin_data['shear_angle'])
 
         def _axis_angle(M):
             q = _R.from_matrix(M).as_quat()  # [x, y, z, w]
@@ -6367,8 +6958,391 @@ class ClusteringResult:
             'is_match': angle < tol_deg,
             'swapped': swapped,
         }
+    def check_twin_relationship(self, cluster_a, cluster_b, system, mode,
+                                tol_deg=5.0, symmetric=True):
+        """
+        Check whether the orientation relationship between two clusters'
+        average orientations corresponds to a known twinning mode, via the
+        rotation axis/angle of the relative misorientation compared against
+        the mode's tabulated crystallographic elements.
+
+        IMPORTANT PREREQUISITE: cluster_a and cluster_b's average
+        orientations (self.avg_orientations) must already be resolved to a
+        MUTUALLY CONSISTENT crystal-symmetry branch before calling this --
+        e.g. via self.symmetrize_clusters(cluster_ids='all', phase=...,
+        return_clustering_result=True) run once beforehand on the whole
+        dataset. Without that, M = G2 @ G1.T is only ONE ARBITRARY
+        representative of the true misorientation (each cluster's average
+        independently resolved to its own nearest branch, with no shared
+        reference), and this function's axis/angle comparison will be
+        checked against the wrong rotation entirely -- confirmed
+        empirically: an unsymmetrized pair showed a raw misorientation
+        angle of 68.66 deg, while the TRUE (disorimat, full symmetry
+        search) minimum was 37.00 deg, matching what was visible on the
+        pole figure. This function does NOT itself search over cluster_a's
+        or cluster_b's own symmetric branches -- only over the twin mode's
+        12 tabulated equivalent elements -- so branch consistency must
+        already hold going in.
+
+        Convention: M = G2 @ G1.T (G1, G2 = self.avg_orientations for
+        cluster_a, cluster_b) transforms a vector expressed in cluster_a's
+        crystal frame into cluster_b's crystal frame, for the same physical
+        (sample-frame) vector. Its axis/angle (axis taken via a sign-
+        consistent quaternion, so axis is unique up to the natural line
+        ambiguity of a rotation axis) is compared against TWO independent
+        families of conditions, ANY match in EITHER family being sufficient
+        to report a match:
+
+        1. axis ~ n1_a (K1 plane normal) and angle ~ 180 deg -- type I twin
+        (reflection across K1 is EBSD-indistinguishable from a 180 deg
+        rotation about n1, per Friedel's law / the extended Laue-class
+        symmetry already used elsewhere in this codebase).
+        2. axis ~ a1_a (eta1 shear direction) and angle ~ 180 deg -- type II
+        twin.
+        3. axis ~ n2_a (K2 plane normal) and angle ~ shear_angle -- the
+        GENERAL twin description (valid for compound AND non-compound
+        modes). shear_angle is stored in self.data.twinSys[system][mode]
+        ['shear_angle'][0], in RADIANS, converted to degrees internally.
+
+        NOTE ON C_a: the C_a correspondence matrices stored in
+        self.data.twinSys are NOT used here. Empirically, for at least one
+        non-compound mode ('114' in a NiTi dataset), C_a's 12 variants were
+        ALL exactly 180 deg rotations, unconditionally -- i.e. C_a appears
+        to be constructed via the compound-twin (180 deg) formula
+        regardless of whether the specific mode is actually compound, and
+        for a non-compound mode this makes C_a represent a different
+        (incorrect) physical rotation than the mode's actual lattice
+        correspondence, despite sharing the same underlying direction-
+        cosine magnitudes (C_a = S @ R for some symmetry rotation S, which
+        preserves neither R's angle nor axis in general). Conditions 1-3
+        above, built directly from n1_a/a1_a/n2_a + shear_angle, were
+        empirically validated instead (angle_dev=1.94 deg, axis_dev=1.26
+        deg for the confirmed '114' match) and are what this function uses.
+        If your twinSys data's C_a IS correctly built as the general
+        R(n2, shear_angle) for non-compound modes (verify per-system before
+        trusting), it could be used as a single combined check instead --
+        but that is not assumed here.
+
+        Parameters
+        ----------
+        cluster_a, cluster_b : int
+            Cluster IDs. Both should be the same phase -- twin
+            relationships are only meaningful within one phase. Order does
+            not matter for correctness (both directions are tested when
+            symmetric=True); cluster_a is only a label for the "matrix"
+            side, not a required physical role.
+        system : str
+            Alloy/system key, e.g. 'NiTi'.
+        mode : str
+            Twin mode key, e.g. '114'. Looks up
+            self.data.twinSys[system][mode]['n1_a'], ['a1_a'], ['n2_a']
+            (each a list of 12 equivalent (3,) Cartesian unit vectors), and
+            ['shear_angle'] (a list; ['shear_angle'][0] used, radians).
+        tol_deg : float, optional
+            Deviation angle below which BOTH axis and angle must fall for a
+            condition to count as a match. Default 5.0 degrees.
+        symmetric : bool, optional
+            If True (default), also test the reverse direction (G1 as
+            "twin", G2 as "matrix", i.e. M_rev = G1 @ G2.T). Since M_rev =
+            M_fwd.T, both directions have the SAME rotation angle and
+            antiparallel axes -- with axis comparison already sign-
+            independent (abs(dot)), fwd and rev will always give identical
+            angle_dev/axis_dev for every condition; this flag is kept for
+            API clarity/symmetry with earlier versions but does not
+            currently change the numeric result. Kept as a parameter in
+            case a future asymmetric criterion is added.
+
+        Returns
+        -------
+        result : dict
+            'cluster_a', 'cluster_b' : as given (not reordered, since fwd/
+                rev are numerically identical per the note above)
+            'system', 'mode' : as given
+            'is_match' : bool
+                True if ANY of the three conditions matched (within tol_deg).
+            'best_condition' : str
+                'K1_180', 'eta1_180', or 'K2_shear' -- whichever had the
+                smallest combined (axis_dev + angle_dev).
+            'axis_dev_deg', 'angle_dev_deg' : float
+                Deviations for best_condition.
+            'checks' : dict {condition_name: dict}
+                All three conditions' results, each with 'axis_dev_deg',
+                'angle_dev_deg', 'is_match', 'variant_idx' (which of the 12
+                equivalent target vectors gave the smallest axis deviation).
+            'axis' : (3,) ndarray
+                Extracted rotation axis (unit vector) of M_fwd.
+            'angle_deg' : float
+                Extracted rotation angle of M_fwd.
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
+            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
+
+        phase_a = self.data.phase_names[self.cluster_phases_id[cluster_a]]
+        phase_b = self.data.phase_names[self.cluster_phases_id[cluster_b]]
+        if phase_a != phase_b:
+            print(f"Warning: cluster {cluster_a} (phase {phase_a}) and cluster {cluster_b} "
+                f"(phase {phase_b}) are different phases; twin relationships are only "
+                f"meaningful within a single phase.")
+
+        G1 = self.avg_orientations[cluster_a]
+        G2 = self.avg_orientations[cluster_b]
+        M = G2 @ G1.T
+
+        twin_data = self.data.twinSys[system][mode]
+        n1_a = np.asarray(twin_data['n1_a'], dtype=float)      # (12, 3)
+        a1_a = np.asarray(twin_data['a1_a'], dtype=float)      # (12, 3)
+        n2_a = np.asarray(twin_data['n2_a'], dtype=float)      # (12, 3)
+        shear_angle = np.degrees(float(twin_data['shear_angle'][0]))
+
+        q = _R.from_matrix(M).as_quat()  # [x, y, z, w]
+        if q[3] < 0:
+            q = -q
+        w = np.clip(q[3], -1.0, 1.0)
+        angle = 2.0 * np.degrees(np.arccos(w))
+        s = np.sqrt(max(1.0 - w * w, 0.0))
+        axis = q[:3] / s if s > 1e-8 else np.array([0.0, 0.0, 1.0])
+
+        def _condition(target_axes, target_angle):
+            T = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
+            cosang = np.clip(np.abs(T @ axis), -1.0, 1.0)
+            axis_devs = np.degrees(np.arccos(cosang))
+            variant_idx = int(np.argmin(axis_devs))
+            axis_dev = float(axis_devs[variant_idx])
+            angle_dev = abs(angle - target_angle)
+            return {
+                'axis_dev_deg': axis_dev,
+                'angle_dev_deg': angle_dev,
+                'is_match': (axis_dev < tol_deg) and (angle_dev < tol_deg),
+                'variant_idx': variant_idx,
+            }
+
+        checks = {
+            'K1_180': _condition(n1_a, 180.0),
+            'eta1_180': _condition(a1_a, 180.0),
+            'K2_shear': _condition(n2_a, shear_angle),
+        }
+
+        best_condition = min(checks, key=lambda k: checks[k]['axis_dev_deg'] + checks[k]['angle_dev_deg'])
+        
+        return {
+            'cluster_a': cluster_a,
+            'cluster_b': cluster_b,
+            'system': system,
+            'mode': mode,
+            'is_match': any(v['is_match'] for v in checks.values()),
+            'best_condition': best_condition,
+            'axis_dev_deg': checks[best_condition]['axis_dev_deg'],
+            'angle_dev_deg': checks[best_condition]['angle_dev_deg'],
+            'checks': checks,
+            'axis': axis,
+            'angle_deg': angle,
+        }
 
     def map_twin_relationships(self, phase, system, modes, tol_deg=5.0, min_size=None,
+                                cluster_ids=None, print_result=False, print_matches_only=True,
+                                sort_by='deviation'):
+        """
+        ... (same docstring as before, plus:)
+
+        sort_by : {'deviation', 'size', 'cluster_id'}, optional
+            Sort order for the returned `matches` list (and, if
+            print_result=True, the printed table -- see print_twin_matches
+            for the same options applied independently there).
+            'deviation' (default): ascending combined (axis_dev + angle_dev)
+                -- tightest-fitting match first.
+            'size': descending average pixel size of the two matched
+                clusters ((size_a + size_b) / 2) -- largest reconstructed
+                grains first.
+            'cluster_id': ascending (cluster_a, cluster_b).
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if sort_by not in ('deviation', 'size', 'cluster_id'):
+            raise ValueError(f"sort_by must be 'deviation', 'size', or 'cluster_id', got {sort_by!r}")
+
+        if isinstance(modes, str):
+            modes = [modes]
+
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase])
+        cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+        if min_size is not None:
+            sizes = self.cluster_sizes
+            cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+
+        n = len(cluster_ids)
+        if n < 2:
+            if print_result:
+                print("Fewer than 2 clusters available; nothing to check.")
+            return [], []
+
+        sizes = self.cluster_sizes
+
+        G = np.array([self.avg_orientations[c] for c in cluster_ids])
+        pair_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        P = len(pair_idx)
+        ii = np.array([i for i, _ in pair_idx])
+        jj = np.array([j for _, j in pair_idx])
+
+        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
+
+        q = _R.from_matrix(M_fwd).as_quat()
+        flip = q[:, 3] < 0
+        q[flip] = -q[flip]
+        w = np.clip(q[:, 3], -1.0, 1.0)
+        angle = 2.0 * np.degrees(np.arccos(w))
+        s = np.sqrt(np.clip(1.0 - w * w, 0.0, None))
+        axis = np.divide(q[:, :3], s[:, None], out=np.zeros((P, 3)), where=s[:, None] > 1e-8)
+        axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])
+
+        def _condition_batch(target_axes, target_angle):
+            T = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
+            cosang = np.clip(np.abs(axis @ T.T), -1.0, 1.0)
+            axis_devs_all = np.degrees(np.arccos(cosang))
+            variant_idx = np.argmin(axis_devs_all, axis=1)
+            axis_dev = axis_devs_all[np.arange(P), variant_idx]
+            angle_dev = np.abs(angle - target_angle)
+            return axis_dev, angle_dev, variant_idx
+
+        checks_by_mode_all = {}
+        best_combined_per_mode = {}
+
+        shear_angle_by_mode = {}
+        for mode in modes:
+            twin_data = self.data.twinSys[system][mode]
+            n1_a = np.asarray(twin_data['n1_a'], dtype=float)
+            a1_a = np.asarray(twin_data['a1_a'], dtype=float)
+            n2_a = np.asarray(twin_data['n2_a'], dtype=float)
+            shear_angle = np.degrees(float(twin_data['shear_angle'][0]))
+            shear_angle_by_mode[mode] = shear_angle
+
+            conditions = {
+                'K1_180': _condition_batch(n1_a, 180.0),
+                'eta1_180': _condition_batch(a1_a, 180.0),
+                'K2_shear': _condition_batch(n2_a, shear_angle),
+            }
+            checks_by_mode_all[mode] = conditions
+
+            combined_stack = np.stack([conditions[k][0] + conditions[k][1] for k in conditions], axis=1)
+            cond_names = list(conditions.keys())
+            best_cond_idx = np.argmin(combined_stack, axis=1)
+            best_combined = combined_stack[np.arange(P), best_cond_idx]
+            best_combined_per_mode[mode] = (best_combined, best_cond_idx, cond_names)
+
+        stacked_mode_scores = np.stack([best_combined_per_mode[m][0] for m in modes], axis=1)
+        best_mode_idx = np.argmin(stacked_mode_scores, axis=1)
+
+        pairs_results = []
+        for p in range(P):
+            m = modes[best_mode_idx[p]]
+            best_combined, best_cond_idx, cond_names = best_combined_per_mode[m]
+            cond = cond_names[best_cond_idx[p]]
+            axis_dev_p, angle_dev_p, variant_idx_p = checks_by_mode_all[m][cond]
+
+            checks_by_mode = {}
+            for mm in modes:
+                checks_by_mode[mm] = {
+                    cn: {
+                        'axis_dev_deg': float(checks_by_mode_all[mm][cn][0][p]),
+                        'angle_dev_deg': float(checks_by_mode_all[mm][cn][1][p]),
+                        'variant_idx': int(checks_by_mode_all[mm][cn][2][p]),
+                    }
+                    for cn in checks_by_mode_all[mm]
+                }
+
+            cluster_a_id = int(cluster_ids[ii[p]])
+            cluster_b_id = int(cluster_ids[jj[p]])
+
+            pairs_results.append({
+                'cluster_a': cluster_a_id,
+                'cluster_b': cluster_b_id,
+                'size_a': int(sizes.get(cluster_a_id, 0)),
+                'size_b': int(sizes.get(cluster_b_id, 0)),
+                'best_mode': m,
+                'best_condition': cond,
+                'shear_angle_deg': shear_angle_by_mode[m],
+                'angle_deg': float(best_combined[p]),
+                'axis_dev_deg': float(axis_dev_p[p]),
+                'angle_dev_deg': float(angle_dev_p[p]),
+                'is_match': bool(axis_dev_p[p] < tol_deg and angle_dev_p[p] < tol_deg),
+                'variant_idx': int(variant_idx_p[p]),
+                'checks_by_mode': checks_by_mode,
+            })
+
+        matches = [r for r in pairs_results if r['is_match']]
+        matches = self._sort_twin_results(matches, sort_by)
+
+        if print_result:
+            to_print = matches if print_matches_only else self._sort_twin_results(pairs_results, sort_by)
+            self.print_twin_matches(to_print, sort_by=sort_by)
+
+        return pairs_results, matches
+
+
+    def _sort_twin_results(self, results, sort_by):
+        """
+        Shared sorting helper for twin-relationship result lists (used by
+        both map_twin_relationships and print_twin_matches, so the two stay
+        consistent).
+
+        Parameters
+        ----------
+        results : list of dict
+            pairs_results or matches entries, each with 'cluster_a',
+            'cluster_b', 'size_a', 'size_b', 'axis_dev_deg', 'angle_dev_deg'.
+        sort_by : {'deviation', 'size', 'cluster_id'}
+
+        Returns
+        -------
+        list of dict, sorted.
+        """
+        if sort_by == 'deviation':
+            return sorted(results, key=lambda r: r['axis_dev_deg'] + r['angle_dev_deg'])
+        elif sort_by == 'size':
+            return sorted(results, key=lambda r: -(r['size_a'] + r['size_b']) / 2.0)
+        elif sort_by == 'cluster_id':
+            return sorted(results, key=lambda r: (r['cluster_a'], r['cluster_b']))
+        else:
+            raise ValueError(f"sort_by must be 'deviation', 'size', or 'cluster_id', got {sort_by!r}")
+
+
+    def print_twin_matches(self, matches, sort_by='cluster_id'):
+        """
+        Print a formatted table of twin-relationship results.
+
+        Parameters
+        ----------
+        matches : list of dict
+            Either the 'matches' list from map_twin_relationships (filtered
+            to is_match=True) or the full 'pairs_results' list.
+        sort_by : {'deviation', 'size', 'cluster_id'}, optional
+            Sort order for the printed table. Default 'cluster_id'
+            (ascending cluster_a, then cluster_b). Independent of whatever
+            order `matches` was already in -- always re-sorted for display.
+            'deviation': ascending combined (axis_dev + angle_dev).
+            'size': descending average pixel size of the two clusters.
+        """
+
+        if not matches:
+            print("No pairs to display.")
+            return
+
+        ordered = self._sort_twin_results(matches, sort_by)
+
+        print(f"{'#':>4} {'Cluster A':>10} {'Px A':>8} {'Cluster B':>10} {'Px B':>8} {'Mode':>8} "
+            f"{'Condition':>10} {'Shear':>8} {'Axis dev':>10} {'Angle dev':>10} {'Match':>6}")
+        print("-" * 108)
+        for idx, m in enumerate(ordered):
+            match_str = 'yes' if m['is_match'] else 'no'
+            print(f"{idx:>4} {m['cluster_a']:>10} {m['size_a']:>8} {m['cluster_b']:>10} {m['size_b']:>8} "
+                f"{m['best_mode']:>8} {m['best_condition']:>10} {m['shear_angle_deg']:>7.2f}° "
+                f"{m['axis_dev_deg']:>9.2f}° {m['angle_dev_deg']:>9.2f}° {match_str:>6}")
+
+        n_match = sum(1 for m in matches if m['is_match'])
+        print(f"\n{n_match} matching pair(s) out of {len(matches)} shown.")        
+    def map_twin_relationships_ini2(self, phase, system, modes, tol_deg=5.0, min_size=None,
                                 cluster_ids=None):
         """
         Check the orientation relationship between EVERY pair of clusters
@@ -13945,7 +14919,315 @@ class EbsdHPAnalyzer():
         ax3.legend(fontsize=9)
         ax3.grid(axis='y', alpha=0.3)
         return fig, (ax1, ax2, ax3)
-    
+    # =============================================================================
+    #  hpstat.xlsx formatting patch for EbsdHPAnalyzer
+    # =============================================================================
+    #
+    #  HOW TO IMPLEMENT (3 steps):
+    #
+    #  STEP 1 - Add BOTH methods below (`_append_physical_ids_and_write` and
+    #           `_write_formatted_xlsx`) into the EbsdHPAnalyzer class, e.g. right
+    #           after export_results(). They are ordinary methods - paste as-is.
+    #
+    #  STEP 2 - In export_results(), find the existing Excel-export block
+    #           (currently ~lines 12181-12187):
+    #
+    #               # -- Export to Excel --
+    #               if export_xlsx is not None:
+    #                   import pandas as pd
+    #                   df = pd.DataFrame(restable)
+    #                   df.to_excel(str(export_xlsx), index=False)
+    #                   print(f"hpstat written to {export_xlsx}  "
+    #                       f"({len(df)} rows x {len(df.columns)} columns)")
+    #
+    #           and REPLACE it with this 3-line call (keep the same indentation):
+    #
+    #               # -- Export to Excel --
+    #               if export_xlsx is not None:
+    #                   self._append_physical_ids_and_write(
+    #                       restable, export_xlsx,
+    #                       parent_grain_groups, child_lamella_groups)
+    #
+    #  STEP 3 - Make sure `openpyxl` is installed (pandas' default .xlsx engine):
+    #               pip install openpyxl
+    #
+    #  Nothing in this file is commented-out code - both methods below are live.
+    #  Only the tiny call in STEP 2 has to be edited into export_results, because
+    #  it uses that method's local variables (restable, export_xlsx, ...).
+    # =============================================================================
+    def _append_physical_ids_and_write(self, restable, export_xlsx,
+                                    parent_grain_groups, child_lamella_groups):
+        """
+        Build the hpstat DataFrame from `restable`, insert the physical-grain and
+        physical-lamella IDs next to their cluster IDs, and write a formatted
+        .xlsx via _write_formatted_xlsx().
+
+        Clusters that were not part of the physical reconstruction (e.g. excluded
+        by reconstruct_physical_lamellas because they had no valid elongation) are
+        left blank in the physical-id columns.
+        """
+        import pandas as pd
+
+        df = pd.DataFrame(restable)
+
+        # invert the group dicts: fragment cluster id -> physical (root) id
+        au_cid_to_grain = {cid: root
+                        for root, frags in (parent_grain_groups or {}).items()
+                        for cid in frags}
+        ma_cid_to_lam   = {cid: root
+                        for root, frags in (child_lamella_groups or {}).items()
+                        for cid in frags}
+
+        if 'austenite parent cluster id' in df.columns:
+            df.insert(df.columns.get_loc('austenite parent cluster id') + 1,
+                    'physical grain id',
+                    [au_cid_to_grain.get(c) for c in df['austenite parent cluster id']])
+        if 'martensite child cluster id' in df.columns:
+            df.insert(df.columns.get_loc('martensite child cluster id') + 1,
+                    'physical lamella id',
+                    [ma_cid_to_lam.get(c) for c in df['martensite child cluster id']])
+
+        self._write_formatted_xlsx(df, export_xlsx)
+        print(f"hpstat written to {export_xlsx}  "
+            f"({len(df)} rows x {len(df.columns)} columns)")
+        return df
+
+
+    def _write_formatted_xlsx(self, df, path,
+                            decimals_mat=5, decimals_strain=4, max_col_width=48):
+        """
+        Write `df` to an .xlsx with:
+        - roi column moved to column E and frozen together with the ID columns,
+        - frozen header row + frozen ID columns (parent/grain/child/lamella/roi),
+        - auto-sized columns (capped) and matrix-row heights,
+        - 3x3 orientation matrices as three right-aligned fixed-digit rows in one
+            cell (monospace so digits line up),
+        - 3-vectors on a single right-aligned fixed-digit row,
+        - Miller indices / families as right-aligned integer triplets,
+        - plain numeric columns (Score, sizes, areas, lamella length/width, IDs,
+            LCV, order, strain) right-aligned with fixed decimals, kept numeric,
+        - gray/white row banding per (parent, child) interface, blue/green
+            colouring of the physical-id columns by value, and a two-tone roi
+            column with a divider between the two semi-ROIs.
+        """
+        import numpy as np
+        import pandas as pd
+        from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        MATRIX_COLS = {
+            'Parent cluster average orientation',
+            'Child cluster average orientation',
+            'Average orientation matrix of Austenite phase at the interface',
+            'Average orientation matrix of Martensite phase at the interface',
+        }
+        VECTOR_COLS = {
+            'Vector of the interface trace in the sample coordinate system',
+            'Vector of the normal of the interface trace in the sample coordinate system',
+            'Martensite child lamella principal direction in sample coordinate system',
+            'Martensite child lamella width perpendicular direction in the sample coordinate system',
+            'Unit vector of the habit plane of Austenite phase in the crystal coordinate system',
+            'Unit vector of the habit plane of Austenite phase in the sample coordinate system',
+            'Unit vector of the habit plane of Martensite phase in the crystal coordinate system',
+            'Unit vector of the habit plane of Martensite phase in the sample coordinate system',
+        }
+        MILLER_COLS = {
+            'Miller indices of the habit plane in Austenite phase',
+            'Unified symmetry equivalent Miller indices of the habit plane in Austenite phase',
+            'Miller indices of the habit plane in Martensite phase',
+            'Unified symmetry equivalent Miller indices of the habit plane in Martensite phase',
+        }
+        ID_COLS = ['austenite parent cluster id', 'physical grain id',
+                'martensite child cluster id', 'physical lamella id']
+        ROI_COL = 'roi (which side of the lamella)'
+        STRAIN_COL = 'Transformation strain [-] along sample [100] from the closest LCV'
+
+        INT_COLS = {
+            'austenite parent cluster id', 'physical grain id',
+            'martensite child cluster id', 'physical lamella id',
+            'Parent cluster size (px)', 'Child cluster size (px)',
+            'score order of the habit plane match',
+            'Closest theoretical martensite variant (LCV)',
+        }
+        FLOAT_DECIMALS = {
+            'Score': 2,
+            'Parent cluster area [um]': 2,
+            'Child cluster area [um]': 2,
+            'Martensite child lamella length': 2,
+            'Martensite child lamella width': 2,
+            STRAIN_COL: decimals_strain,
+        }
+        DEFAULT_FLOAT_DECIMALS = 3
+
+        fmt_f = f'%+.{decimals_mat}f'
+
+        def _is_numeric_col(series):
+            vals = [v for v in series if v is not None
+                    and not (isinstance(v, float) and v != v)]
+            if not vals:
+                return False
+            return all(isinstance(v, (int, float, np.integer, np.floating))
+                    and not isinstance(v, bool) for v in vals)
+
+        def _rows_to_block(rows):
+            strs = [[fmt_f % float(x) for x in row] for row in rows]
+            w = max((len(s) for r in strs for s in r), default=0)
+            return '\n'.join('  '.join(s.rjust(w) for s in r) for r in strs)
+
+        def _grid(v):
+            try:
+                a = np.asarray(v, dtype=float)
+                if a.ndim == 1:
+                    a = a.reshape(1, -1)
+                return _rows_to_block(a)
+            except (ValueError, TypeError):
+                return str(v)
+
+        def _miller(v):
+            try:
+                a = np.asarray(v).ravel()
+                if a.size == 0:
+                    return ''
+                return '  '.join(f'{int(round(float(x)))}' for x in a)
+            except (ValueError, TypeError):
+                return str(v)
+
+        # place the roi column right after the leading ID columns (-> column E)
+        df = df.copy()
+        id_present = [c for c in ID_COLS if c in df.columns]
+        if ROI_COL in df.columns and id_present:
+            order = list(df.columns)
+            order.remove(ROI_COL)
+            order.insert(order.index(id_present[-1]) + 1, ROI_COL)
+            df = df[order]
+
+        # build a display copy with formatted strings
+        disp = df.copy()
+        for col in disp.columns:
+            if col in MATRIX_COLS or col in VECTOR_COLS:
+                disp[col] = ['' if v is None else _grid(v) for v in df[col]]
+            elif col in MILLER_COLS:
+                disp[col] = ['' if v is None else _miller(v) for v in df[col]]
+
+        with pd.ExcelWriter(str(path), engine='openpyxl') as writer:
+            disp.to_excel(writer, index=False, sheet_name='hpstat')
+            ws = writer.sheets['hpstat']
+            cols = list(disp.columns)
+
+            mono     = Font(name='Consolas', size=10)
+            hfont    = Font(bold=True)
+            head_al  = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            right_al = Alignment(horizontal='right', vertical='center', wrap_text=True)
+            num_al   = Alignment(horizontal='right', vertical='center')
+
+            n_freeze = sum(c in cols for c in (ID_COLS + [ROI_COL]))
+            ws.freeze_panes = ws.cell(row=2, column=n_freeze + 1)
+
+            for j, col in enumerate(cols, start=1):
+                c = ws.cell(row=1, column=j)
+                c.font = hfont
+                c.alignment = head_al
+            ws.row_dimensions[1].height = 90
+
+            for j, col in enumerate(cols, start=1):
+                body_w = 0
+                for v in disp[col]:
+                    s = '' if v is None else str(v)
+                    for line in s.split('\n'):
+                        body_w = max(body_w, len(line))
+                head_w = max((len(t) for t in str(col).split(' ')), default=0)
+                width  = min(max(body_w, head_w, 6) + 2, max_col_width)
+                ws.column_dimensions[get_column_letter(j)].width = width
+
+            mono_cols = {c for c in cols
+                        if c in MATRIX_COLS or c in VECTOR_COLS or c in MILLER_COLS}
+            for j, col in enumerate(cols, start=1):
+                if col not in mono_cols:
+                    continue
+                for i in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=i, column=j)
+                    cell.font = mono
+                    cell.alignment = right_al
+
+            for j, col in enumerate(cols, start=1):
+                if col in mono_cols:
+                    continue
+                if not _is_numeric_col(df[col]):
+                    continue
+                if col in INT_COLS:
+                    nf = '0'
+                else:
+                    dec = FLOAT_DECIMALS.get(col, DEFAULT_FLOAT_DECIMALS)
+                    nf = '0' if dec == 0 else '0.' + '0' * dec
+                for i in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=i, column=j)
+                    cell.number_format = nf
+                    cell.alignment = num_al
+
+            for i in range(2, ws.max_row + 1):
+                ws.row_dimensions[i].height = 48
+
+            # ── Row banding + physical-group colouring ─────────────────────────
+            def _fill(hexrgb):
+                return PatternFill(start_color=hexrgb, end_color=hexrgb,
+                                fill_type='solid')
+
+            BAND = [_fill('FFFFFF'), _fill('F2F2F2')]           # white / light-gray
+            GRAIN_FILLS   = [_fill('DDEBF7'), _fill('BDD7EE')]  # blue pair
+            LAMELLA_FILLS = [_fill('E2EFDA'), _fill('C6E0B4')]  # green pair
+
+            pcol, ccol = 'austenite parent cluster id', 'martensite child cluster id'
+            gcol, lcol = 'physical grain id', 'physical lamella id'
+
+            # 1) alternate gray/white per contiguous (parent, child) interface block
+            if pcol in cols and ccol in cols:
+                band, prev = 0, object()
+                for i, (p, c) in enumerate(zip(disp[pcol], disp[ccol]), start=2):
+                    key = (p, c)
+                    if key != prev:
+                        band ^= 1
+                        prev = key
+                    for j in range(1, len(cols) + 1):
+                        ws.cell(row=i, column=j).fill = BAND[band]
+
+            # 2) colour the physical-id columns by value (same id -> same colour),
+            #    overriding the row band so the groups stand out.
+            def _colour_id_column(colname, fills):
+                if colname not in cols:
+                    return
+                j = cols.index(colname) + 1
+                order = {}
+                for v in disp[colname]:
+                    if v is not None and not (isinstance(v, float) and v != v) \
+                            and v not in order:
+                        order[v] = len(order)
+                for i, v in enumerate(disp[colname], start=2):
+                    if v is None or (isinstance(v, float) and v != v):
+                        continue
+                    ws.cell(row=i, column=j).fill = fills[order[v] % 2]
+
+            _colour_id_column(gcol, GRAIN_FILLS)
+            _colour_id_column(lcol, LAMELLA_FILLS)
+
+            # 3) distinguish the two lamella sides within an interface block:
+            #    colour the roi column (semi_roi_1 vs semi_roi_2) and draw a thin
+            #    divider on the row where the side flips but (parent, child) stays.
+            roicol = ROI_COL
+            ROI_FILLS = [_fill('E4DFEC'), _fill('CCC0DA')]      # lavender pair
+            _colour_id_column(roicol, ROI_FILLS)
+
+            if pcol in cols and ccol in cols and roicol in cols:
+                top_border = Border(top=Side(style='thin', color='999999'))
+                prev_key, prev_roi = object(), object()
+                for i, (p, c, r) in enumerate(
+                        zip(disp[pcol], disp[ccol], disp[roicol]), start=2):
+                    key = (p, c)
+                    if key == prev_key and r != prev_roi:
+                        for j in range(1, len(cols) + 1):
+                            ws.cell(row=i, column=j).border = top_border
+                    prev_key, prev_roi = key, r
+
+        return path
     def export_results(self, output_path,
                         parent_grain_groups=None,
                         parent_disor_matrix=None,
@@ -14022,6 +15304,8 @@ class EbsdHPAnalyzer():
         import json
         from pathlib import Path as _Path
         from collections import defaultdict
+
+    
 
         # ── Resolve: explicit > embedded on objects > default ─────────────
         def _resolve(explicit, *fallbacks, default=None):
@@ -14148,6 +15432,8 @@ class EbsdHPAnalyzer():
         hp_stats = self._collect_hp_stats(
             lamellar_child_clusters = lamellar_child_clusters,
             export_xlsx             = export_xlsx,
+            parent_grain_groups     = parent_grain_groups,   # add
+            child_lamella_groups    = child_lamella_groups,  # add
         )
 
         # ── Section: Schmid-factor analysis ──────────────────────────────
@@ -14303,7 +15589,7 @@ class EbsdHPAnalyzer():
         self.results = results
         return results    
     def _collect_hp_stats(self, lamellar_child_clusters=None,
-                        export_xlsx=None):
+                        export_xlsx=None, parent_grain_groups=None, child_lamella_groups=None):
         """
         Collect habit plane statistics directly from self.HP.
 
@@ -14523,11 +15809,15 @@ class EbsdHPAnalyzer():
 
         # ── Export to Excel ────────────────────────────────────────────────
         if export_xlsx is not None:
-            import pandas as pd
-            df = pd.DataFrame(restable)
-            df.to_excel(str(export_xlsx), index=False)
-            print(f"hpstat written to {export_xlsx}  "
-                f"({len(df)} rows × {len(df.columns)} columns)")
+            #import pandas as pd
+            #df = pd.DataFrame(restable)
+            #df.to_excel(str(export_xlsx), index=False)
+            #print(f"hpstat written to {export_xlsx}  "
+            #    f"({len(df)} rows × {len(df.columns)} columns)")
+            self._append_physical_ids_and_write(
+                   restable, export_xlsx,
+                   parent_grain_groups, child_lamella_groups)
+            print(f"hpstat written to {export_xlsx}  ")
 
         # ── Statistics summary ─────────────────────────────────────────────
         n_r1      = len(scores_r1)
@@ -16168,56 +17458,85 @@ class EbsdHPAnalyzer():
         story.append(Paragraph(
             '5. Variant Compatibility Analysis', s_h1))
 
-        if not vc or not vc_bnd:
+        vc_per_grain = vc.get('per_grain', []) if vc else []
+
+        if not vc or (not vc_per_grain and not vc_bnd):
             story.append(Paragraph(
                 'Variant compatibility analysis not available — '
                 'run hpa.analyse_variant_compatibility() first.',
                 s_body))
         else:
+            # ── Step 1: per-grain variant grouping (shown whenever present) ──
             story.append(Paragraph(
                 f'Within each physical grain, lamellae were grouped into '
                 f'crystallographically distinct martensite variants using a '
                 f'{params.get("ma_threshold_deg", 2.0)}° disorientation '
-                f'threshold. '
-                f'Mean variants per grain: '
+                f'threshold. Mean variants per grain: '
                 f'<b>{_fmt(vc_summary.get("mean_variants_per_grain"), 1)}</b> '
-                f'(max: {vc_summary.get("max_variants_per_grain","?")}). '
-                f'{vc_summary.get("n_boundary_pairs_analysed","?")} '
-                f'neighbouring grain pairs analysed. '
-                f'Compatible variant combinations (OR residual &lt; '
-                f'{params.get("or_preserved_deg", 3.0)}°) found at '
-                f'{vc_summary.get("n_compatible_boundaries","?")} boundaries '
-                f'({_fmt(vc_summary.get("pct_compatible_boundaries"), 0)}%).',
-                s_body))
-            story.append(_img(fig6_path))
-
-            # Meeting vs non-meeting table
-            vc_rows = [
-                ['Meeting pairs',
-                str(vc_meeting.get('n_meeting_pairs','?')),
-                _fmt(vc_meeting.get('meeting_min_or_mean'), 1) + '°',
-                _fmt(vc_meeting.get('meeting_min_or_median'), 1) + '°'],
-                ['Non-meeting pairs',
-                str(vc_meeting.get('n_nomeeting_pairs','?')),
-                _fmt(vc_meeting.get('nomeeting_min_or_mean'), 1) + '°',
-                _fmt(vc_meeting.get('nomeeting_min_or_median'), 1) + '°'],
-            ]
-            story.append(_tbl(
-                ['Group', 'N pairs', 'Mean min OR res', 'Median min OR res'],
-                vc_rows, col_widths=[5*cm, 2.5*cm, 3.5*cm, 3.5*cm]))
-            story.append(Spacer(1, 0.2*cm))
-            story.append(Paragraph(
-                f'<b>Statistical test:</b> '
-                f'{vc_meeting.get("interpretation", "—")}',
+                f'(max: {vc_summary.get("max_variants_per_grain","?")}).',
                 s_body))
 
-        story.append(PageBreak())
+            if vc_per_grain:
+                vg_rows = []
+                for g in vc_per_grain:
+                    for k, vg in enumerate(g.get('variant_groups', []), start=1):
+                        vg_rows.append([
+                            str(g.get('phys_grain_id', '?')),
+                            f'V{k}',
+                            str(vg.get('rep_cid', '?')),
+                            str(vg.get('n_members', '?')),
+                            (_fmt(vg.get('mean_strain'), 4)
+                             if vg.get('mean_strain') is not None else '—'),
+                        ])
+                story.append(_tbl(
+                    ['Phys. grain', 'Variant', 'Rep. lamella (cid)',
+                     'N lamellae', 'Mean strain'],
+                    vg_rows,
+                    col_widths=[2.8*cm, 2.0*cm, 3.6*cm, 2.4*cm, 3.2*cm]))
+                story.append(Spacer(1, 0.2*cm))
 
-        # Section 6: warnings  (renumber from 5 to 6)
+            # ── Step 2: cross-boundary compatibility (needs >= 2 grains) ──
+            if vc_bnd:
+                story.append(Paragraph(
+                    f'{vc_summary.get("n_boundary_pairs_analysed","?")} '
+                    f'neighbouring grain pairs analysed. '
+                    f'Compatible variant combinations (OR residual &lt; '
+                    f'{params.get("or_preserved_deg", 3.0)}°) found at '
+                    f'{vc_summary.get("n_compatible_boundaries","?")} boundaries '
+                    f'({_fmt(vc_summary.get("pct_compatible_boundaries"), 0)}%).',
+                    s_body))
+                if fig6_path:
+                    story.append(_img(fig6_path))
+
+                vc_rows = [
+                    ['Meeting pairs',
+                     str(vc_meeting.get('n_meeting_pairs','?')),
+                     _fmt(vc_meeting.get('meeting_min_or_mean'), 1) + '°',
+                     _fmt(vc_meeting.get('meeting_min_or_median'), 1) + '°'],
+                    ['Non-meeting pairs',
+                     str(vc_meeting.get('n_nomeeting_pairs','?')),
+                     _fmt(vc_meeting.get('nomeeting_min_or_mean'), 1) + '°',
+                     _fmt(vc_meeting.get('nomeeting_min_or_median'), 1) + '°'],
+                ]
+                story.append(_tbl(
+                    ['Group', 'N pairs', 'Mean min OR res', 'Median min OR res'],
+                    vc_rows, col_widths=[5*cm, 2.5*cm, 3.5*cm, 3.5*cm]))
+                story.append(Spacer(1, 0.2*cm))
+                story.append(Paragraph(
+                    f'<b>Statistical test:</b> '
+                    f'{vc_meeting.get("interpretation", "—")}',
+                    s_body))
+            else:
+                story.append(Paragraph(
+                    'Cross-boundary variant compatibility requires at least two '
+                    'neighbouring physical austenite grains; this scan '
+                    f'reconstructed {vc_summary.get("n_physical_grains","?")}, so '
+                    'only the per-grain variant grouping above is reported.',
+                    s_note))    
+
+        # Section 6: warnings
         story.append(Paragraph(
             '6. Methodological Notes and Warnings', s_h1))
-        # Section 5: warnings
-        story.append(Paragraph('Methodological Notes and Warnings', s_h1))
         for w in results.get('warnings', []):
             story.append(Paragraph(f'• {w}', s_note))
 
@@ -16620,10 +17939,11 @@ class EbsdHPAnalyzer():
             lines.append('')
 
         # ── Section 5: Variant compatibility ─────────────────────────────
-        vc      = results.get('variant_analysis', {})
-        vc_bnd  = vc.get('boundary_pairs', [])
-        vc_sum  = vc.get('summary', {})
-        vc_meet = vc.get('meeting_stats', {})
+        vc          = results.get('variant_analysis', {})
+        vc_bnd      = vc.get('boundary_pairs', [])
+        vc_sum      = vc.get('summary', {})
+        vc_meet     = vc.get('meeting_stats', {})
+        vc_pergrain = vc.get('per_grain', []) if vc else []
 
         lines += [
             r'\newpage',
@@ -16631,11 +17951,12 @@ class EbsdHPAnalyzer():
             '',
         ]
 
-        if not vc or not vc_bnd:
+        if not vc or (not vc_pergrain and not vc_bnd):
             lines.append(
                 r'Variant compatibility analysis not available --- '
                 r'run \texttt{hpa.analyse\_variant\_compatibility()} first.')
         else:
+            # Step 1: per-grain variant grouping (shown whenever present)
             lines += [
                 f'Within each physical grain, lamellae were grouped into '
                 f'crystallographically distinct martensite variants using a '
@@ -16643,46 +17964,83 @@ class EbsdHPAnalyzer():
                 f'disorientation threshold. '
                 f'Mean variants per grain: '
                 f'\\textbf{{{_fmt(vc_sum.get("mean_variants_per_grain"),1)}}} '
-                f'(max: {vc_sum.get("max_variants_per_grain","?")}). '
-                f'{vc_sum.get("n_boundary_pairs_analysed","?")} neighbouring '
-                f'grain pairs analysed. '
-                f'Compatible boundaries: '
-                f'{vc_sum.get("n_compatible_boundaries","?")} '
-                f'({_fmt(vc_sum.get("pct_compatible_boundaries"),0)}\\%).',
-                '',
-                _fig(fig_paths.get('fig6'),
-                    'Variant compatibility analysis: variants per grain, '
-                    'min OR residual for meeting vs non-meeting boundary '
-                    'pairs, and OR residual vs boundary character.',
-                    'fig:variant'),
-            ]
-
-            vc_rows = [
-                ['Meeting pairs',
-                str(vc_meet.get('n_meeting_pairs','?')),
-                f'{_fmt(vc_meet.get("meeting_min_or_mean"),1)}\\textdegree',
-                f'{_fmt(vc_meet.get("meeting_min_or_median"),1)}\\textdegree'],
-                ['Non-meeting pairs',
-                str(vc_meet.get('n_nomeeting_pairs','?')),
-                f'{_fmt(vc_meet.get("nomeeting_min_or_mean"),1)}\\textdegree',
-                f'{_fmt(vc_meet.get("nomeeting_min_or_median"),1)}\\textdegree'],
-            ]
-            lines += [
-                r'\begin{table}[htbp]',
-                r'  \centering',
-                r'  \caption{Variant compatibility: meeting vs non-meeting pairs}',
-                r'  \label{tab:variant_compat}',
-                '  ' + _tbl_tex(
-                    ['Group', 'N pairs',
-                    'Mean min OR res', 'Median min OR res'],
-                    vc_rows, 'lrrr'),
-                r'\end{table}',
-                '',
-                f'\\textbf{{Statistical test:}} '
-                f'\\textit{{{vc_meet.get("interpretation","—")}}}',
+                f'(max: {vc_sum.get("max_variants_per_grain","?")}).',
                 '',
             ]
 
+            if vc_pergrain:
+                vg_rows = []
+                for g in vc_pergrain:
+                    for k, vg in enumerate(g.get('variant_groups', []), start=1):
+                        vg_rows.append([
+                            str(g.get('phys_grain_id', '?')),
+                            f'V{k}',
+                            str(vg.get('rep_cid', '?')),
+                            str(vg.get('n_members', '?')),
+                            (_fmt(vg.get('mean_strain'), 4)
+                             if vg.get('mean_strain') is not None else '---'),
+                        ])
+                lines += [
+                    r'\begin{table}[htbp]',
+                    r'  \centering',
+                    r'  \caption{Per-grain martensite variant groups}',
+                    r'  \label{tab:variant_pergrain}',
+                    '  ' + _tbl_tex(
+                        ['Phys. grain', 'Variant', 'Rep. lamella (cid)',
+                         'N lamellae', 'Mean strain'],
+                        vg_rows, 'lllrr'),
+                    r'\end{table}',
+                    '',
+                ]
+
+            # Step 2: cross-boundary compatibility (needs >= 2 grains)
+            if vc_bnd:
+                lines += [
+                    f'{vc_sum.get("n_boundary_pairs_analysed","?")} neighbouring '
+                    f'grain pairs analysed. Compatible boundaries: '
+                    f'{vc_sum.get("n_compatible_boundaries","?")} '
+                    f'({_fmt(vc_sum.get("pct_compatible_boundaries"),0)}\\%).',
+                    '',
+                    _fig(fig_paths.get('fig6'),
+                        'Variant compatibility analysis: variants per grain, '
+                        'min OR residual for meeting vs non-meeting boundary '
+                        'pairs, and OR residual vs boundary character.',
+                        'fig:variant'),
+                ]
+
+                vc_rows = [
+                    ['Meeting pairs',
+                    str(vc_meet.get('n_meeting_pairs','?')),
+                    f'{_fmt(vc_meet.get("meeting_min_or_mean"),1)}\\textdegree',
+                    f'{_fmt(vc_meet.get("meeting_min_or_median"),1)}\\textdegree'],
+                    ['Non-meeting pairs',
+                    str(vc_meet.get('n_nomeeting_pairs','?')),
+                    f'{_fmt(vc_meet.get("nomeeting_min_or_mean"),1)}\\textdegree',
+                    f'{_fmt(vc_meet.get("nomeeting_min_or_median"),1)}\\textdegree'],
+                ]
+                lines += [
+                    r'\begin{table}[htbp]',
+                    r'  \centering',
+                    r'  \caption{Variant compatibility: meeting vs non-meeting pairs}',
+                    r'  \label{tab:variant_compat}',
+                    '  ' + _tbl_tex(
+                        ['Group', 'N pairs',
+                        'Mean min OR res', 'Median min OR res'],
+                        vc_rows, 'lrrr'),
+                    r'\end{table}',
+                    '',
+                    f'\\textbf{{Statistical test:}} '
+                    f'\\textit{{{vc_meet.get("interpretation","—")}}}',
+                    '',
+                ]
+            else:
+                lines += [
+                    r'Cross-boundary variant compatibility requires at least two '
+                    r'neighbouring physical austenite grains; this scan '
+                    f'reconstructed {vc_sum.get("n_physical_grains","?")}, so only '
+                    r'the per-grain variant grouping above is reported.',
+                    '',
+                ]
         # ── Section 6: warnings ───────────────────────────────────────────
         lines += [
             r'\newpage',
