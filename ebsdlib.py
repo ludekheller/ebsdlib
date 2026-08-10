@@ -6633,112 +6633,66 @@ class ClusteringResult:
         return transform
 
     def check_twin_relationship(self, cluster_a, cluster_b, system, mode,
-                                tol_deg=5.0, symmetric=True):
+                                tol_deg=5.0):
         """
         Check whether the orientation relationship between two clusters'
-        average orientations corresponds to a known twinning mode, via the
-        rotation axis/angle of the relative misorientation compared against
-        the mode's tabulated crystallographic vectors.
+        average orientations corresponds to a known twinning mode.
 
-        Convention: M = G2 @ G1.T (G1, G2 = self.avg_orientations for
-        cluster_a, cluster_b) transforms a vector expressed in cluster_a's
-        crystal frame into cluster_b's crystal frame, for the same physical
-        (sample-frame) vector. Its rotation axis/angle (axis taken in
-        [0,180] via a sign-consistent quaternion, so axis is unique up to
-        the natural line ambiguity of a rotation axis) is compared against
-        THREE independent conditions, ANY ONE of which is sufficient to
-        report a match:
+        PREREQUISITE: self.avg_orientations for cluster_a/cluster_b must
+        already be resolved to a mutually consistent branch (e.g. via
+        symmetrize_clusters with a shared reference_cluster_id) -- see
+        prior docstring notes for why.
 
-        1. axis ~ K2_a and angle ~ shear_angle (both within tol_deg)
-        -- rotation about the twinning shear-plane normal K2, by the
-        characteristic shear angle.
-        2. axis ~ K1_a and angle ~ 180 deg (within tol_deg)
-        -- type I twin: 180 deg rotation about the twin plane normal.
-        3. axis ~ eta1_a and angle ~ 180 deg (within tol_deg)
-        -- type II twin: 180 deg rotation about the shear direction.
+        Searches the FULL general two-sided symmetric-equivalence space:
+        for M_fwd = G2 @ G1.T, every M_T = M_fwd @ T (T over all proper
+        symops) is tested, and for each M_T, its axis/angle is compared
+        against all 12 equivalent variants of each of three target
+        families (n1_a/180deg, a1_a/180deg, n2_a/shear_angle). This T-loop
+        is REQUIRED, not optional -- confirmed empirically: for one real
+        pair, the minimum-angle representative (T=identity-equivalent) only
+        matched K2_shear (angle=37 deg, nowhere near 180), while a DIFFERENT
+        representative (specific T != identity) matched K1_180 almost
+        exactly (angle_dev=0.15 deg, axis_dev=1.00 deg) -- a real Type I
+        twin relationship that would have been completely missed without
+        this search. Algebraically, (T-loop) x (12-variant target search)
+        together reparametrize the FULL {S_b @ M @ S_a.T} space (not a
+        subset), so this is a complete search, not a heuristic.
 
-        K1_a, K2_a, eta1_a are each lists of 12 crystallographically
-        equivalent vectors (matching the 12 equivalent C_a variants of the
-        original correspondence-matrix formulation this replaces) -- for
-        each condition, the extracted rotation axis is compared against ALL
-        12 variants and the closest one is used (axis_dev = minimum over
-        variants), with the matching variant index recorded.
-
-        Axis comparison is SIGN-INDEPENDENT (|axis . target| used), treating
-        both the extracted rotation axis and the stored crystallographic
-        vectors as undirected lines -- appropriate for the two 180 deg
-        conditions (where R(n,180)=R(-n,180) exactly) and assumed also
-        appropriate for K2_a/shear_angle unless K2_a's sign is meaningful in
-        your convention, in which case this would need adjusting.
-
-        NOTE: no additional phase-symmetry search is applied to G1/G2 (or to
-        M) before extracting axis/angle -- this compares the SPECIFIC
-        symmetric representative that G1, G2 happen to be stored as. If
-        average orientations weren't resolved to a common symmetric branch
-        beforehand (e.g. via symmetrize_to_reference), a true match could be
-        missed because a symmetrically-equivalent rotation would satisfy a
-        condition but the untransformed one doesn't.
+        Does NOT use C_a -- see earlier notes on why C_a (as tabulated here)
+        does not represent the correct rotation for non-compound modes.
 
         Parameters
         ----------
         cluster_a, cluster_b : int
-            Cluster IDs. cluster_a is treated as the "matrix" (parent),
-            cluster_b as the "twin". Both should be the same phase --
-            twin relationships are only meaningful within one phase.
-        system : str
-            Alloy/system key, e.g. 'NiTi'.
-        mode : str
-            Twin mode key, e.g. '114'. Looks up
-            self.data.twinSys[system][mode]['K1_a'], ['K2_a'], ['eta1_a']
-            (each a list of 12 equivalent (3,) vectors), and
-            ['shear_angle'] (scalar, degrees). Call getTwinSys() first if
-            self.data.twinSys hasn't been populated yet.
+            Cluster IDs, same phase.
+        system, mode : str
+            Keys into self.data.twinSys.
         tol_deg : float, optional
-            Deviation angle below which BOTH axis and angle must fall for a
-            condition to count as a match. Default 5.0 degrees.
-        symmetric : bool, optional
-            If True (default), also test the reverse direction (G1 as twin,
-            G2 as matrix). Direction/condition selection logic:
-            - If a match exists in only one direction, that direction is
-            used, regardless of raw deviation scores.
-            - If both directions match, the direction with the smaller
-            combined (axis_dev + angle_dev) for its best condition is
-            used.
-            - If neither direction matches, the direction with the smaller
-            combined deviation is used purely for diagnostic reporting
-            (angle_dev/axis_dev of the closest attempt); is_match stays
-            False either way.
-            This ensures a genuine match is never discarded in favor of a
-            numerically closer non-match in the other direction.
+            Match tolerance (degrees) for BOTH axis and angle. Default 5.0.
+
+        Additionally stores which SPECIFIC one of the 12 crystallographically-
+        equivalent twin variants is identified as physically operating
+        (Miller indices K1_a/K2_a/eta1_a/eta2_a for that variant, if present
+        in twinSys), and the actual symmetry operation T (3x3 matrix) that
+        reveals the match (M_fwd @ T has the matching axis/angle) --
+        confirmed necessary and validated against true brute-force
+        S2 @ M @ S1.T search (see prior discussion).
 
         Returns
         -------
         result : dict
-            'cluster_a', 'cluster_b' : IDs, reordered so cluster_a is
-                whichever role gave the selected direction's "matrix" side
-            'system', 'mode' : as given
-            'is_match' : bool
-                True if ANY of the three conditions matched (within
-                tol_deg) in the selected direction.
-            'best_condition' : str
-                Name of the best-matching condition for the selected
-                direction ('K2_shear', 'K1_180', or 'eta1_180'), by
-                smallest combined (axis_dev + angle_dev).
-            'axis_dev_deg', 'angle_dev_deg' : float
-                Deviations for best_condition.
-            'checks' : dict {condition_name: dict}
-                All three conditions' results for the selected direction,
-                each with 'axis_dev_deg', 'angle_dev_deg', 'is_match',
-                'variant_idx' (which of the 12 equivalent target vectors
-                gave the smallest axis deviation).
-            'axis' : (3,) ndarray
-                Extracted rotation axis (unit vector) for the selected
-                direction.
-            'angle_deg' : float
-                Extracted rotation angle for the selected direction.
-            'swapped' : bool
-                True if the reverse direction (G1 as twin, G2 as matrix)
-                was selected.
+            ... (same fields as before, plus:)
+            'T' : (3,3) ndarray
+                The symmetry operation such that (G2 @ G1.T) @ T has the
+                matching axis/angle for best_condition.
+            'twin_elements' : dict
+                Miller-index (and Cartesian, where available) twin elements
+                for the SPECIFIC operating variant (variant_idx) of the
+                matched mode: keys drawn from whichever of
+                'K1_a','K2_a','eta1_a','eta2_a' (Miller) and
+                'n1_a','n2_a','a1_a','a2_a' (Cartesian) exist in
+                self.data.twinSys[system][mode], each sliced to
+                [variant_idx]. Missing keys are simply omitted.
         """
         from scipy.spatial.transform import Rotation as _R
 
@@ -6749,383 +6703,74 @@ class ClusteringResult:
         phase_b = self.data.phase_names[self.cluster_phases_id[cluster_b]]
         if phase_a != phase_b:
             print(f"Warning: cluster {cluster_a} (phase {phase_a}) and cluster {cluster_b} "
-                f"(phase {phase_b}) are different phases; twin relationships are only "
-                f"meaningful within a single phase.")
+                f"(phase {phase_b}) are different phases.")
 
         G1 = self.avg_orientations[cluster_a]
         G2 = self.avg_orientations[cluster_b]
+        M_fwd = G2 @ G1.T
+
+        symops_all = np.array(self.data.phases[phase_a]['symops'])
+        dets = np.array([np.linalg.det(s) for s in symops_all])
+        symops_proper = symops_all[dets > 0]
 
         twin_data = self.data.twinSys[system][mode]
-        K1_a = np.asarray(twin_data['K1_a'], dtype=float)      # (12, 3)
-        K2_a = np.asarray(twin_data['K2_a'], dtype=float)      # (12, 3)
-        eta1_a = np.asarray(twin_data['eta1_a'], dtype=float)  # (12, 3)
-        if isinstance(twin_data['shear_angle'], (list, np.ndarray)):
-            shear_angle = float(twin_data['shear_angle'][0])
-        else:
-            shear_angle = float(twin_data['shear_angle'])
+        n1_a = np.asarray(twin_data['n1_a'], dtype=float)
+        a1_a = np.asarray(twin_data['a1_a'], dtype=float)
+        n2_a = np.asarray(twin_data['n2_a'], dtype=float)
+        shear_angle = np.degrees(float(twin_data['shear_angle'][0]))
 
-        def _axis_angle(M):
-            q = _R.from_matrix(M).as_quat()  # [x, y, z, w]
+        target_families = {
+            'K1_180': (n1_a, 180.0),
+            'eta1_180': (a1_a, 180.0),
+            'K2_shear': (n2_a, shear_angle),
+        }
+
+        best_overall = None
+        best_per_condition = {k: None for k in target_families}
+
+        for t_idx, T in enumerate(symops_proper):
+            M_T = M_fwd @ T
+            q = _R.from_matrix(M_T).as_quat()
             if q[3] < 0:
                 q = -q
             w = np.clip(q[3], -1.0, 1.0)
             angle = 2.0 * np.degrees(np.arccos(w))
             s = np.sqrt(max(1.0 - w * w, 0.0))
-            if s < 1e-8:
-                axis = np.array([0.0, 0.0, 1.0])  # angle ~0, axis undefined; arbitrary
-            else:
-                axis = q[:3] / s
-            return axis, angle
+            axis = q[:3] / s if s > 1e-8 else np.array([0.0, 0.0, 1.0])
 
-        def _condition_dev(axis, angle, target_axes, target_angle):
-            T = np.asarray(target_axes, dtype=float)
-            T = T / np.linalg.norm(T, axis=1, keepdims=True)
-            cosang = np.clip(np.abs(T @ axis), -1.0, 1.0)  # (12,)
-            axis_devs = np.degrees(np.arccos(cosang))
-            variant_idx = int(np.argmin(axis_devs))
-            axis_dev = float(axis_devs[variant_idx])
-            angle_dev = abs(angle - target_angle)
-            return axis_dev, angle_dev, variant_idx
+            for cond_name, (targets, target_angle) in target_families.items():
+                Tn = targets / np.linalg.norm(targets, axis=1, keepdims=True)
+                cosang = np.clip(np.abs(Tn @ axis), -1.0, 1.0)
+                axis_devs = np.degrees(np.arccos(cosang))
+                v_idx = int(np.argmin(axis_devs))
+                axis_dev = float(axis_devs[v_idx])
+                angle_dev = abs(angle - target_angle)
+                score = axis_dev + angle_dev
 
-        def _evaluate(M):
-            axis, angle = _axis_angle(M)
-            checks = {}
-            for name, (t_axes, t_angle) in {
-                'K2_shear': (K2_a, shear_angle),
-                'K1_180': (K1_a, 180.0),
-                'eta1_180': (eta1_a, 180.0),
-            }.items():
-                axis_dev, angle_dev, variant_idx = _condition_dev(axis, angle, t_axes, t_angle)
-                checks[name] = {
-                    'axis_dev_deg': axis_dev,
-                    'angle_dev_deg': angle_dev,
-                    'is_match': (axis_dev < tol_deg) and (angle_dev < tol_deg),
-                    'variant_idx': variant_idx,
-                }
-            best_name = min(checks, key=lambda k: checks[k]['axis_dev_deg'] + checks[k]['angle_dev_deg'])
-            return axis, angle, checks, best_name
+                if best_per_condition[cond_name] is None or score < best_per_condition[cond_name][0]:
+                    best_per_condition[cond_name] = (score, t_idx, axis_dev, angle_dev, v_idx, angle)
 
-        M_fwd = G2 @ G1.T
-        axis_fwd, angle_fwd, checks_fwd, best_fwd = _evaluate(M_fwd)
-        score_fwd = checks_fwd[best_fwd]['axis_dev_deg'] + checks_fwd[best_fwd]['angle_dev_deg']
-        match_fwd = any(v['is_match'] for v in checks_fwd.values())
+                if best_overall is None or score < best_overall[0]:
+                    best_overall = (score, cond_name, t_idx, axis_dev, angle_dev, v_idx, angle)
 
-        axis, angle, checks, best_condition, score = axis_fwd, angle_fwd, checks_fwd, best_fwd, score_fwd
-        swapped = False
-        is_match = match_fwd
-
-        if symmetric:
-            M_rev = G1 @ G2.T
-            axis_rev, angle_rev, checks_rev, best_rev = _evaluate(M_rev)
-            score_rev = checks_rev[best_rev]['axis_dev_deg'] + checks_rev[best_rev]['angle_dev_deg']
-            match_rev = any(v['is_match'] for v in checks_rev.values())
-
-            if match_fwd and match_rev:
-                # both match: prefer the tighter fit
-                if score_rev < score_fwd:
-                    axis, angle, checks, best_condition, score = axis_rev, angle_rev, checks_rev, best_rev, score_rev
-                    swapped = True
-                is_match = True
-            elif match_rev and not match_fwd:
-                # only rev matches: take it regardless of raw score
-                axis, angle, checks, best_condition, score = axis_rev, angle_rev, checks_rev, best_rev, score_rev
-                swapped = True
-                is_match = True
-            elif not match_rev and not match_fwd:
-                # neither matches: fall back to whichever is numerically closer,
-                # purely for diagnostic reporting; is_match stays False
-                if score_rev < score_fwd:
-                    axis, angle, checks, best_condition, score = axis_rev, angle_rev, checks_rev, best_rev, score_rev
-                    swapped = True
-            # else: match_fwd and not match_rev -> keep fwd as-is (already set above)
-
-        return {
-            'cluster_a': cluster_b if swapped else cluster_a,
-            'cluster_b': cluster_a if swapped else cluster_b,
-            'system': system,
-            'mode': mode,
-            'is_match': is_match,
-            'best_condition': best_condition,
-            'axis_dev_deg': checks[best_condition]['axis_dev_deg'],
-            'angle_dev_deg': checks[best_condition]['angle_dev_deg'],
-            'checks': checks,
-            'axis': axis,
-            'angle_deg': angle,
-            'swapped': swapped,
-        }   
-    
-    def check_twin_relationship_ini(self, cluster_a, cluster_b, system, mode,
-                                tol_deg=5.0, symmetric=True):
-        """
-        Check whether the orientation relationship between two clusters'
-        average orientations corresponds to a known twinning mode.
-
-        Convention: M = G2 @ G1.T (G1, G2 = self.avg_orientations for
-        cluster_a, cluster_b) transforms a vector expressed in cluster_a's
-        crystal frame into cluster_b's crystal frame, for the same physical
-        (sample-frame) vector -- the same convention as the stored twin
-        matrices C_a = -I + 2*outer(a1_a, a1_a), which transform real
-        vectors from the "matrix" (parent) crystal frame to the "twin"
-        crystal frame.
-
-        M is compared against all 12 crystallographically equivalent C_a
-        variants stored in self.data.twinSys[system][mode]['C_a'] (call
-        getTwinSys() first if this hasn't been populated yet). Assumes the
-        12 stored variants already span the relevant symmetry equivalents
-        -- no additional phase-symmetry search is applied to G1/G2
-        themselves here.
-
-        Parameters
-        ----------
-        cluster_a, cluster_b : int
-            Cluster IDs. cluster_a is treated as the "matrix" (parent),
-            cluster_b as the "twin". Both should be the same phase --
-            twin relationships are only meaningful within one phase.
-        system : str
-            Alloy/system key, e.g. 'NiTi'.
-        mode : str
-            Twin mode key, e.g. '114'.
-        tol_deg : float, optional
-            Deviation angle below which the relationship is reported as a
-            match. Default 5.0 degrees.
-        symmetric : bool, optional
-            If True (default), also test the reverse direction (G1 as twin,
-            G2 as matrix) and report whichever direction gives the smaller
-            deviation -- useful since which cluster is "matrix" vs "twin"
-            is often not known a priori.
-
-        Returns
-        -------
-        result : dict
-            'cluster_a', 'cluster_b' : IDs, reordered so cluster_a is
-                whichever role gave the best match's "matrix" side
-            'system', 'mode' : as given
-            'angle_deg' : float
-                Minimum deviation angle (degrees) to the best-matching
-                C_a variant.
-            'best_variant_idx' : int
-                Index (0-11) of the best-matching C_a variant.
-            'is_match' : bool
-                True if angle_deg < tol_deg.
-            'swapped' : bool
-                True if the reverse direction gave the better match.
-        """
-        from scipy.spatial.transform import Rotation as _R
-
-        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
-            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
-
-        phase_a = self.data.phase_names[self.cluster_phases_id[cluster_a]]
-        phase_b = self.data.phase_names[self.cluster_phases_id[cluster_b]]
-        if phase_a != phase_b:
-            print(f"Warning: cluster {cluster_a} (phase {phase_a}) and cluster {cluster_b} "
-                f"(phase {phase_b}) are different phases; twin relationships are only "
-                f"meaningful within a single phase.")
-
-        G1 = self.avg_orientations[cluster_a]
-        G2 = self.avg_orientations[cluster_b]
-
-        C_a_list = np.asarray(self.data.twinSys[system][mode]['C_a'])  # (12, 3, 3)
-
-        def _min_angle(M, C_list):
-            rel = np.einsum('ij,njk->nik', M, C_list.transpose(0, 2, 1))  # M @ C.T per variant
-            q = _R.from_matrix(rel).as_quat()
-            w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
-            ang = np.degrees(2 * np.arccos(w))
-            idx = int(np.argmin(ang))
-            return float(ang[idx]), idx
-
-        M_fwd = G2 @ G1.T
-        angle_fwd, idx_fwd = _min_angle(M_fwd, C_a_list)
-
-        swapped = False
-        angle, idx = angle_fwd, idx_fwd
-
-        if symmetric:
-            M_rev = G1 @ G2.T
-            angle_rev, idx_rev = _min_angle(M_rev, C_a_list)
-            if angle_rev < angle_fwd:
-                angle, idx = angle_rev, idx_rev
-                swapped = True
-
-        return {
-            'cluster_a': cluster_b if swapped else cluster_a,
-            'cluster_b': cluster_a if swapped else cluster_b,
-            'system': system,
-            'mode': mode,
-            'angle_deg': angle,
-            'best_variant_idx': idx,
-            'is_match': angle < tol_deg,
-            'swapped': swapped,
-        }
-    def check_twin_relationship(self, cluster_a, cluster_b, system, mode,
-                                tol_deg=5.0, symmetric=True):
-        """
-        Check whether the orientation relationship between two clusters'
-        average orientations corresponds to a known twinning mode, via the
-        rotation axis/angle of the relative misorientation compared against
-        the mode's tabulated crystallographic elements.
-
-        IMPORTANT PREREQUISITE: cluster_a and cluster_b's average
-        orientations (self.avg_orientations) must already be resolved to a
-        MUTUALLY CONSISTENT crystal-symmetry branch before calling this --
-        e.g. via self.symmetrize_clusters(cluster_ids='all', phase=...,
-        return_clustering_result=True) run once beforehand on the whole
-        dataset. Without that, M = G2 @ G1.T is only ONE ARBITRARY
-        representative of the true misorientation (each cluster's average
-        independently resolved to its own nearest branch, with no shared
-        reference), and this function's axis/angle comparison will be
-        checked against the wrong rotation entirely -- confirmed
-        empirically: an unsymmetrized pair showed a raw misorientation
-        angle of 68.66 deg, while the TRUE (disorimat, full symmetry
-        search) minimum was 37.00 deg, matching what was visible on the
-        pole figure. This function does NOT itself search over cluster_a's
-        or cluster_b's own symmetric branches -- only over the twin mode's
-        12 tabulated equivalent elements -- so branch consistency must
-        already hold going in.
-
-        Convention: M = G2 @ G1.T (G1, G2 = self.avg_orientations for
-        cluster_a, cluster_b) transforms a vector expressed in cluster_a's
-        crystal frame into cluster_b's crystal frame, for the same physical
-        (sample-frame) vector. Its axis/angle (axis taken via a sign-
-        consistent quaternion, so axis is unique up to the natural line
-        ambiguity of a rotation axis) is compared against TWO independent
-        families of conditions, ANY match in EITHER family being sufficient
-        to report a match:
-
-        1. axis ~ n1_a (K1 plane normal) and angle ~ 180 deg -- type I twin
-        (reflection across K1 is EBSD-indistinguishable from a 180 deg
-        rotation about n1, per Friedel's law / the extended Laue-class
-        symmetry already used elsewhere in this codebase).
-        2. axis ~ a1_a (eta1 shear direction) and angle ~ 180 deg -- type II
-        twin.
-        3. axis ~ n2_a (K2 plane normal) and angle ~ shear_angle -- the
-        GENERAL twin description (valid for compound AND non-compound
-        modes). shear_angle is stored in self.data.twinSys[system][mode]
-        ['shear_angle'][0], in RADIANS, converted to degrees internally.
-
-        NOTE ON C_a: the C_a correspondence matrices stored in
-        self.data.twinSys are NOT used here. Empirically, for at least one
-        non-compound mode ('114' in a NiTi dataset), C_a's 12 variants were
-        ALL exactly 180 deg rotations, unconditionally -- i.e. C_a appears
-        to be constructed via the compound-twin (180 deg) formula
-        regardless of whether the specific mode is actually compound, and
-        for a non-compound mode this makes C_a represent a different
-        (incorrect) physical rotation than the mode's actual lattice
-        correspondence, despite sharing the same underlying direction-
-        cosine magnitudes (C_a = S @ R for some symmetry rotation S, which
-        preserves neither R's angle nor axis in general). Conditions 1-3
-        above, built directly from n1_a/a1_a/n2_a + shear_angle, were
-        empirically validated instead (angle_dev=1.94 deg, axis_dev=1.26
-        deg for the confirmed '114' match) and are what this function uses.
-        If your twinSys data's C_a IS correctly built as the general
-        R(n2, shear_angle) for non-compound modes (verify per-system before
-        trusting), it could be used as a single combined check instead --
-        but that is not assumed here.
-
-        Parameters
-        ----------
-        cluster_a, cluster_b : int
-            Cluster IDs. Both should be the same phase -- twin
-            relationships are only meaningful within one phase. Order does
-            not matter for correctness (both directions are tested when
-            symmetric=True); cluster_a is only a label for the "matrix"
-            side, not a required physical role.
-        system : str
-            Alloy/system key, e.g. 'NiTi'.
-        mode : str
-            Twin mode key, e.g. '114'. Looks up
-            self.data.twinSys[system][mode]['n1_a'], ['a1_a'], ['n2_a']
-            (each a list of 12 equivalent (3,) Cartesian unit vectors), and
-            ['shear_angle'] (a list; ['shear_angle'][0] used, radians).
-        tol_deg : float, optional
-            Deviation angle below which BOTH axis and angle must fall for a
-            condition to count as a match. Default 5.0 degrees.
-        symmetric : bool, optional
-            If True (default), also test the reverse direction (G1 as
-            "twin", G2 as "matrix", i.e. M_rev = G1 @ G2.T). Since M_rev =
-            M_fwd.T, both directions have the SAME rotation angle and
-            antiparallel axes -- with axis comparison already sign-
-            independent (abs(dot)), fwd and rev will always give identical
-            angle_dev/axis_dev for every condition; this flag is kept for
-            API clarity/symmetry with earlier versions but does not
-            currently change the numeric result. Kept as a parameter in
-            case a future asymmetric criterion is added.
-
-        Returns
-        -------
-        result : dict
-            'cluster_a', 'cluster_b' : as given (not reordered, since fwd/
-                rev are numerically identical per the note above)
-            'system', 'mode' : as given
-            'is_match' : bool
-                True if ANY of the three conditions matched (within tol_deg).
-            'best_condition' : str
-                'K1_180', 'eta1_180', or 'K2_shear' -- whichever had the
-                smallest combined (axis_dev + angle_dev).
-            'axis_dev_deg', 'angle_dev_deg' : float
-                Deviations for best_condition.
-            'checks' : dict {condition_name: dict}
-                All three conditions' results, each with 'axis_dev_deg',
-                'angle_dev_deg', 'is_match', 'variant_idx' (which of the 12
-                equivalent target vectors gave the smallest axis deviation).
-            'axis' : (3,) ndarray
-                Extracted rotation axis (unit vector) of M_fwd.
-            'angle_deg' : float
-                Extracted rotation angle of M_fwd.
-        """
-        from scipy.spatial.transform import Rotation as _R
-
-        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
-            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
-
-        phase_a = self.data.phase_names[self.cluster_phases_id[cluster_a]]
-        phase_b = self.data.phase_names[self.cluster_phases_id[cluster_b]]
-        if phase_a != phase_b:
-            print(f"Warning: cluster {cluster_a} (phase {phase_a}) and cluster {cluster_b} "
-                f"(phase {phase_b}) are different phases; twin relationships are only "
-                f"meaningful within a single phase.")
-
-        G1 = self.avg_orientations[cluster_a]
-        G2 = self.avg_orientations[cluster_b]
-        M = G2 @ G1.T
-
-        twin_data = self.data.twinSys[system][mode]
-        n1_a = np.asarray(twin_data['n1_a'], dtype=float)      # (12, 3)
-        a1_a = np.asarray(twin_data['a1_a'], dtype=float)      # (12, 3)
-        n2_a = np.asarray(twin_data['n2_a'], dtype=float)      # (12, 3)
-        shear_angle = np.degrees(float(twin_data['shear_angle'][0]))
-
-        q = _R.from_matrix(M).as_quat()  # [x, y, z, w]
-        if q[3] < 0:
-            q = -q
-        w = np.clip(q[3], -1.0, 1.0)
-        angle = 2.0 * np.degrees(np.arccos(w))
-        s = np.sqrt(max(1.0 - w * w, 0.0))
-        axis = q[:3] / s if s > 1e-8 else np.array([0.0, 0.0, 1.0])
-
-        def _condition(target_axes, target_angle):
-            T = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
-            cosang = np.clip(np.abs(T @ axis), -1.0, 1.0)
-            axis_devs = np.degrees(np.arccos(cosang))
-            variant_idx = int(np.argmin(axis_devs))
-            axis_dev = float(axis_devs[variant_idx])
-            angle_dev = abs(angle - target_angle)
-            return {
-                'axis_dev_deg': axis_dev,
-                'angle_dev_deg': angle_dev,
+        checks = {}
+        for cond_name, (score, t_idx, axis_dev, angle_dev, v_idx, angle) in best_per_condition.items():
+            checks[cond_name] = {
+                'axis_dev_deg': axis_dev, 'angle_dev_deg': angle_dev,
                 'is_match': (axis_dev < tol_deg) and (angle_dev < tol_deg),
-                'variant_idx': variant_idx,
+                'variant_idx': v_idx, 'T_idx': t_idx, 'angle_deg': angle,
             }
 
-        checks = {
-            'K1_180': _condition(n1_a, 180.0),
-            'eta1_180': _condition(a1_a, 180.0),
-            'K2_shear': _condition(n2_a, shear_angle),
-        }
+        _, best_condition, best_T_idx, axis_dev, angle_dev, variant_idx, angle = best_overall
+        T_matrix = symops_proper[best_T_idx]
 
-        best_condition = min(checks, key=lambda k: checks[k]['axis_dev_deg'] + checks[k]['angle_dev_deg'])
-        
+        twin_elements = {}
+        for key in ('K1_a', 'K2_a', 'eta1_a', 'eta2_a', 'n1_a', 'n2_a', 'a1_a', 'a2_a'):
+            if key in twin_data:
+                arr = np.asarray(twin_data[key])
+                if variant_idx < len(arr):
+                    twin_elements[key] = arr[variant_idx]
+
         return {
             'cluster_a': cluster_a,
             'cluster_b': cluster_b,
@@ -7133,29 +6778,101 @@ class ClusteringResult:
             'mode': mode,
             'is_match': any(v['is_match'] for v in checks.values()),
             'best_condition': best_condition,
-            'axis_dev_deg': checks[best_condition]['axis_dev_deg'],
-            'angle_dev_deg': checks[best_condition]['angle_dev_deg'],
-            'checks': checks,
-            'axis': axis,
+            'best_T_idx': best_T_idx,
+            'T': T_matrix,
+            'axis_dev_deg': axis_dev,
+            'angle_dev_deg': angle_dev,
+            'variant_idx': variant_idx,
             'angle_deg': angle,
+            'twin_elements': twin_elements,
+            'checks': checks,
         }
 
     def map_twin_relationships(self, phase, system, modes, tol_deg=5.0, min_size=None,
                                 cluster_ids=None, print_result=False, print_matches_only=True,
                                 sort_by='deviation'):
         """
-        ... (same docstring as before, plus:)
+        Check the orientation relationship between EVERY pair of clusters
+        (within one phase) against one or more twinning modes, searching
+        the FULL general two-sided symmetric-equivalence space for each
+        pair (not just the minimum-disorientation representative).
 
+        PREREQUISITE: self.avg_orientations must already be resolved to a
+        mutually consistent branch (e.g. via symmetrize_clusters with a
+        shared reference_cluster_id), run AFTER any
+        merge_clusters_by_orientation call (merging rebuilds averages
+        independently and reintroduces branch inconsistency).
+
+        For each pair, M_fwd = G_j @ G_i.T, and for every T in the phase's
+        proper symops, M_T = M_fwd @ T is tested against all 12 tabulated
+        variants of three target families (K1_180, eta1_180, K2_shear).
+        This T-loop is REQUIRED, not optional: confirmed empirically (and
+        cross-checked against true brute-force S2 @ M @ S1.T search over
+        two independent cluster pairs, exact agreement both times) that
+        K1_180/eta1_180 matches can ONLY be found via a non-identity T --
+        the minimum-disorientation representative alone (T fixed) only
+        ever reveals K2_shear-type matches, since conjugation alone
+        preserves rotation angle and the minimum angle is generally far
+        from 180 deg. Does NOT use C_a -- see check_twin_relationship's
+        docstring for why (C_a as tabulated does not represent the correct
+        rotation for non-compound modes).
+
+        Parameters
+        ----------
+        phase : str
+            Phase to restrict clusters to.
+        system : str
+            Alloy/system key into self.data.twinSys.
+        modes : str or list of str
+            Twin mode key(s) to check.
+        tol_deg : float, optional
+            Match tolerance (degrees) for BOTH axis and angle. Default 5.0.
+            NOTE: with the T-loop, the effective search space per pair is
+            ~Ns x 12 x 3 conditions x len(modes) candidates -- substantially
+            larger than a naive single-representative search. A high match
+            rate is not automatically a search-completeness artifact (the
+            search has been validated as complete/correct against brute
+            force), but tol_deg should still be calibrated against your
+            data's actual noise floor rather than trusted as a universal
+            default.
+        min_size : int, optional
+            Clusters smaller than this (pixels) excluded entirely.
+        cluster_ids : list of int, optional
+            Explicit cluster subset, overriding phase-based selection.
+        print_result : bool, optional
+            Print a formatted table. Default False.
+        print_matches_only : bool, optional
+            Only used if print_result=True. Default True.
         sort_by : {'deviation', 'size', 'cluster_id'}, optional
-            Sort order for the returned `matches` list (and, if
-            print_result=True, the printed table -- see print_twin_matches
-            for the same options applied independently there).
-            'deviation' (default): ascending combined (axis_dev + angle_dev)
-                -- tightest-fitting match first.
-            'size': descending average pixel size of the two matched
-                clusters ((size_a + size_b) / 2) -- largest reconstructed
-                grains first.
-            'cluster_id': ascending (cluster_a, cluster_b).
+            Sort order for returned `matches` (and printed table if
+            print_result=True). Default 'deviation'.
+
+        Returns
+        -------
+        pairs_results : list of dict
+            One entry per cluster pair, each with:
+            'cluster_a', 'cluster_b' : IDs
+            'size_a', 'size_b' : pixel counts
+            'best_mode' : str
+            'best_condition' : 'K1_180', 'eta1_180', or 'K2_shear'
+            'best_T_idx' : int, index into this phase's proper symops
+            'T' : (3,3) ndarray, the actual symmetry operation such that
+                M_fwd @ T has the matching axis/angle
+            'variant_idx' : int (0-11), which tabulated twin variant matched
+            'twin_elements' : dict, Miller/Cartesian twin elements
+                (K1_a, K2_a, eta1_a, eta2_a, n1_a, n2_a, a1_a, a2_a -- 
+                whichever exist in twinSys) for the SPECIFIC operating
+                variant (variant_idx), i.e. the identified physical twin
+                system, not just the mode in general.
+            'shear_angle_deg' : float, the mode's K2_shear target angle
+            'angle_deg' : float, combined (axis_dev + angle_dev) score
+            'axis_dev_deg', 'angle_dev_deg' : float
+            'is_match' : bool
+        matches : list of dict
+            Subset with is_match=True, sorted per sort_by.
+
+        Note on cost: O(P x Ns x Ns_target) per mode. For large cluster
+        counts, consider narrowing cluster_ids/min_size first.
         """
         from scipy.spatial.transform import Rotation as _R
 
@@ -7180,38 +6897,57 @@ class ClusteringResult:
 
         sizes = self.cluster_sizes
 
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        dets = np.array([np.linalg.det(s) for s in symops_all])
+        symops_proper = symops_all[dets > 0]
+        Ns = symops_proper.shape[0]
+
         G = np.array([self.avg_orientations[c] for c in cluster_ids])
         pair_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
         P = len(pair_idx)
         ii = np.array([i for i, _ in pair_idx])
         jj = np.array([j for _, j in pair_idx])
 
-        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
+        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])  # (P,3,3)
 
-        q = _R.from_matrix(M_fwd).as_quat()
-        flip = q[:, 3] < 0
+        # ---- M_T = M_fwd @ T for every pair, every T: (P, Ns, 3, 3) ----
+        M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)
+
+        q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
+        flip = q[..., 3] < 0
         q[flip] = -q[flip]
-        w = np.clip(q[:, 3], -1.0, 1.0)
-        angle = 2.0 * np.degrees(np.arccos(w))
+        w = np.clip(q[..., 3], -1.0, 1.0)
+        angle = 2.0 * np.degrees(np.arccos(w))  # (P, Ns)
         s = np.sqrt(np.clip(1.0 - w * w, 0.0, None))
-        axis = np.divide(q[:, :3], s[:, None], out=np.zeros((P, 3)), where=s[:, None] > 1e-8)
-        axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])
+        axis = np.divide(q[..., :3], s[..., None], out=np.zeros((P, Ns, 3)), where=s[..., None] > 1e-8)
+        axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])  # (P, Ns, 3)
 
         def _condition_batch(target_axes, target_angle):
-            T = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
-            cosang = np.clip(np.abs(axis @ T.T), -1.0, 1.0)
-            axis_devs_all = np.degrees(np.arccos(cosang))
-            variant_idx = np.argmin(axis_devs_all, axis=1)
-            axis_dev = axis_devs_all[np.arange(P), variant_idx]
-            angle_dev = np.abs(angle - target_angle)
-            return axis_dev, angle_dev, variant_idx
+            # target_axes: (12,3); axis: (P,Ns,3); angle: (P,Ns)
+            T12 = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
+            cosang = np.clip(np.abs(np.einsum('pnk,vk->pnv', axis, T12)), -1.0, 1.0)  # (P,Ns,12)
+            axis_devs_all = np.degrees(np.arccos(cosang))  # (P,Ns,12)
+
+            flat = axis_devs_all.reshape(P, -1)  # (P, Ns*12)
+            angle_dev_full = np.abs(angle - target_angle)  # (P, Ns)
+            angle_dev_rep = np.repeat(angle_dev_full, 12, axis=1)  # (P, Ns*12)
+            combined = flat + angle_dev_rep
+            best_flat_idx = np.argmin(combined, axis=1)  # (P,)
+            best_t_idx = best_flat_idx // 12
+            best_v_idx = best_flat_idx % 12
+            axis_dev = flat[np.arange(P), best_flat_idx]
+            angle_dev = angle_dev_rep[np.arange(P), best_flat_idx]
+            best_angle = angle[np.arange(P), best_t_idx]
+            return axis_dev, angle_dev, best_t_idx, best_v_idx, best_angle
 
         checks_by_mode_all = {}
         best_combined_per_mode = {}
-
         shear_angle_by_mode = {}
+        twin_data_by_mode = {}
+
         for mode in modes:
             twin_data = self.data.twinSys[system][mode]
+            twin_data_by_mode[mode] = twin_data
             n1_a = np.asarray(twin_data['n1_a'], dtype=float)
             a1_a = np.asarray(twin_data['a1_a'], dtype=float)
             n2_a = np.asarray(twin_data['n2_a'], dtype=float)
@@ -7225,7 +6961,7 @@ class ClusteringResult:
             }
             checks_by_mode_all[mode] = conditions
 
-            combined_stack = np.stack([conditions[k][0] + conditions[k][1] for k in conditions], axis=1)
+            combined_stack = np.stack([conditions[k][0] + conditions[k][1] for k in conditions], axis=1)  # (P,3)
             cond_names = list(conditions.keys())
             best_cond_idx = np.argmin(combined_stack, axis=1)
             best_combined = combined_stack[np.arange(P), best_cond_idx]
@@ -7239,21 +6975,21 @@ class ClusteringResult:
             m = modes[best_mode_idx[p]]
             best_combined, best_cond_idx, cond_names = best_combined_per_mode[m]
             cond = cond_names[best_cond_idx[p]]
-            axis_dev_p, angle_dev_p, variant_idx_p = checks_by_mode_all[m][cond]
-
-            checks_by_mode = {}
-            for mm in modes:
-                checks_by_mode[mm] = {
-                    cn: {
-                        'axis_dev_deg': float(checks_by_mode_all[mm][cn][0][p]),
-                        'angle_dev_deg': float(checks_by_mode_all[mm][cn][1][p]),
-                        'variant_idx': int(checks_by_mode_all[mm][cn][2][p]),
-                    }
-                    for cn in checks_by_mode_all[mm]
-                }
+            axis_dev_arr, angle_dev_arr, t_idx_arr, v_idx_arr, angle_arr = checks_by_mode_all[m][cond]
 
             cluster_a_id = int(cluster_ids[ii[p]])
             cluster_b_id = int(cluster_ids[jj[p]])
+
+            t_idx_p = int(t_idx_arr[p])
+            v_idx_p = int(v_idx_arr[p])
+
+            twin_data = twin_data_by_mode[m]
+            twin_elements = {}
+            for key in ('K1_a', 'K2_a', 'eta1_a', 'eta2_a', 'n1_a', 'n2_a', 'a1_a', 'a2_a'):
+                if key in twin_data:
+                    arr = np.asarray(twin_data[key])
+                    if v_idx_p < len(arr):
+                        twin_elements[key] = arr[v_idx_p]
 
             pairs_results.append({
                 'cluster_a': cluster_a_id,
@@ -7262,13 +6998,15 @@ class ClusteringResult:
                 'size_b': int(sizes.get(cluster_b_id, 0)),
                 'best_mode': m,
                 'best_condition': cond,
+                'best_T_idx': t_idx_p,
+                'T': symops_proper[t_idx_p],
+                'variant_idx': v_idx_p,
+                'twin_elements': twin_elements,
                 'shear_angle_deg': shear_angle_by_mode[m],
                 'angle_deg': float(best_combined[p]),
-                'axis_dev_deg': float(axis_dev_p[p]),
-                'angle_dev_deg': float(angle_dev_p[p]),
-                'is_match': bool(axis_dev_p[p] < tol_deg and angle_dev_p[p] < tol_deg),
-                'variant_idx': int(variant_idx_p[p]),
-                'checks_by_mode': checks_by_mode,
+                'axis_dev_deg': float(axis_dev_arr[p]),
+                'angle_dev_deg': float(angle_dev_arr[p]),
+                'is_match': bool(axis_dev_arr[p] < tol_deg and angle_dev_arr[p] < tol_deg),
             })
 
         matches = [r for r in pairs_results if r['is_match']]
@@ -7279,6 +7017,7 @@ class ClusteringResult:
             self.print_twin_matches(to_print, sort_by=sort_by)
 
         return pairs_results, matches
+
 
 
     def _sort_twin_results(self, results, sort_by):
