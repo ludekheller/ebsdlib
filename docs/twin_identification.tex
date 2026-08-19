@@ -1,0 +1,263 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{siunitx}
+
+\newcommand{\Kone}{K_1}
+\newcommand{\Ktwo}{K_2}
+\newcommand{\etaone}{\eta_1}
+\newcommand{\etatwo}{\eta_2}
+
+\title{Identification of Twin-Related Grain Pairs from EBSD Orientation Data}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Problem statement}
+
+Given two crystallographically indexed grains (clusters) with average
+orientation matrices $G_1, G_2$ (mapping sample coordinates to crystal
+coordinates), we wish to determine whether the pair is related by a
+specific twinning mode, defined by its crystallographic elements
+$\Kone$, $\Ktwo$, $\etaone$, $\etatwo$ (composition planes and shear
+directions) tabulated in a twin-system database for a set of $M$
+crystallographically equivalent variants of the mode.
+
+The variant count $M$ is not a free parameter: it is the size of the
+orbit of the twin-element tuple $(\Kone,\etaone)$ (or, more generally,
+the full tuple $(\Kone,\Ktwo,\etaone,\etatwo)$, depending on how the
+tabulation was generated) under the action of the phase's point group
+$\mathcal G$, of order $N_s$. By the orbit--stabiliser theorem,
+\begin{equation}
+  M = \frac{N_s}{|\mathrm{Stab}(\Kone,\etaone)|},
+\end{equation}
+so $M \le N_s$ always, with equality only when the stabiliser of the
+twin-element tuple is trivial. Different twin systems within the same
+point group can therefore have different $M$; $M$ must be taken as
+tabulated for each system rather than assumed. A concrete value of $M$
+is given for the worked example in Section~\ref{sec:example}.
+
+\section{Symmetry ambiguity of measured orientations}
+
+A crystal orientation is only ever known modulo the crystal's point group
+$\mathcal{G}$ (order $N_s$): for any $S \in \mathcal{G}$, $S G$ represents
+the same physical crystal. Consequently, if $G_1$ and $G_2$ are each
+independently resolved to \emph{some} representative (e.g.\ by an
+unconstrained least-squares average over the grain's pixels), the two
+representatives carry no guarantee of being labelled on
+\emph{mutually consistent} branches. The raw misorientation
+\begin{equation}
+  M = G_2 G_1^{\mathsf T}
+\end{equation}
+is then only \emph{one arbitrary member} of the physically equivalent set
+$\{\, S_2 G_2 (S_1 G_1)^{\mathsf T} : S_1,S_2 \in \mathcal G \,\}$, and its
+rotation angle need not be close to the true minimum disorientation
+between the two grains.
+
+\paragraph{Resolution.} Before any twin analysis, every cluster's
+average orientation (and, for consistency, its constituent pixel
+orientations) is re-expressed on a single symmetry branch chosen so as to
+minimise disorientation to one shared reference grain. This is a
+\emph{single} symmetry operation per cluster, applied uniformly to that
+cluster's average and to every one of its pixels -- never resolved
+independently per pixel, since an independent per-pixel search was found
+empirically to split a single physically coherent grain's pixels across
+several different branches when pixel-level measurement noise straddles
+a branch boundary. A concrete instance of both this failure mode and its
+fix is given in Section~\ref{sec:example}.
+
+\section{Twin conditions used}
+
+A twinning operation can be described, for a Type~I twin, as a
+$\SI{180}{\degree}$ rotation about the $\Kone$ plane normal $n_1$
+(a reflection across $\Kone$ is experimentally indistinguishable from
+this rotation for a centrosymmetric crystal, by Friedel's law -- EBSD
+diffraction patterns cannot distinguish a crystal from its point-inverted
+enantiomorph, so the effective symmetry group used throughout is the
+extended (Laue-class) group, improper operations included). For a
+Type~II twin, the equivalent description is a $\SI{180}{\degree}$
+rotation about the $\etaone$ shear direction $a_1$. A third, general
+description (valid for compound and non-compound modes alike) is a
+rotation about the $\Ktwo$ plane normal $n_2$ by the mode's
+characteristic shear angle $\gamma$.
+
+All three conditions are checked:
+\begin{align}
+  \text{K1\_180:}\quad & \text{axis}(M) \parallel n_1, \quad \text{angle}(M) = \SI{180}{\degree} \\
+  \text{eta1\_180:}\quad & \text{axis}(M) \parallel a_1, \quad \text{angle}(M) = \SI{180}{\degree} \\
+  \text{K2\_shear:}\quad & \text{axis}(M) \parallel n_2, \quad \text{angle}(M) = \gamma
+\end{align}
+where $\text{axis}(M)$, $\text{angle}(M)$ are extracted from $M$ via a
+sign-consistent unit quaternion, and axis comparison is sign-independent
+($|\hat n \cdot \hat a|$), since a rotation axis and the tabulated
+crystallographic directions are each defined only up to line direction.
+
+All three conditions are always fully evaluated for every candidate pair
+(never short-circuited on the first match), and every condition
+satisfying the tolerance is reported, not only the single best. A pair
+for which K1\_180 and eta1\_180 are \emph{both} independently satisfied
+(generally via different representative rotations, see below) is a
+compound twin -- all three descriptions coincide exactly when the mode's
+$\Kone,\Ktwo,\etaone,\etatwo$ are all simultaneously rational; observing
+K1\_180, eta1\_180, and K2\_shear simultaneously satisfied for the same
+pair is accordingly the expected, confirmatory signature of a compound
+twin.
+
+\section{The representative-rotation problem}
+
+A subtlety was discovered during validation that is easy to miss: even
+after the branch-consistency fix above, comparing the \emph{minimum-angle}
+representative of $M$ against the $\SI{180}{\degree}$ conditions can fail
+to find a genuine Type~I/II relationship. This is because conjugation,
+$M \mapsto S M S^{\mathsf T}$, preserves rotation angle exactly and only
+rotates the axis; if the true minimum disorientation angle is far from
+$\SI{180}{\degree}$ (as it generically is), no amount of searching over
+conjugation alone will ever produce a $\SI{180}{\degree}$ candidate.
+
+The complete search requires a second, non-conjugation degree of freedom,
+distinct from the target-side variant search introduced above: for every
+proper $T \in \mathcal G$,
+\begin{equation}
+  M_T = M\,T
+\end{equation}
+is tested against the tabulated target directions (each already
+representing $M_{\text{var}}$ equivalent variants -- using $M_{\text{var}}$
+here to avoid clashing with the misorientation symbol $M$ -- so that
+testing $M_T$ against all $M_{\text{var}}$ stored variants is equivalent
+to an additional conjugation search on the target side). Algebraically,
+$M_T = G_2 (T^{\mathsf T} G_1)^{\mathsf T}$: this is exactly the same
+construction as $M$, but with $G_1$ replaced by the equally-valid
+symmetric branch $T^{\mathsf T} G_1$. The $T$-loop combined with the
+target-variant search was confirmed, by direct comparison against a
+brute-force search over the complete two-sided set $\{S_2 M
+S_1^{\mathsf T} : S_1,S_2\in\mathcal G\}$, to reproduce the true global
+optimum exactly. A worked instance is given in Section~\ref{sec:example}.
+
+\section{Algorithm summary}
+
+For a candidate grain pair with (branch-consistent) average orientations
+$G_1, G_2$:
+\begin{enumerate}
+  \item Form $M = G_2 G_1^{\mathsf T}$.
+  \item For every proper symmetry operation $T$ of the phase:
+  \begin{enumerate}
+    \item Form $M_T = M T$ and extract its rotation axis and angle.
+    \item For each of the three target families ($n_1$, $a_1$, $n_2$;
+      each with $M_{\text{var}}$ tabulated equivalent variants): find
+      the variant minimising the combined axis and angle deviation from
+      the condition's target axis and target angle
+      ($\SI{180}{\degree}$ for K1\_180/eta1\_180, $\gamma$ for K2\_shear).
+  \end{enumerate}
+  \item For each condition, retain the globally best $(T, \text{variant})$
+    pair found over the full search.
+  \item Report the pair as a match for a given condition if both the
+    axis and angle deviations fall below a tolerance
+    $\text{tol}=\SI{5}{\degree}$ (default); report \emph{all} conditions
+    satisfying this, not only the single best.
+\end{enumerate}
+
+For $N$ candidate grains this is applied to every unordered pair
+($\binom{N}{2}$ total), vectorised across pairs, symmetry operations, and
+target variants. The cost per pair scales as $O(N_s \times
+M_{\text{var}})$ per condition.
+
+\paragraph{Relation to a naive brute-force search.} A brute-force search
+of the complete two-sided symmetric-equivalence set against a single
+fixed target vector, without using the tabulated variants at all, would
+require looping $S_1$ and $S_2$ independently over the full point group,
+i.e.\ $O(N_s^2)$ candidate evaluations. Looping only over the $M$
+distinct tabulated variants instead of over all $N_s$ raw symmetry
+operations on the target side is exact and lossless, not an
+approximation: by construction the $M$ variants are precisely the
+distinct images produced by the $N_s$ operations acting on the twin
+element tuple, so iterating the $M$ pre-computed variants reproduces the
+identical set of comparisons that iterating all $N_s$ raw operations
+would produce, with the redundant (duplicate-image) evaluations already
+removed. The $T$-loop-plus-variant-search cost is therefore smaller than
+the naive $O(N_s^2)$ brute force by a factor
+\begin{equation}
+  \frac{N_s^2}{N_s \, M_{\text{var}}} = \frac{N_s}{M_{\text{var}}}
+  = |\mathrm{Stab}(\Kone,\etaone)|,
+\end{equation}
+i.e.\ exactly the stabiliser order of the twin-element tuple. Twin
+systems with a small number of unique variants $M_{\text{var}}$ (a large
+stabiliser) are therefore searched proportionally faster; the search is
+never more expensive than, and is equal to, the brute-force cost only in
+the worst case $M_{\text{var}} = N_s$ (trivial stabiliser).
+
+\section{Worked example: the \{114\} austenite twinning mode in NiTi}
+\label{sec:example}
+
+The general method above is illustrated with the $\{114\}$ deformation
+twin mode in B2 (austenite) NiTi, generated from the tabulated primary
+variant
+\begin{equation}
+  \etaone = [1\,2\,2],\qquad \Kone = (\bar 4\,1\,1),
+\end{equation}
+expressed in the crystal's real-space and reciprocal-space bases
+respectively, converted to Cartesian unit vectors $a_1, n_1$ via the
+phase's structure matrices. The remaining $M-1$ equivalent variants are
+generated by applying every proper cubic symmetry operation
+($N_s = 24$) to the tuple $(\Kone,\Ktwo,\etaone,\etatwo)$ and retaining
+only genuinely distinct results -- two candidates are treated as
+equivalent if \emph{either} their $\Kone$ \emph{or} their $\etaone$
+coincide (up to sign) with an already-retained variant. This is a
+coarser equivalence than a single-vector orbit (which, checked directly
+for $n_1$ alone, has orbit size $3$ under the $24$ proper rotations, not
+$M$), consistent with the general bound $M \le N_s$ derived above; for
+this system the generation algorithm yields $M = 12$, i.e.\ a search
+cost reduction of a factor $N_s/M_{\text{var}} = 24/12 = 2$ relative to
+the naive $O(N_s^2)$ brute-force search, per the general result above.
+
+\paragraph{Branch-consistency failure, observed.} On real EBSD data, one
+grain pair's independently-resolved (unsymmetrized) average orientations
+gave a raw misorientation angle of \SI{68.66}{\degree}; after resolving
+both grains to branches consistent with a shared reference, the same
+pair's misorientation was \SI{37.00}{\degree}, matching the true minimum
+disorientation and the value visible directly on the pair's measured
+pole figures. Separately, for one cluster, independent per-pixel branch
+resolution (rather than the single-symmetry-operation-per-cluster
+approach specified above) was found to split its $1408$ pixels across
+$6$ distinct branches, despite an internal pixel-to-pixel orientation
+spread of only $\approx\SI{6}{\degree}$ once resolved consistently --
+confirming the branch ambiguity is a real, non-negligible effect on this
+class of data, not a theoretical concern only.
+
+\paragraph{Representative-rotation search, observed.} For a confirmed
+grain pair, the minimum-angle representative of $M$ had rotation angle
+$\approx\SI{37}{\degree}$, matching the K2\_shear description (axis
+deviation \SI{1.28}{\degree}, angle deviation \SI{1.83}{\degree}) -- but
+this angle is nowhere near \SI{180}{\degree}, so neither K1\_180 nor
+eta1\_180 could match via conjugation alone at this representative. The
+$T$-loop search found a specific alternative representative matching
+K1\_180 with axis deviation \SI{1.00}{\degree} and angle deviation
+\SI{0.15}{\degree} -- an essentially exact Type~I twin relationship,
+confirmed independently by brute-force search over the complete
+two-sided symmetric-equivalence set, and consistent with the pair's
+directly observed coincident $\{114\}$ pole on the measured pole
+figures. A second, independently checked grain pair was found to satisfy
+K1\_180, eta1\_180, \emph{and} K2\_shear simultaneously, each via its own
+representative rotation $T$ -- the expected signature of a compound
+twin, per Section~3.
+
+\section{Tolerance and interpretation}
+
+Because the search evaluates, per pair and per condition, $N_s \times
+M_{\text{var}}$ candidate rotations (of order several hundred), a
+nominal tolerance tuned for a much smaller search (e.g.\ the original
+target-variant-only search) is not automatically appropriate once the
+$T$-loop is included: the enlarged search finds the true global optimum
+rather than an artifact of incomplete search, but the achievable minimum
+deviation under \emph{no} true relationship also shrinks as the number
+of candidates grows. The tolerance should therefore be calibrated
+against the specific dataset's orientation-measurement noise floor
+(typically a few degrees for EBSD) rather than treated as a universal
+constant, and the reported deviation values should be inspected directly
+(e.g.\ sorted by deviation) rather than relying solely on a hard
+pass/fail cutoff.
+
+\end{document}

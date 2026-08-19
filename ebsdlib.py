@@ -219,8 +219,45 @@ def rebuild_dataEBSD(recipe):
               "dataEBSD.set_rois() before using the restored pipeline.")
     return d
  
- 
 
+def _generate_low_index_uvw_directions(max_index=3):
+    """
+    Enumerate primitive (gcd-reduced) integer DIRECTION triples [uvw]
+    with components in [-max_index, max_index], excluding the zero
+    vector and non-primitive duplicates (e.g. [2,0,0] is the same
+    direction as [1,0,0]).
+
+    Named uvw (real-space direction), not hkl (reciprocal-space plane
+    normal), since these are converted via the phase's real-space
+    structure matrix L, not its reciprocal Lr -- see
+    identify_kink_axis/check_kink_relationship, which are direction
+    (rotation axis) searches, not plane searches.
+
+    Note: many enumerated triples are coordinate permutations/sign
+    variants of each other and belong to the SAME symmetric family
+    under the phase's point group (e.g. [1,1,0], [1,0,1], [0,1,1] are
+    all <110>-type). This is expected and NOT a source of redundant
+    weighting downstream: callers that expand each candidate to its
+    full symmetric family and deduplicate by family membership (as
+    identify_kink_axis does) will naturally collapse permutation-
+    related candidates into a single tested family.
+    """
+    from math import gcd
+    seen = set()
+    out = []
+    for h in range(-max_index, max_index + 1):
+        for k in range(-max_index, max_index + 1):
+            for l in range(-max_index, max_index + 1):
+                if h == 0 and k == 0 and l == 0:
+                    continue
+                g = gcd(gcd(abs(h), abs(k)), abs(l))
+                if g > 1:
+                    continue
+                key = (h, k, l)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+    return out
 # -----------------------------------------------------------------------------
 #  ROI selection helpers (interactive once, then persisted in the recipe)
 # -----------------------------------------------------------------------------
@@ -6631,6 +6668,728 @@ class ClusteringResult:
                 R_twist = _R.from_rotvec(-current_angle * z).as_matrix()
                 transform = R_twist @ transform
         return transform
+    
+
+    def check_kink_relationship(self, cluster_a, cluster_b, phase, axes, tol_deg=5.0,
+                                expand_symmetric=True):
+        """
+        Check whether the misorientation between two clusters' average
+        orientations corresponds to a KINK relationship about one of a
+        given list of candidate rotation axes (Miller-index directions,
+        uvw).
+
+        Uses the SAME T-loop + symmetric-family search validated for
+        check_twin_relationship: for M = G2 @ G1.T, every M_T = M @ T (T
+        over all proper symops) is tested, since M_T for ANY T is an
+        equally valid relabeling of the SAME physical grain-pair
+        relationship. Each candidate axis is expanded to its full symmetric
+        family before matching. Comparison is SIGNED (rotation sense is
+        treated as physically meaningful).
+
+        IMPORTANT: with the T-loop unconstrained by any target angle, the
+        single BEST (T, axis) combination found by argmin(axis_dev) can be
+        a crystallographically MEANINGLESS coincidence that happens to beat
+        a real, physically meaningful match on raw axis-alignment tightness
+        alone -- confirmed on real data: for one grain pair with a known
+        genuine ~42 deg K2_shear twin relationship (axis_dev~2.9 deg), the
+        single-best search instead returned an unrelated match at
+        axis_dev~1.1 deg but angle~138 deg, silently burying the real one.
+        For this reason, ALL (T, variant) combinations satisfying tol_deg
+        are now returned (not just the single best) via
+        'all_matches_by_axis', sorted by axis_dev ascending -- inspect this
+        list rather than trusting 'best_axis_idx'/'kink_angle_deg' alone
+        when more than one match exists for an axis.
+
+        PREREQUISITE: self.avg_orientations for cluster_a/cluster_b must
+        already be resolved to a mutually consistent branch.
+
+        Parameters
+        ----------
+        cluster_a, cluster_b : int
+            Cluster IDs, same phase.
+        phase : str
+            Phase for symops/L lookup.
+        axes : list of array-like (3,)
+            Candidate kink axes, Miller-index DIRECTIONS (uvw), converted
+            to Cartesian via self.data.phases[phase]['L'].
+        tol_deg : float, optional
+            Axis-only match tolerance (degrees). Default 5.0.
+        expand_symmetric : bool, optional
+            Expand each input axis to its symmetrically-equivalent family
+            before matching. Default True.
+
+        Returns
+        -------
+        result : dict
+            'cluster_a', 'cluster_b', 'phase'
+            'is_match' : bool
+            'matched_axes' : list of int, indices into `axes` with at least
+                one match satisfying tol_deg
+            'best_axis_idx' : int
+            'best_axis_uvw' : the Miller-index vector as given
+            'kink_angle_deg' : float, angle of the SINGLE best (T, variant)
+                match -- see the warning above; prefer 'all_matches_by_axis'
+            'axis_dev_deg' : float, for the single best match
+            'variant_cartesian' : (3,) ndarray, for the single best match
+            'best_T_idx' : int
+            'T' : (3,3) ndarray
+            'all_matches_by_axis' : dict {axis_idx: list of dict}
+                EVERY (T, variant) combination satisfying tol_deg for that
+                axis, each {'axis_dev_deg', 'kink_angle_deg', 'T_idx',
+                'variant_cartesian'}, sorted by axis_dev_deg ascending.
+            'checks' : dict {axis_idx: {single best per-axis result}}
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
+            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
+
+        G1 = self.avg_orientations[cluster_a]
+        G2 = self.avg_orientations[cluster_b]
+        M_fwd = G2 @ G1.T
+
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        dets = np.array([np.linalg.det(sm) for sm in symops_all])
+        symops_proper = symops_all[dets > 0]
+        L = np.asarray(self.data.phases[phase]['L'])
+
+        axis_families = []
+        for uvw in axes:
+            v = L.dot(np.asarray(uvw, dtype=float))
+            v = v / np.linalg.norm(v)
+            if expand_symmetric:
+                family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
+            else:
+                family = v[None, :]
+            axis_families.append(family)
+
+        best_overall = None
+        best_per_axis = [None] * len(axes)
+        all_matches = [[] for _ in axes]
+
+        for t_idx, T in enumerate(symops_proper):
+            M_T = M_fwd @ T
+            q = _R.from_matrix(M_T).as_quat()
+            if q[3] < 0:
+                q = -q
+            w = np.clip(q[3], -1.0, 1.0)
+            angle = 2.0 * np.degrees(np.arccos(w))
+            s = np.sqrt(max(1.0 - w * w, 0.0))
+            m_axis = q[:3] / s if s > 1e-8 else np.array([0.0, 0.0, 1.0])
+
+            for a_idx, family in enumerate(axis_families):
+                Fn = family / np.linalg.norm(family, axis=1, keepdims=True)
+                cosang = np.clip(Fn @ m_axis, -1.0, 1.0)  # SIGNED
+                devs = np.degrees(np.arccos(cosang))
+                v_idx = int(np.argmin(devs))
+                axis_dev = float(devs[v_idx])
+
+                if best_per_axis[a_idx] is None or axis_dev < best_per_axis[a_idx][0]:
+                    best_per_axis[a_idx] = (axis_dev, t_idx, v_idx, angle)
+                if best_overall is None or axis_dev < best_overall[0]:
+                    best_overall = (axis_dev, a_idx, t_idx, v_idx, angle)
+
+                if axis_dev < tol_deg:
+                    all_matches[a_idx].append((axis_dev, t_idx, v_idx, angle))
+
+        for a_idx in range(len(axes)):
+            all_matches[a_idx].sort(key=lambda x: x[0])
+
+        checks = {}
+        all_matches_by_axis = {}
+        for a_idx, (axis_dev, t_idx, v_idx, angle) in enumerate(best_per_axis):
+            checks[a_idx] = {
+                'axis_dev_deg': axis_dev,
+                'kink_angle_deg': angle,
+                'is_match': axis_dev < tol_deg,
+                'T_idx': t_idx,
+                'variant_cartesian': axis_families[a_idx][v_idx],
+            }
+            all_matches_by_axis[a_idx] = [
+                {'axis_dev_deg': ad, 'kink_angle_deg': ang, 'T_idx': ti,
+                'variant_cartesian': axis_families[a_idx][vi]}
+                for ad, ti, vi, ang in all_matches[a_idx]
+            ]
+
+        matched_axes = [a for a, v in checks.items() if v['is_match']]
+
+        axis_dev, best_axis_idx, best_T_idx, best_v_idx, kink_angle = best_overall
+        T_matrix = symops_proper[best_T_idx]
+
+        return {
+            'cluster_a': cluster_a,
+            'cluster_b': cluster_b,
+            'phase': phase,
+            'is_match': len(matched_axes) > 0,
+            'matched_axes': matched_axes,
+            'best_axis_idx': best_axis_idx,
+            'best_axis_uvw': axes[best_axis_idx],
+            'kink_angle_deg': kink_angle,
+            'axis_dev_deg': axis_dev,
+            'variant_cartesian': axis_families[best_axis_idx][best_v_idx],
+            'best_T_idx': best_T_idx,
+            'T': T_matrix,
+            'all_matches_by_axis': all_matches_by_axis,
+            'checks': checks,
+        }
+
+    def map_kink_relationships(self, phase, axes, tol_deg=5.0, min_size=None,
+                                cluster_ids=None, expand_symmetric=True,
+                                return_all_matches=False,
+                                print_result=False, print_matches_only=True,
+                                sort_by='deviation'):
+        """
+        Check the misorientation between EVERY pair of clusters (within one
+        phase) against a list of candidate kink axes (uvw), via the same
+        T-loop + symmetric-family search as check_kink_relationship,
+        vectorized across all pairs. Comparison is SIGNED.
+
+        IMPORTANT: same warning as check_kink_relationship -- the single
+        best (T, axis) combination per pair can be a crystallographically
+        meaningless coincidence that beats a real match on raw axis
+        tightness alone. Set return_all_matches=True to get every match per
+        pair/axis (not just the single best) for inspection; this costs
+        extra memory/time and defaults to False.
+
+        PREREQUISITE: same as map_twin_relationships.
+
+        Parameters
+        ----------
+        phase : str
+        axes : list of array-like (3,)
+            Candidate kink axes, Miller-index directions (uvw).
+        tol_deg : float, optional
+            Default 5.0.
+        min_size : int, optional
+        cluster_ids : list of int, optional
+        expand_symmetric : bool, optional
+            Default True.
+        return_all_matches : bool, optional
+            If True, each pair's dict also includes 'all_matches_by_axis'
+            (same structure as check_kink_relationship), computed from the
+            already-available (P,Ns,n_var) deviation arrays. Default False.
+        print_result, print_matches_only, sort_by : as in map_twin_relationships.
+
+        Returns
+        -------
+        pairs_results : list of dict
+            'cluster_a', 'cluster_b', 'size_a', 'size_b'
+            'best_axis_idx', 'best_axis_uvw'
+            'matched_axes' : list of int
+            'kink_angle_deg' : float, angle of the single best match (see warning)
+            'axis_dev_deg' : float
+            'best_T_idx' : int
+            'T' : (3,3) ndarray
+            'variant_cartesian' : (3,) ndarray
+            'is_match' : bool
+            'all_matches_by_axis' : only if return_all_matches=True
+        matches : list of dict
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if sort_by not in ('deviation', 'size', 'cluster_id'):
+            raise ValueError(f"sort_by must be 'deviation', 'size', or 'cluster_id', got {sort_by!r}")
+
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase])
+        cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+        if min_size is not None:
+            sizes = self.cluster_sizes
+            cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+
+        n = len(cluster_ids)
+        if n < 2:
+            if print_result:
+                print("Fewer than 2 clusters available; nothing to check.")
+            return [], []
+
+        sizes = self.cluster_sizes
+
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        dets = np.array([np.linalg.det(s) for s in symops_all])
+        symops_proper = symops_all[dets > 0]
+        Ns = symops_proper.shape[0]
+        L = np.asarray(self.data.phases[phase]['L'])
+
+        axis_families = []
+        for uvw in axes:
+            v = L.dot(np.asarray(uvw, dtype=float))
+            v = v / np.linalg.norm(v)
+            if expand_symmetric:
+                family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
+            else:
+                family = v[None, :]
+            axis_families.append(family)
+
+        G = np.array([self.avg_orientations[c] for c in cluster_ids])
+        pair_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        P = len(pair_idx)
+        ii = np.array([i for i, _ in pair_idx])
+        jj = np.array([j for _, j in pair_idx])
+
+        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
+        M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
+
+        q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
+        flip = q[..., 3] < 0
+        q[flip] = -q[flip]
+        w = np.clip(q[..., 3], -1.0, 1.0)
+        angle = 2.0 * np.degrees(np.arccos(w))  # (P, Ns)
+        s = np.sqrt(np.clip(1.0 - w * w, 0.0, None))
+        axis = np.divide(q[..., :3], s[..., None], out=np.zeros((P, Ns, 3)), where=s[..., None] > 1e-8)
+        axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])  # (P, Ns, 3)
+
+        per_axis_devs_all = []  # (P,Ns,n_var) per axis, kept if return_all_matches
+        per_axis_results = []   # (axis_dev(P,), t_idx(P,), v_idx(P,), angle(P,)) per axis
+
+        for family in axis_families:
+            n_var = family.shape[0]
+            Fn = family / np.linalg.norm(family, axis=1, keepdims=True)
+            cosang = np.clip(np.einsum('pnk,vk->pnv', axis, Fn), -1.0, 1.0)  # (P,Ns,n_var), SIGNED
+            devs_all = np.degrees(np.arccos(cosang))
+            if return_all_matches:
+                per_axis_devs_all.append(devs_all)
+
+            flat = devs_all.reshape(P, -1)
+            best_flat_idx = np.argmin(flat, axis=1)
+            best_t_idx = best_flat_idx // n_var
+            best_v_idx = best_flat_idx % n_var
+            axis_dev = flat[np.arange(P), best_flat_idx]
+            best_angle = angle[np.arange(P), best_t_idx]
+            per_axis_results.append((axis_dev, best_t_idx, best_v_idx, best_angle))
+
+        axis_dev_stack = np.stack([r[0] for r in per_axis_results], axis=1)  # (P, n_axes)
+        best_axis_idx_arr = np.argmin(axis_dev_stack, axis=1)
+
+        pairs_results = []
+        for p in range(P):
+            a_idx = int(best_axis_idx_arr[p])
+            axis_dev_arr, t_idx_arr, v_idx_arr, angle_arr = per_axis_results[a_idx]
+
+            matched_axes = [a for a in range(len(axes)) if per_axis_results[a][0][p] < tol_deg]
+
+            cluster_a_id = int(cluster_ids[ii[p]])
+            cluster_b_id = int(cluster_ids[jj[p]])
+            t_idx_p = int(t_idx_arr[p])
+            v_idx_p = int(v_idx_arr[p])
+
+            entry = {
+                'cluster_a': cluster_a_id,
+                'cluster_b': cluster_b_id,
+                'size_a': int(sizes.get(cluster_a_id, 0)),
+                'size_b': int(sizes.get(cluster_b_id, 0)),
+                'best_axis_idx': a_idx,
+                'best_axis_uvw': axes[a_idx],
+                'matched_axes': matched_axes,
+                'kink_angle_deg': float(angle_arr[p]),
+                'axis_dev_deg': float(axis_dev_arr[p]),
+                'best_T_idx': t_idx_p,
+                'T': symops_proper[t_idx_p],
+                'variant_cartesian': axis_families[a_idx][v_idx_p],
+                'is_match': bool(len(matched_axes) > 0),
+            }
+
+            if return_all_matches:
+                all_matches_by_axis = {}
+                for a2 in range(len(axes)):
+                    devs_all = per_axis_devs_all[a2]  # (P,Ns,n_var)
+                    mask = devs_all[p] < tol_deg       # (Ns, n_var)
+                    t_ids, v_ids = np.where(mask)
+                    entries = sorted(
+                        [{'axis_dev_deg': float(devs_all[p, ti, vi]),
+                        'kink_angle_deg': float(angle[p, ti]),
+                        'T_idx': int(ti),
+                        'variant_cartesian': axis_families[a2][vi]}
+                        for ti, vi in zip(t_ids, v_ids)],
+                        key=lambda d: d['axis_dev_deg']
+                    )
+                    all_matches_by_axis[a2] = entries
+                entry['all_matches_by_axis'] = all_matches_by_axis
+
+            pairs_results.append(entry)
+
+        matches = [r for r in pairs_results if r['is_match']]
+
+        def _sort_kink(results, sb):
+            if sb == 'deviation':
+                return sorted(results, key=lambda r: r['axis_dev_deg'])
+            elif sb == 'size':
+                return sorted(results, key=lambda r: -(r['size_a'] + r['size_b']) / 2.0)
+            elif sb == 'cluster_id':
+                return sorted(results, key=lambda r: (r['cluster_a'], r['cluster_b']))
+
+        matches = _sort_kink(matches, sort_by)
+        if print_result:
+            to_print = matches if print_matches_only else _sort_kink(pairs_results, sort_by)
+
+            has_all_matches = return_all_matches and len(to_print) > 0 and 'all_matches_by_axis' in to_print[0]
+
+            if has_all_matches:
+                print(f"{'#':>4} {'Cluster A':>10} {'Px A':>8} {'Cluster B':>10} {'Px B':>8} "
+                    f"{'Axis idx':>9} {'Axis dev':>10} {'Kink angle':>11} {'T_idx':>6} {'Match':>6}")
+                print("-" * 92)
+                row = 0
+                for r in to_print:
+                    match_str = 'yes' if r['is_match'] else 'no'
+                    # every match, for every axis that satisfied tol_deg for this pair
+                    shown_any = False
+                    for a_idx in r['matched_axes']:
+                        for m in r['all_matches_by_axis'][a_idx]:
+                            print(f"{row:>4} {r['cluster_a']:>10} {r['size_a']:>8} {r['cluster_b']:>10} {r['size_b']:>8} "
+                                f"{a_idx:>9} {m['axis_dev_deg']:>9.2f}° {m['kink_angle_deg']:>10.2f}° "
+                                f"{m['T_idx']:>6} {match_str:>6}")
+                            row += 1
+                            shown_any = True
+                    if not shown_any:
+                        # pair with no matches (only relevant when print_matches_only=False)
+                        print(f"{row:>4} {r['cluster_a']:>10} {r['size_a']:>8} {r['cluster_b']:>10} {r['size_b']:>8} "
+                            f"{r['best_axis_idx']:>9} {r['axis_dev_deg']:>9.2f}° {r['kink_angle_deg']:>10.2f}° "
+                            f"{r['best_T_idx']:>6} {match_str:>6}")
+                        row += 1
+                n_match = sum(1 for r in matches if r['is_match'])
+                print(f"\n{n_match} matching pair(s) out of {len(to_print)} shown "
+                    f"({row} total match rows, since a pair can have multiple valid (T, axis) matches).")
+            else:
+                print(f"{'#':>4} {'Cluster A':>10} {'Px A':>8} {'Cluster B':>10} {'Px B':>8} "
+                    f"{'Axis idx':>9} {'Axis dev':>10} {'Kink angle':>11} {'Match':>6}")
+                print("-" * 85)
+                for idx, r in enumerate(to_print):
+                    match_str = 'yes' if r['is_match'] else 'no'
+                    print(f"{idx:>4} {r['cluster_a']:>10} {r['size_a']:>8} {r['cluster_b']:>10} {r['size_b']:>8} "
+                        f"{r['best_axis_idx']:>9} {r['axis_dev_deg']:>9.2f}° {r['kink_angle_deg']:>10.2f}° {match_str:>6}")
+                n_match = sum(1 for r in matches if r['is_match'])
+                print(f"\n{n_match} matching pair(s) out of {len(to_print)} shown.")
+        
+
+        return pairs_results, matches    
+
+    def _kink_metric(self,uvw, angle_deg):
+        """
+        Lexicographic ranking metric for selecting among candidates that
+        already satisfy the axis_dev tolerance: (max Miller index, angle),
+        both ascending -- prefer simpler (lower-index) directions first,
+        breaking ties by smaller kink angle. Deliberately excludes axis_dev
+        itself (that's already the pass/fail threshold, not a ranking
+        criterion among passing candidates).
+        """
+        return (max(abs(v) for v in uvw), angle_deg)
+
+
+    def identify_kink_axis(self, cluster_a, cluster_b, phase, max_miller_index=2, tol_deg=5.0,
+                            print_result=False, print_top_n=10):
+        """
+        BLIND rotation-axis indexing. See prior docstring for the T-loop +
+        family-search methodology and the spurious-single-best-match
+        warning (confirmed on real data: axis_dev alone cannot distinguish
+        a real match from noise once many low-index families are tested).
+
+        Selection among candidates satisfying tol_deg is now done via
+        _kink_metric (Miller-index simplicity, then angle) rather than
+        axis_dev, since axis_dev is already the pass/fail criterion.
+
+        Parameters
+        ----------
+        cluster_a, cluster_b : int
+        phase : str
+        max_miller_index : int, optional
+            Default 2.
+        tol_deg : float, optional
+            Default 5.0.
+        print_result : bool, optional
+            If True, print the top print_top_n candidates (across ALL
+            matches of ALL families, not just each family's best), ranked
+            by _kink_metric. Default False.
+        print_top_n : int or 'all', optional
+        Number of top-ranked candidates to print/return in
+        'top_candidates'. Pass 'all' to include every match found
+        (across all families), not just a fixed-size top slice.
+        Default 10.
+
+        Returns
+        -------
+        result : dict
+            'cluster_a', 'cluster_b', 'phase'
+            'is_match' : bool
+            'best_uvw', 'axis_dev_deg', 'kink_angle_deg', 'best_T_idx',
+                'variant_cartesian' : the METRIC-selected best candidate
+                (Miller-index simplicity, then angle) among all matches --
+                NOT the smallest axis_dev.
+            'top_candidates' : list of dict, the print_top_n best matches
+                by metric, across all families, each {'uvw', 'axis_dev_deg',
+                'kink_angle_deg', 'T_idx'}
+            'all_matches_by_family' : dict {uvw_tuple: list of dict}, as before
+            'n_families_tested' : int
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if cluster_a not in self.avg_orientations or cluster_b not in self.avg_orientations:
+            raise ValueError(f"Average orientation not available for cluster {cluster_a} or {cluster_b}")
+
+        G1 = self.avg_orientations[cluster_a]
+        G2 = self.avg_orientations[cluster_b]
+        M_fwd = G2 @ G1.T
+
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        dets = np.array([np.linalg.det(sm) for sm in symops_all])
+        symops_proper = symops_all[dets > 0]
+        L = np.asarray(self.data.phases[phase]['L'])
+
+        raw_candidates = _generate_low_index_uvw_directions(max_miller_index)
+
+        seen_members = set()
+        families = []
+        for uvw in raw_candidates:
+            v = L.dot(np.array(uvw, dtype=float))
+            v = v / np.linalg.norm(v)
+            family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
+            key = frozenset(tuple(row) for row in family)
+            if key in seen_members:
+                continue
+            seen_members.add(key)
+            families.append((uvw, family))
+
+        all_matches = [[] for _ in families]
+
+        for t_idx, T in enumerate(symops_proper):
+            M_T = M_fwd @ T
+            q = _R.from_matrix(M_T).as_quat()
+            if q[3] < 0:
+                q = -q
+            w = np.clip(q[3], -1.0, 1.0)
+            angle = 2.0 * np.degrees(np.arccos(w))
+            s = np.sqrt(max(1.0 - w * w, 0.0))
+            m_axis = q[:3] / s if s > 1e-8 else np.array([0.0, 0.0, 1.0])
+
+            for f_idx, (uvw, family) in enumerate(families):
+                Fn = family / np.linalg.norm(family, axis=1, keepdims=True)
+                cosang = np.clip(Fn @ m_axis, -1.0, 1.0)
+                devs = np.degrees(np.arccos(cosang))
+                v_idx = int(np.argmin(devs))
+                axis_dev = float(devs[v_idx])
+
+                if axis_dev < tol_deg:
+                    all_matches[f_idx].append((axis_dev, t_idx, v_idx, angle))
+
+        all_matches_by_family = {}
+        flat_candidates = []
+        for f_idx, (uvw, family) in enumerate(families):
+            if all_matches[f_idx]:
+                entries = sorted(
+                    [{'axis_dev_deg': ad, 'kink_angle_deg': ang, 'T_idx': ti,
+                    'variant_cartesian': family[vi]}
+                    for ad, ti, vi, ang in all_matches[f_idx]],
+                    key=lambda d: d['axis_dev_deg']
+                )
+                all_matches_by_family[uvw] = entries
+                for e in entries:
+                    flat_candidates.append({'uvw': uvw, **e})
+
+        if not flat_candidates:
+            return {
+                'cluster_a': cluster_a, 'cluster_b': cluster_b, 'phase': phase,
+                'is_match': False, 'best_uvw': None, 'axis_dev_deg': None,
+                'kink_angle_deg': None, 'best_T_idx': None, 'variant_cartesian': None,
+                'top_candidates': [], 'all_matches_by_family': {}, 'n_families_tested': len(families),
+            }
+
+        flat_candidates.sort(key=lambda c: self._kink_metric(c['uvw'], c['kink_angle_deg']))
+        best = flat_candidates[0]
+        top_candidates = flat_candidates if print_top_n == 'all' else flat_candidates[:print_top_n]
+
+        if print_result:
+            print(f"Cluster {cluster_a} <-> {cluster_b}, phase {phase}: "
+                f"{len(flat_candidates)} total match(es) across {len(all_matches_by_family)} "
+                f"distinct famil{'y' if len(all_matches_by_family)==1 else 'ies'}, "
+                f"ranked by (max Miller index, angle)")
+            print(f"{'#':>3} {'uvw':>12} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} {'T_idx':>6}")
+            print("-" * 58)
+            for i, c in enumerate(top_candidates):
+                max_idx = max(abs(v) for v in c['uvw'])
+                print(f"{i:>3} {str(c['uvw']):>12} {max_idx:>9} {c['axis_dev_deg']:>9.2f}° "
+                    f"{c['kink_angle_deg']:>10.2f}° {c['T_idx']:>6}")
+
+        return {
+            'cluster_a': cluster_a,
+            'cluster_b': cluster_b,
+            'phase': phase,
+            'is_match': True,
+            'best_uvw': best['uvw'],
+            'axis_dev_deg': best['axis_dev_deg'],
+            'kink_angle_deg': best['kink_angle_deg'],
+            'best_T_idx': best['T_idx'],
+            'variant_cartesian': best['variant_cartesian'],
+            'top_candidates': top_candidates,
+            'all_matches_by_family': all_matches_by_family,
+            'n_families_tested': len(families),
+        }    
+
+
+    def map_kink_axes(self, phase, max_miller_index=2, tol_deg=5.0, min_size=None,
+                    cluster_ids=None, print_result=False, print_top_n_per_pair=3,
+                    sort_by='size'):
+        """
+        BLIND rotation-axis indexing for EVERY pair of clusters (within one
+        phase): same methodology as identify_kink_axis (auto-generated,
+        deduplicated low-index uvw families; T-loop + family search;
+        metric-based selection among tol_deg-passing candidates), applied
+        pairwise and vectorized.
+
+        PREREQUISITE: self.avg_orientations must already be resolved to a
+        mutually consistent branch.
+
+        Parameters
+        ----------
+        phase : str
+        max_miller_index : int, optional
+            Default 2.
+        tol_deg : float, optional
+            Default 5.0.
+        min_size : int, optional
+        cluster_ids : list of int, optional
+        print_result : bool, optional
+            If True, print a table with print_top_n_per_pair metric-ranked
+            candidates per pair (pairs with no match are skipped). Default False.
+        print_top_n_per_pair : int or 'all', optional
+        Number of top-ranked candidates to print per pair. Pass 'all'
+        to print every match found for that pair. Default 3.
+        Also controls how many candidates are retained in each pair's
+        'top_candidates' list in the returned pairs_results (at least
+        5 are always kept there regardless, unless 'all' is given, in
+        which case every match is kept).
+        sort_by : {'size', 'cluster_id'}, optional
+            Order pairs are printed in. Default 'size' (largest first).
+
+        Returns
+        -------
+        pairs_results : list of dict
+            One entry per cluster pair WITH at least one match:
+            'cluster_a', 'cluster_b', 'size_a', 'size_b'
+            'best_uvw', 'axis_dev_deg', 'kink_angle_deg', 'best_T_idx'
+                (metric-selected, per identify_kink_axis)
+            'top_candidates' : list of dict, metric-ranked matches for this pair
+            'n_matches' : int, total match count across all families
+        """
+        from scipy.spatial.transform import Rotation as _R
+
+        if sort_by not in ('size', 'cluster_id'):
+            raise ValueError(f"sort_by must be 'size' or 'cluster_id', got {sort_by!r}")
+
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase])
+        cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+        if min_size is not None:
+            sizes = self.cluster_sizes
+            cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+
+        n = len(cluster_ids)
+        if n < 2:
+            if print_result:
+                print("Fewer than 2 clusters available; nothing to check.")
+            return []
+
+        sizes = self.cluster_sizes
+
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        dets = np.array([np.linalg.det(s) for s in symops_all])
+        symops_proper = symops_all[dets > 0]
+        Ns = symops_proper.shape[0]
+        L = np.asarray(self.data.phases[phase]['L'])
+
+        raw_candidates = _generate_low_index_uvw_directions(max_miller_index)
+        seen_members = set()
+        families = []
+        for uvw in raw_candidates:
+            v = L.dot(np.array(uvw, dtype=float))
+            v = v / np.linalg.norm(v)
+            family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
+            key = frozenset(tuple(row) for row in family)
+            if key in seen_members:
+                continue
+            seen_members.add(key)
+            families.append((uvw, family))
+
+        G = np.array([self.avg_orientations[c] for c in cluster_ids])
+        pair_idx = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        P = len(pair_idx)
+        ii = np.array([i for i, _ in pair_idx])
+        jj = np.array([j for _, j in pair_idx])
+
+        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
+        M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
+
+        q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
+        flip = q[..., 3] < 0
+        q[flip] = -q[flip]
+        w = np.clip(q[..., 3], -1.0, 1.0)
+        angle = 2.0 * np.degrees(np.arccos(w))  # (P, Ns)
+        s = np.sqrt(np.clip(1.0 - w * w, 0.0, None))
+        axis = np.divide(q[..., :3], s[..., None], out=np.zeros((P, Ns, 3)), where=s[..., None] > 1e-8)
+        axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])  # (P, Ns, 3)
+
+        pair_candidates = [[] for _ in range(P)]
+
+        for uvw, family in families:
+            n_var = family.shape[0]
+            Fn = family / np.linalg.norm(family, axis=1, keepdims=True)
+            cosang = np.clip(np.einsum('pnk,vk->pnv', axis, Fn), -1.0, 1.0)  # (P,Ns,n_var)
+            devs_all = np.degrees(np.arccos(cosang))
+
+            mask = devs_all < tol_deg  # (P, Ns, n_var)
+            p_idx, t_idx, v_idx = np.where(mask)
+            for p, t, v in zip(p_idx, t_idx, v_idx):
+                pair_candidates[p].append({
+                    'uvw': uvw,
+                    'axis_dev_deg': float(devs_all[p, t, v]),
+                    'kink_angle_deg': float(angle[p, t]),
+                    'T_idx': int(t),
+                })
+
+        keep_n = None if print_top_n_per_pair == 'all' else max(
+            (print_top_n_per_pair if isinstance(print_top_n_per_pair, int) else 3), 5
+        )
+
+        pairs_results = []
+        for p in range(P):
+            cands = pair_candidates[p]
+            if not cands:
+                continue
+            cands.sort(key=lambda c: self._kink_metric(c['uvw'], c['kink_angle_deg']))
+            best = cands[0]
+            cluster_a_id = int(cluster_ids[ii[p]])
+            cluster_b_id = int(cluster_ids[jj[p]])
+            pairs_results.append({
+                'cluster_a': cluster_a_id,
+                'cluster_b': cluster_b_id,
+                'size_a': int(sizes.get(cluster_a_id, 0)),
+                'size_b': int(sizes.get(cluster_b_id, 0)),
+                'best_uvw': best['uvw'],
+                'axis_dev_deg': best['axis_dev_deg'],
+                'kink_angle_deg': best['kink_angle_deg'],
+                'best_T_idx': best['T_idx'],
+                'top_candidates': cands if keep_n is None else cands[:keep_n],
+                'n_matches': len(cands),
+            })
+
+        if sort_by == 'size':
+            pairs_results.sort(key=lambda r: -(r['size_a'] + r['size_b']) / 2.0)
+        else:
+            pairs_results.sort(key=lambda r: (r['cluster_a'], r['cluster_b']))
+
+        if print_result:
+            print(f"{len(pairs_results)} pair(s) with at least one kink-axis match "
+                f"(tol_deg={tol_deg}, max_miller_index={max_miller_index})\n")
+            for r in pairs_results:
+                print(f"Cluster {r['cluster_a']} ({r['size_a']} px) <-> "
+                    f"{r['cluster_b']} ({r['size_b']} px): {r['n_matches']} match(es)")
+                print(f"  {'uvw':>10} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} {'T_idx':>6}")
+                to_show = r['top_candidates'] if print_top_n_per_pair == 'all' else r['top_candidates'][:print_top_n_per_pair]
+                for c in to_show:
+                    max_idx = max(abs(v) for v in c['uvw'])
+                    print(f"  {str(c['uvw']):>10} {max_idx:>9} {c['axis_dev_deg']:>9.2f}° "
+                        f"{c['kink_angle_deg']:>10.2f}° {c['T_idx']:>6}")
+                print()
+
+        return pairs_results        
 
     def check_twin_relationship(self, cluster_a, cluster_b, system, mode,
                                 tol_deg=5.0):
@@ -6788,6 +7547,7 @@ class ClusteringResult:
             'checks': checks,
         }
 
+
     def map_twin_relationships(self, phase, system, modes, tol_deg=5.0, min_size=None,
                                 cluster_ids=None, print_result=False, print_matches_only=True,
                                 sort_by='deviation'):
@@ -6804,7 +7564,7 @@ class ClusteringResult:
         independently and reintroduces branch inconsistency).
 
         For each pair, M_fwd = G_j @ G_i.T, and for every T in the phase's
-        proper symops, M_T = M_fwd @ T is tested against all 12 tabulated
+        proper symops, M_T = M_fwd @ T is tested against all tabulated
         variants of three target families (K1_180, eta1_180, K2_shear).
         This T-loop is REQUIRED, not optional: confirmed empirically (and
         cross-checked against true brute-force S2 @ M @ S1.T search over
@@ -6817,6 +7577,12 @@ class ClusteringResult:
         docstring for why (C_a as tabulated does not represent the correct
         rotation for non-compound modes).
 
+        All three conditions are ALWAYS fully evaluated per pair (never
+        short-circuited); 'matched_conditions' reports every condition that
+        independently satisfies tol_deg, not just the single best -- a pair
+        with more than one entry in matched_conditions is a compound twin
+        (see check_twin_relationship's docstring for the theory).
+
         Parameters
         ----------
         phase : str
@@ -6828,7 +7594,7 @@ class ClusteringResult:
         tol_deg : float, optional
             Match tolerance (degrees) for BOTH axis and angle. Default 5.0.
             NOTE: with the T-loop, the effective search space per pair is
-            ~Ns x 12 x 3 conditions x len(modes) candidates -- substantially
+            ~Ns x M_var x 3 conditions x len(modes) candidates -- substantially
             larger than a naive single-representative search. A high match
             rate is not automatically a search-completeness artifact (the
             search has been validated as complete/correct against brute
@@ -6855,15 +7621,16 @@ class ClusteringResult:
             'size_a', 'size_b' : pixel counts
             'best_mode' : str
             'best_condition' : 'K1_180', 'eta1_180', or 'K2_shear'
+            'matched_conditions' : list of str, ALL conditions that
+                independently satisfied tol_deg for best_mode (more than
+                one entry indicates a compound twin)
             'best_T_idx' : int, index into this phase's proper symops
             'T' : (3,3) ndarray, the actual symmetry operation such that
-                M_fwd @ T has the matching axis/angle
-            'variant_idx' : int (0-11), which tabulated twin variant matched
-            'twin_elements' : dict, Miller/Cartesian twin elements
-                (K1_a, K2_a, eta1_a, eta2_a, n1_a, n2_a, a1_a, a2_a -- 
-                whichever exist in twinSys) for the SPECIFIC operating
-                variant (variant_idx), i.e. the identified physical twin
-                system, not just the mode in general.
+                M_fwd @ T has the matching axis/angle for best_condition
+            'variant_idx' : int, which tabulated twin variant matched,
+                for best_condition
+            'twin_elements' : dict, Miller/Cartesian twin elements for the
+                SPECIFIC operating variant (variant_idx) of best_condition
             'shear_angle_deg' : float, the mode's K2_shear target angle
             'angle_deg' : float, combined (axis_dev + angle_dev) score
             'axis_dev_deg', 'angle_dev_deg' : float
@@ -6871,7 +7638,7 @@ class ClusteringResult:
         matches : list of dict
             Subset with is_match=True, sorted per sort_by.
 
-        Note on cost: O(P x Ns x Ns_target) per mode. For large cluster
+        Note on cost: O(P x Ns x M_var) per mode. For large cluster
         counts, consider narrowing cluster_ids/min_size first.
         """
         from scipy.spatial.transform import Rotation as _R
@@ -6923,18 +7690,19 @@ class ClusteringResult:
         axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])  # (P, Ns, 3)
 
         def _condition_batch(target_axes, target_angle):
-            # target_axes: (12,3); axis: (P,Ns,3); angle: (P,Ns)
-            T12 = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
-            cosang = np.clip(np.abs(np.einsum('pnk,vk->pnv', axis, T12)), -1.0, 1.0)  # (P,Ns,12)
-            axis_devs_all = np.degrees(np.arccos(cosang))  # (P,Ns,12)
+            # target_axes: (M_var,3); axis: (P,Ns,3); angle: (P,Ns)
+            n_var = target_axes.shape[0]
+            Tn = target_axes / np.linalg.norm(target_axes, axis=1, keepdims=True)
+            cosang = np.clip(np.abs(np.einsum('pnk,vk->pnv', axis, Tn)), -1.0, 1.0)  # (P,Ns,M_var)
+            axis_devs_all = np.degrees(np.arccos(cosang))
 
-            flat = axis_devs_all.reshape(P, -1)  # (P, Ns*12)
+            flat = axis_devs_all.reshape(P, -1)  # (P, Ns*M_var)
             angle_dev_full = np.abs(angle - target_angle)  # (P, Ns)
-            angle_dev_rep = np.repeat(angle_dev_full, 12, axis=1)  # (P, Ns*12)
+            angle_dev_rep = np.repeat(angle_dev_full, n_var, axis=1)  # (P, Ns*M_var)
             combined = flat + angle_dev_rep
             best_flat_idx = np.argmin(combined, axis=1)  # (P,)
-            best_t_idx = best_flat_idx // 12
-            best_v_idx = best_flat_idx % 12
+            best_t_idx = best_flat_idx // n_var
+            best_v_idx = best_flat_idx % n_var
             axis_dev = flat[np.arange(P), best_flat_idx]
             angle_dev = angle_dev_rep[np.arange(P), best_flat_idx]
             best_angle = angle[np.arange(P), best_t_idx]
@@ -6975,7 +7743,15 @@ class ClusteringResult:
             m = modes[best_mode_idx[p]]
             best_combined, best_cond_idx, cond_names = best_combined_per_mode[m]
             cond = cond_names[best_cond_idx[p]]
-            axis_dev_arr, angle_dev_arr, t_idx_arr, v_idx_arr, angle_arr = checks_by_mode_all[m][cond]
+            conditions = checks_by_mode_all[m]
+
+            matched_conditions = []
+            for cn in cond_names:
+                ad, angd, _, _, _ = conditions[cn]
+                if ad[p] < tol_deg and angd[p] < tol_deg:
+                    matched_conditions.append(cn)
+
+            axis_dev_arr, angle_dev_arr, t_idx_arr, v_idx_arr, angle_arr = conditions[cond]
 
             cluster_a_id = int(cluster_ids[ii[p]])
             cluster_b_id = int(cluster_ids[jj[p]])
@@ -6998,6 +7774,7 @@ class ClusteringResult:
                 'size_b': int(sizes.get(cluster_b_id, 0)),
                 'best_mode': m,
                 'best_condition': cond,
+                'matched_conditions': matched_conditions,
                 'best_T_idx': t_idx_p,
                 'T': symops_proper[t_idx_p],
                 'variant_idx': v_idx_p,
@@ -7006,7 +7783,7 @@ class ClusteringResult:
                 'angle_deg': float(best_combined[p]),
                 'axis_dev_deg': float(axis_dev_arr[p]),
                 'angle_dev_deg': float(angle_dev_arr[p]),
-                'is_match': bool(axis_dev_arr[p] < tol_deg and angle_dev_arr[p] < tol_deg),
+                'is_match': bool(len(matched_conditions) > 0),
             })
 
         matches = [r for r in pairs_results if r['is_match']]
@@ -7017,7 +7794,6 @@ class ClusteringResult:
             self.print_twin_matches(to_print, sort_by=sort_by)
 
         return pairs_results, matches
-
 
 
     def _sort_twin_results(self, results, sort_by):
@@ -7046,10 +7822,13 @@ class ClusteringResult:
         else:
             raise ValueError(f"sort_by must be 'deviation', 'size', or 'cluster_id', got {sort_by!r}")
 
-
     def print_twin_matches(self, matches, sort_by='cluster_id'):
         """
-        Print a formatted table of twin-relationship results.
+        Print a formatted table of twin-relationship results. If entries
+        have been annotated via annotate_matches_with_boundary
+        ('shares_boundary'/'boundary_length_px' present), those are shown
+        as extra columns; otherwise the table falls back to the
+        unannotated format.
 
         Parameters
         ----------
@@ -7063,24 +7842,40 @@ class ClusteringResult:
             'deviation': ascending combined (axis_dev + angle_dev).
             'size': descending average pixel size of the two clusters.
         """
-
         if not matches:
             print("No pairs to display.")
             return
 
         ordered = self._sort_twin_results(matches, sort_by)
+        has_boundary = 'shares_boundary' in ordered[0]
 
-        print(f"{'#':>4} {'Cluster A':>10} {'Px A':>8} {'Cluster B':>10} {'Px B':>8} {'Mode':>8} "
-            f"{'Condition':>10} {'Shear':>8} {'Axis dev':>10} {'Angle dev':>10} {'Match':>6}")
-        print("-" * 108)
-        for idx, m in enumerate(ordered):
-            match_str = 'yes' if m['is_match'] else 'no'
-            print(f"{idx:>4} {m['cluster_a']:>10} {m['size_a']:>8} {m['cluster_b']:>10} {m['size_b']:>8} "
-                f"{m['best_mode']:>8} {m['best_condition']:>10} {m['shear_angle_deg']:>7.2f}° "
-                f"{m['axis_dev_deg']:>9.2f}° {m['angle_dev_deg']:>9.2f}° {match_str:>6}")
+        if has_boundary:
+            print(f"{'#':>4} {'Cluster A':>10} {'Px A':>8} {'Cluster B':>10} {'Px B':>8} {'Mode':>8} "
+                f"{'Conditions':>28} {'Axis dev':>10} {'Angle dev':>10} {'Match':>6} "
+                f"{'Boundary':>9} {'Bnd px':>7}")
+            print("-" * 140)
+            for idx, m in enumerate(ordered):
+                match_str = 'yes' if m['is_match'] else 'no'
+                cond_str = '+'.join(m['matched_conditions']) if m['matched_conditions'] else m['best_condition']
+                bnd_str = 'yes' if m['shares_boundary'] else 'no'
+                print(f"{idx:>4} {m['cluster_a']:>10} {m['size_a']:>8} {m['cluster_b']:>10} {m['size_b']:>8} "
+                    f"{m['best_mode']:>8} {cond_str:>28} "
+                    f"{m['axis_dev_deg']:>9.2f}° {m['angle_dev_deg']:>9.2f}° {match_str:>6} "
+                    f"{bnd_str:>9} {m['boundary_length_px']:>7}")
+        else:
+            print(f"{'#':>4} {'Cluster A':>10} {'Px A':>8} {'Cluster B':>10} {'Px B':>8} {'Mode':>8} "
+                f"{'Conditions':>28} {'Axis dev':>10} {'Angle dev':>10} {'Match':>6}")
+            print("-" * 122)
+            for idx, m in enumerate(ordered):
+                match_str = 'yes' if m['is_match'] else 'no'
+                cond_str = '+'.join(m['matched_conditions']) if m['matched_conditions'] else m['best_condition']
+                print(f"{idx:>4} {m['cluster_a']:>10} {m['size_a']:>8} {m['cluster_b']:>10} {m['size_b']:>8} "
+                    f"{m['best_mode']:>8} {cond_str:>28} "
+                    f"{m['axis_dev_deg']:>9.2f}° {m['angle_dev_deg']:>9.2f}° {match_str:>6}")
 
         n_match = sum(1 for m in matches if m['is_match'])
-        print(f"\n{n_match} matching pair(s) out of {len(matches)} shown.")        
+        print(f"\n{n_match} matching pair(s) out of {len(matches)} shown.")
+      
     def map_twin_relationships_ini2(self, phase, system, modes, tol_deg=5.0, min_size=None,
                                 cluster_ids=None):
         """
@@ -7216,6 +8011,134 @@ class ClusteringResult:
         matches = sorted([r for r in pairs_results if r['is_match']], key=lambda r: r['angle_deg'])
 
         return pairs_results, matches
+
+    def find_boundary_sharing_twins(self, boundary_result, merge_groups_all, phase, system, modes,
+                                    tol_deg=5.0, min_size=None, cluster_ids=None,
+                                    boundary_only=False, print_result=False, sort_by='size'):
+        """
+        Run map_twin_relationships, then annotate every returned match with
+        whether the two matched clusters physically share a boundary, via
+        boundary_result.annotate_matches_with_boundary (see BoundaryResult
+        for the adjacency-lookup logic itself).
+
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            From BoundaryAnalyzer().analyze(clustering_result), where
+            clustering_result is the UNMERGED result the merge was built from.
+        merge_groups_all : dict
+            {phase: {root_id: [fragment cluster ids]}}, from
+            merge_clusters_by_orientation.
+        phase, system, modes, tol_deg, min_size, cluster_ids :
+            Passed through to map_twin_relationships.
+        boundary_only : bool, optional
+            If True, `matches` returned (and printed) is filtered to only
+            boundary-sharing pairs. Default False.
+        print_result : bool, optional
+            Print the annotated table via print_twin_matches. Default False.
+        sort_by : {'deviation', 'size', 'cluster_id'}, optional
+            Default 'size'.
+
+        Returns
+        -------
+        pairs_results : list of dict
+            ALL checked pairs (not boundary-annotated -- only `matches` is).
+        matches : list of dict
+            Matched pairs, annotated with 'shares_boundary' and
+            'boundary_length_px'. Filtered to boundary-sharing only if
+            boundary_only=True.
+        """
+        pairs_results, matches = self.map_twin_relationships(
+            phase=phase, system=system, modes=modes, tol_deg=tol_deg,
+            min_size=min_size, cluster_ids=cluster_ids, sort_by=sort_by
+        )
+
+        boundary_result.annotate_matches_with_boundary(matches, merge_groups_all, phase)
+
+        if boundary_only:
+            matches = [m for m in matches if m['shares_boundary']]
+
+        if print_result:
+            self.print_twin_matches(matches, sort_by=sort_by)
+            n_bnd = sum(1 for m in matches if m['shares_boundary'])
+            print(f"\n({n_bnd} of {len(matches)} shown pair(s) share a physical boundary)")
+
+        return pairs_results, matches
+
+    def find_boundary_sharing_kinks(self, boundary_result, merge_groups_all, phase,
+                                    max_miller_index=2, tol_deg=5.0, min_size=None,
+                                    cluster_ids=None, boundary_only=False,
+                                    print_result=False, print_top_n=None,
+                                    print_top_n_per_pair=3, sort_by='size'):
+        """
+        Run map_kink_axes, then annotate every returned pair with whether
+        the two matched clusters physically share a boundary, via
+        boundary_result.annotate_matches_with_boundary.
+
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            From BoundaryAnalyzer().analyze(clustering_result), where
+            clustering_result is the UNMERGED result the merge was built from.
+        merge_groups_all : dict
+            {phase: {root_id: [fragment cluster ids]}}
+        phase, max_miller_index, tol_deg, min_size, cluster_ids :
+            Passed through to map_kink_axes.
+        boundary_only : bool, optional
+            If True, only boundary-sharing pairs are returned/printed.
+            Default False.
+        print_result : bool, optional
+            Default False.
+        print_top_n : int or None, optional
+            Maximum number of PAIRS to print (after sort_by ordering and
+            any boundary_only filtering). None (default) prints all pairs.
+            Independent of print_top_n_per_pair, which limits candidates
+            shown WITHIN each printed pair.
+        print_top_n_per_pair : int or 'all', optional
+            Default 3.
+        sort_by : {'size', 'cluster_id'}, optional
+            Default 'size'.
+
+        Returns
+        -------
+        pairs_results : list of dict
+            ALL pairs with at least one kink-axis match (NOT truncated by
+            print_top_n -- that only affects what's printed), each
+            annotated with 'shares_boundary' and 'boundary_length_px'.
+            Filtered to boundary-sharing only if boundary_only=True.
+        """
+        pairs_results = self.map_kink_axes(
+            phase=phase, max_miller_index=max_miller_index, tol_deg=tol_deg,
+            min_size=min_size, cluster_ids=cluster_ids, sort_by=sort_by
+        )
+
+        boundary_result.annotate_matches_with_boundary(pairs_results, merge_groups_all, phase)
+
+        if boundary_only:
+            pairs_results = [r for r in pairs_results if r['shares_boundary']]
+
+        if print_result:
+            to_print = pairs_results if print_top_n is None else pairs_results[:print_top_n]
+            n_bnd_all = sum(1 for r in pairs_results if r['shares_boundary'])
+
+            print(f"{len(pairs_results)} pair(s) with at least one kink-axis match "
+                f"(tol_deg={tol_deg}, max_miller_index={max_miller_index}), "
+                f"{n_bnd_all} sharing a physical boundary"
+                + (f" -- showing top {len(to_print)}" if print_top_n is not None else "") + "\n")
+
+            for r in to_print:
+                bnd_str = f"boundary={r['boundary_length_px']}px" if r['shares_boundary'] else "no boundary"
+                print(f"Cluster {r['cluster_a']} ({r['size_a']} px) <-> "
+                    f"{r['cluster_b']} ({r['size_b']} px): {r['n_matches']} match(es), {bnd_str}")
+                print(f"  {'uvw':>10} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} {'T_idx':>6}")
+                to_show = r['top_candidates'] if print_top_n_per_pair == 'all' else r['top_candidates'][:print_top_n_per_pair]
+                for c in to_show:
+                    max_idx = max(abs(v) for v in c['uvw'])
+                    print(f"  {str(c['uvw']):>10} {max_idx:>9} {c['axis_dev_deg']:>9.2f}° "
+                        f"{c['kink_angle_deg']:>10.2f}° {c['T_idx']:>6}")
+                print()
+
+        return pairs_results
     def merge_clusters_by_orientation(self, threshold_deg=2.0, phase=None, min_size=None,
                                         return_disor_matrices=False):
         """
@@ -11845,6 +12768,85 @@ class BoundaryResult:
                             f"tip_dist: {da:.1f}, {db:.1f} px")
         self.meeting_pairs = meeting_pairs  # Store in data for later use
         return meeting_pairs
+
+
+    def check_boundary_sharing(self, merge_groups_all, cluster_a, cluster_b, phase):
+        """
+        Check whether two MERGED clusters (roots from
+        merge_clusters_by_orientation) physically share a boundary, by
+        checking all pairs of their constituent ORIGINAL (pre-merge)
+        fragment clusters for adjacency recorded in self.
+
+        self (BoundaryResult) must have been built from the SAME unmerged
+        ClusteringResult that merge_groups_all's fragment IDs came from
+        (i.e. BoundaryAnalyzer().analyze(clustering_result) on the
+        pre-merge result) -- merging and later symmetrize_clusters calls
+        never change self.labels, so this stays valid regardless of which
+        downstream stage merge_groups_all was produced at.
+
+        Parameters
+        ----------
+        merge_groups_all : dict
+            {phase: {root_id: [fragment cluster ids]}}, as returned by
+            ClusteringResult.merge_clusters_by_orientation.
+        cluster_a, cluster_b : int
+            MERGED (root) cluster IDs. A cluster ID not present as a key in
+            merge_groups_all[phase] is treated as its own single-fragment
+            group (i.e. an unmerged cluster).
+        phase : str
+
+        Returns
+        -------
+        result : dict
+            'shares_boundary' : bool
+            'boundary_length_px' : int, total shared boundary pixel count
+                summed over every touching fragment pair
+            'touching_fragments' : list of (frag_a, frag_b, length_px)
+        """
+        fragments_a = merge_groups_all[phase].get(cluster_a, [cluster_a])
+        fragments_b = merge_groups_all[phase].get(cluster_b, [cluster_b])
+
+        label_to_idx = {int(c): i for i, c in enumerate(self.clusters)}
+
+        touching = []
+        total_length = 0
+        for fa in fragments_a:
+            if fa not in label_to_idx:
+                continue
+            boundaries = self.grouped_boundaries[label_to_idx[fa]]
+            for fb in fragments_b:
+                if fb in boundaries:
+                    length = len(boundaries[fb])
+                    touching.append((fa, fb, length))
+                    total_length += length
+
+        return {
+            'shares_boundary': len(touching) > 0,
+            'boundary_length_px': total_length,
+            'touching_fragments': touching,
+        }
+
+
+    def annotate_matches_with_boundary(self, matches, merge_groups_all, phase):
+        """
+        Annotate a list of match dicts (anything with 'cluster_a'/
+        'cluster_b' keys -- from map_twin_relationships or map_kink_axes)
+        with whether the two matched clusters physically share a boundary,
+        via self.check_boundary_sharing. Adds 'shares_boundary' and
+        'boundary_length_px' IN PLACE; returns the same list.
+
+        Parameters
+        ----------
+        matches : list of dict
+        merge_groups_all : dict
+            {phase: {root_id: [fragment cluster ids]}}
+        phase : str
+        """
+        for m in matches:
+            r = self.check_boundary_sharing(merge_groups_all, m['cluster_a'], m['cluster_b'], phase)
+            m['shares_boundary'] = r['shares_boundary']
+            m['boundary_length_px'] = r['boundary_length_px']
+        return matches
 class BoundaryAnalyzer:
     """
     Main class for grain boundary detection and analysis.
