@@ -99,12 +99,19 @@ def _load_blob(g, name):
  
 # ---- public API ------------------------------------------------------------
 def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
-                    hpa=None, recipe, or_results=None, aux=None):
-    """Write the derived pipeline state + recipe to an HDF5 checkpoint.
+                    hpa=None, recipe, or_results=None, aux=None, dataEBSD=None):
+    """
+    ... (same docstring as before, plus:)
 
-    `hpa` (and `hierarchy`) are optional: you can checkpoint after clustering /
-    boundaries / hierarchy but before running the HP analysis. Whatever is None
-    is simply stored as None and skipped on restore."""
+    dataEBSD : EBSDData, optional
+        Used ONLY to save ROI polygon vertices (see _save_rois/load_rois).
+        If None (default), taken from clustering_result.data before it is
+        detached for pickling. If that's also unavailable, no ROI data is
+        saved (harmless -- just no ROI shortcut on reload).
+    """
+    if dataEBSD is None:
+        dataEBSD = getattr(clustering_result, 'data', None)
+
     detach = [(clustering_result, 'data'),
               (boundary_result, 'data'),
               (boundary_result, 'clustering')]
@@ -122,7 +129,7 @@ def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
             'or_results':        or_results,
             'aux':               aux or {},
         }
-        for k, obj in blobs.items():            # fail early with a clear message
+        for k, obj in blobs.items():
             try:
                 pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             except Exception as e:
@@ -132,17 +139,35 @@ def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
         with h5py.File(str(path), 'w') as f:
             f.attrs['format'], f.attrs['version'] = _FMT, _VER
             _recipe_put(f.create_group('recipe'), recipe)
+            if dataEBSD is not None:
+                _save_rois(f, dataEBSD)
             g = f.create_group('pickled')
             for k, obj in blobs.items():
                 _dump_blob(g, k, obj)
     finally:
-        for o, a, v in saved:                    # restore in-memory graph
+        for o, a, v in saved:
             setattr(o, a, v)
     print(f"checkpoint saved -> {path}")
 
 
+
+def _apply_roi_verts(d, roi_verts):
+    """Rebuild the ROI selection non-interactively from stored polygon vertices."""
+    from matplotlib.path import Path
+    verts = [np.asarray(v, float) for v in roi_verts]
+ 
+    class _StoredSelector:
+        pass
+    sel = _StoredSelector()
+    sel.selVerts = list(verts)
+    sel.selPaths = [Path(v) for v in verts]
+    d.selector = sel
+    d.set_rois()
+    return d
+ 
 def load_checkpoint(path, dataEBSD=None):
-    """Restore the pipeline. If dataEBSD is None it is rebuilt from the recipe."""
+    """Restore the pipeline. If dataEBSD is None it is rebuilt from the recipe,
+    with ROIs restored automatically from this same checkpoint file."""
     with h5py.File(str(path), 'r') as f:
         if f.attrs.get('format') != _FMT:
             raise ValueError("not an EBSD-HP checkpoint file")
@@ -151,7 +176,7 @@ def load_checkpoint(path, dataEBSD=None):
         blobs = {k: _load_blob(g, k) for k in g.keys()}
 
     if dataEBSD is None:
-        dataEBSD = rebuild_dataEBSD(recipe)
+        dataEBSD = rebuild_dataEBSD(recipe, checkpoint_path=path)
 
     cr = blobs['clustering_result']; cr.data = dataEBSD
     br = blobs['boundary_result'];  br.data = dataEBSD; br.clustering = cr
@@ -175,28 +200,44 @@ def load_checkpoint(path, dataEBSD=None):
                 hierarchy=hierarchy, hpa=hpa,
                 or_results=blobs.get('or_results'), aux=aux, recipe=recipe)
  
- 
-def _apply_roi_verts(d, roi_verts):
-    """Rebuild the ROI selection non-interactively from stored polygon vertices."""
-    from matplotlib.path import Path
-    verts = [np.asarray(v, float) for v in roi_verts]
- 
-    class _StoredSelector:
-        pass
-    sel = _StoredSelector()
-    sel.selVerts = list(verts)
-    sel.selPaths = [Path(v) for v in verts]
-    d.selector = sel
-    d.set_rois()
-    return d
- 
- 
-def rebuild_dataEBSD(recipe):
-    """Re-run the cheap setup (readEBSDdata + crystallography + ROIs).
- 
-    Uses recipe['roi_verts'] to restore the ROI selection without any figure.
-    If they're missing, opens select_rois() interactively (you must then draw
-    the polygons and call set_rois() yourself before proceeding)."""
+# ---- ROI storage, separate from the pickled blobs/recipe -------------------
+def _save_rois(f, dataEBSD):
+    """
+    Save ROI polygon vertices as their own top-level group, independent of
+    the pickled blobs and recipe -- so they can be loaded standalone via
+    load_rois(), without rebuilding the rest of the pipeline.
+
+    NOTE: dataEBSD.selector.selVerts[0] is always the auto-inserted
+    whole-scan "all ROI" placeholder (set_rois() does
+    self.selector.selVerts.insert(0, SelVerts)) -- this is NOT a real
+    user-drawn ROI and must be skipped, or it gets saved/restored as a
+    spurious extra polygon on every reload.
+    """
+    selector = getattr(dataEBSD, 'selector', None)
+    if selector is None or not getattr(selector, 'selVerts', None):
+        return  # nothing to save
+
+    real_verts = selector.selVerts[1:] if len(selector.selVerts) > 0 else []
+    if not real_verts:
+        return  # only the all-ROI placeholder exists, nothing real to save
+
+    g = f.create_group('rois')
+    g.attrs['n_rois'] = len(real_verts)
+    for i, verts in enumerate(real_verts):
+        g.create_dataset(f'roi_{i}', data=np.asarray(verts, dtype=float),
+                          compression='gzip', compression_opts=4)
+
+def build_dataEBSD(recipe, interactive=True):
+    """Read the .oh5 and redo the crystallography, then set up the ROIs.
+
+    ROI handling:
+      * recipe['roi_verts'] present  -> non-interactive: rebuild masks from the
+        stored polygons (no figure), fully ready to use.
+      * else, interactive=True       -> open select_rois() for you to draw, then
+        DOES NOT call set_rois (it must wait until you finish). Draw the
+        polygon(s) and then call  finalize_rois(dataEBSD, RECIPE).
+      * else, interactive=False      -> raise (nothing to select from).
+    """
     d = EBSDData()
     d.readEBSDdata(recipe['filename'])
     d.fromCif(recipe['cif_A'], 'A')
@@ -206,19 +247,54 @@ def rebuild_dataEBSD(recipe):
                         c=recipe['cM'], beta=recipe['betaM'])
     d.setPhaseID(recipe['phaseID'])
     d.getOR()
-    d.getDefGrad()
+    d.getDefGrad()          # also runs getTwinSys / setPlotAttributes / getEl
+    d.getTwinSys()
     d.setPlotAttributes()
     d.getEl()
- 
+
     roi_verts = recipe.get('roi_verts')
     if roi_verts:
-        _apply_roi_verts(d, roi_verts)
+        _apply_roi_verts(d, roi_verts)                 # non-interactive
+    elif interactive:
+        d.select_rois(d=recipe['or_d'])                # opens figure; DRAW now
+        print("\n>>> Draw ROI polygon(s) in the figure, then run:")
+        print(">>>     finalize_rois(dataEBSD, RECIPE)")
+        print(">>> (this stores the masks and saves the polygons into the recipe)\n")
     else:
-        d.select_rois(d=recipe['or_d'])
-        print("recipe has no 'roi_verts' — draw the polygon(s), then call "
-              "dataEBSD.set_rois() before using the restored pipeline.")
+        raise RuntimeError(
+            "recipe['roi_verts'] is empty and interactive=False — no ROI to "
+            "restore. Run build_dataEBSD(recipe, interactive=True), draw the "
+            "polygons, then finalize_rois(dataEBSD, recipe).")
     return d
- 
+
+def load_rois(path):
+    """
+    Load ONLY the saved ROI polygon vertices from a checkpoint file --
+    fast, standalone, does NOT rebuild dataEBSD or unpickle anything else.
+
+    Parameters
+    ----------
+    path : str
+
+    Returns
+    -------
+    roi_verts : list of (N,2) ndarray, one per saved ROI, in save order.
+        Empty list if this checkpoint has no saved ROIs.
+    """
+    with h5py.File(str(path), 'r') as f:
+        if 'rois' not in f:
+            return []
+        g = f['rois']
+        n = int(g.attrs.get('n_rois', 0))
+        return [np.asarray(g[f'roi_{i}'][()]) for i in range(n)]
+
+
+def apply_saved_rois(dataEBSD, roi_verts):
+    """
+    Apply previously-saved ROI vertices (from load_rois) to an EXISTING
+    dataEBSD object non-interactively -- no manual polygon redrawing.
+    """
+    return _apply_roi_verts(dataEBSD, roi_verts)
 
 def _generate_low_index_uvw_directions(max_index=3):
     """
@@ -297,16 +373,27 @@ def finalize_rois(d, recipe=None):
 # -----------------------------------------------------------------------------
 #  SETUP: rebuild dataEBSD from the recipe (raw pixels + crystallography + ROIs)
 # -----------------------------------------------------------------------------
-def build_dataEBSD(recipe, interactive=True):
-    """Read the .oh5 and redo the crystallography, then set up the ROIs.
 
-    ROI handling:
-      * recipe['roi_verts'] present  -> non-interactive: rebuild masks from the
-        stored polygons (no figure), fully ready to use.
-      * else, interactive=True       -> open select_rois() for you to draw, then
-        DOES NOT call set_rois (it must wait until you finish). Draw the
-        polygon(s) and then call  finalize_rois(dataEBSD, RECIPE).
-      * else, interactive=False      -> raise (nothing to select from).
+def rebuild_dataEBSD(recipe, checkpoint_path=None):
+    """
+    Re-run the cheap setup (readEBSDdata + crystallography + ROIs).
+
+    ROI restoration priority:
+    1. checkpoint_path given -> ROIs loaded from that checkpoint's 'rois'
+       group via load_rois() (fast, standalone read -- reopens the file
+       briefly, independent of any pickled-blob loading elsewhere).
+    2. Else recipe['roi_verts'], if present.
+    3. Else opens select_rois() interactively (you must then draw the
+       polygon(s) and call dataEBSD.set_rois() yourself).
+
+    Parameters
+    ----------
+    recipe : dict
+    checkpoint_path : str, optional
+        Path to a checkpoint .h5 file (as written by save_checkpoint) to
+        restore ROI vertices from. Only the 'rois' group is read here --
+        this does NOT load the pickled clustering_result/boundary_result/
+        etc.; use load_checkpoint for that.
     """
     d = EBSDData()
     d.readEBSDdata(recipe['filename'])
@@ -317,26 +404,25 @@ def build_dataEBSD(recipe, interactive=True):
                         c=recipe['cM'], beta=recipe['betaM'])
     d.setPhaseID(recipe['phaseID'])
     d.getOR()
-    d.getDefGrad()          # also runs getTwinSys / setPlotAttributes / getEl
-    d.getTwinSys()
+    d.getDefGrad()
     d.setPlotAttributes()
     d.getEl()
 
-    roi_verts = recipe.get('roi_verts')
-    if roi_verts:
-        _apply_roi_verts(d, roi_verts)                 # non-interactive
-    elif interactive:
-        d.select_rois(d=recipe['or_d'])                # opens figure; DRAW now
-        print("\n>>> Draw ROI polygon(s) in the figure, then run:")
-        print(">>>     finalize_rois(dataEBSD, RECIPE)")
-        print(">>> (this stores the masks and saves the polygons into the recipe)\n")
-    else:
-        raise RuntimeError(
-            "recipe['roi_verts'] is empty and interactive=False — no ROI to "
-            "restore. Run build_dataEBSD(recipe, interactive=True), draw the "
-            "polygons, then finalize_rois(dataEBSD, recipe).")
-    return d
+    roi_verts = None
+    if checkpoint_path is not None:
+        roi_verts = load_rois(checkpoint_path)
+        if not roi_verts:
+            roi_verts = None
+    if roi_verts is None:
+        roi_verts = recipe.get('roi_verts')
 
+    if roi_verts:
+        _apply_roi_verts(d, roi_verts)
+    else:
+        d.select_rois(d=recipe['or_d'])
+        print("No saved ROIs found (checkpoint or recipe) — draw the polygon(s), "
+              "then call dataEBSD.set_rois() before using the restored pipeline.")
+    return d
 
 def default_checkpoint_name(recipe):
     """'<oh5 stem>_roi<ID>_checkpoint.h5' derived from the recipe."""
@@ -2511,6 +2597,7 @@ def compute_cluster_boundary_misorientations(avg_M, neighbors, symops):
     return miso_angles
 
 def compute_cluster_boundary_misorientations_fast(avg_M, neighbors, symops):
+    from scipy.spatial.transform import Rotation as _R
     """
     Vectorized computation of misorientation angles (deg) between neighboring clusters
     considering symmetry operations, without explicit per-cluster loops.
@@ -2552,7 +2639,7 @@ def compute_cluster_boundary_misorientations_fast(avg_M, neighbors, symops):
     R_eq = np.einsum("sij,pjk->spik", symops, R_ab, optimize=True).reshape(-1, 3, 3)
 
     # --- 5. Convert to quaternions & compute rotation angles
-    q = R.from_matrix(R_eq).as_quat().reshape(len(symops), n_pairs, 4)
+    q = _R.from_matrix(R_eq).as_quat().reshape(len(symops), n_pairs, 4)
     w = np.clip(np.abs(q[..., 3]), -1.0, 1.0)
     ang = 2 * np.arccos(w)  # radians
     ang_deg = np.degrees(ang)  # (Ns, P)
@@ -2645,9 +2732,10 @@ class EBSDData(getPhases):
         
         # Validate data
         SelVerts, SelPaths = self.set_allroi()
+
         self.selector = selectROI(None)
-        self.selector.selVerts.append(SelVerts)
-        self.selector.selPaths.append(SelPaths)
+        #self.selector.selPaths.insert(0,SelPaths)
+        #self.selector.selVerts.insert(0,SelVerts)
         self._validate()
 
     def _validate(self):
@@ -2791,7 +2879,7 @@ class EBSDData(getPhases):
         return Colors, phases, pg_laues
 
 
-    def plot_IPF(self,d, tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, orientations=None, mask=None,fig=None, ax=None, **kwargs):
+    def plot_IPF(self,d, tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, orientations=None, mask=None,fig=None, ax=None, colorcode=True, **kwargs):
         if tiling is None:
             if self._ebsdData.grid.lower() == 'hexgrid':
                 tiling == "hex"
@@ -2817,21 +2905,31 @@ class EBSDData(getPhases):
         ipfmap = self._ebsdData.plot_IPF_lh(d=d,tiling=tiling,scalebar=scalebar,d_IPF=None,color=Colors,ax=ax,sel=mask,**kwargs)#(gray=scan.IQ)
         #print(ax.get_xlim())
         #print(ax.get_ylim())
-        rc = {"font.size": 8}
-        with plt.rc_context(rc):  # Temporarily reduce font size
-            for pgi, pg_laue in enumerate(pg_laues):
-                ax_ckey = fig.add_axes(
-                    [0.2+0.2*pgi, 0.85, 0.1, 0.1], projection="ipf", symmetry=pg_laue, zorder=2
-                )
-                ax_ckey.plot_ipf_color_key(show_title=True)
-                ax_ckey.patch.set_facecolor("None")
+        if colorcode:
+            rc = {"font.size": 8}
+            with plt.rc_context(rc):  # Temporarily reduce font size
+                for pgi, pg_laue in enumerate(pg_laues):
+                    ax_ckey = fig.add_axes(
+                        [0.2+0.2*pgi, 0.85, 0.1, 0.1], projection="ipf", symmetry=pg_laue, zorder=2
+                    )
+                    ax_ckey.plot_ipf_color_key(show_title=True)
+                    ax_ckey.patch.set_facecolor("None")
 
         return fig, ax
-            
+    def _ensure_allroi_mask(self):
+        """
+        Idempotent: if self.rois.masks is empty, seed it with the whole-scan
+        mask via set_allroi(). No-op if masks already has entries.
+        """
+        if len(self.rois.masks) == 0:
+            SelVerts, SelPaths = self.set_allroi()
+            self.rois.masks.append(SelPaths.contains_points(np.vstack((self.X, self.Y)).T))            
     def select_rois(self, d, phases='all',tiling=None, scalebar=True, roi=None, phase=None,):
         """
         select ROIS from an IPF by polygons
         """
+        self._ensure_allroi_mask()
+
         fig, ax = self.plot_IPF(d, tiling=tiling, scalebar=scalebar, roi=roi, phase=phase)
         self.selector = selectROI(ax)
         #selector2 = PolygonSelector(ax,onselect)#, lambda *args: None)
@@ -2847,8 +2945,32 @@ class EBSDData(getPhases):
         #print(selector.selVerts)
         return 
 
-
     def set_rois(self):
+        """
+        Set selected ROIS as masks. Idempotent -- safe to call more than once.
+        """
+        if len(self.rois.masks) > 0 and len(self.rois.masks) == len(self.selector.selPaths):
+            return
+
+        self._ensure_allroi_mask()
+
+        if len(self.rois.masks_by_phase) == 0:
+            mask_by_phase = {}
+            for phase_id in self.phase_names:
+                mask_by_phase[self.phase_names[phase_id]] = (self.phases_id == phase_id) * self.rois.masks[0]
+            self.rois.masks_by_phase.append(mask_by_phase)
+
+        for selPath, selVert in zip(self.selector.selPaths, self.selector.selVerts):
+            self.rois.masks.append(selPath.contains_points(np.vstack((self.X, self.Y)).T))
+            mask_by_phase = {}
+            for phase_id in self.phase_names:
+                mask_by_phase[self.phase_names[phase_id]] = (self.phases_id == phase_id) * self.rois.masks[-1]
+            self.rois.masks_by_phase.append(mask_by_phase)
+
+        SelVerts, SelPaths = self.set_allroi()
+        self.selector.selPaths.insert(0, SelPaths)
+        self.selector.selVerts.insert(0, SelVerts)
+    def set_rois_ini(self):
         """
         Set selected ROIS as masks
         """
@@ -2866,8 +2988,10 @@ class EBSDData(getPhases):
             for phase_id in self.phase_names:
                 mask_by_phase[self.phase_names[phase_id]] = (self.phases_id==phase_id)*self.rois.masks[-1]
             self.rois.masks_by_phase.append(mask_by_phase)
-        self.selector.selPaths.insert(0,selPath)
-        self.selector.selVerts.insert(0,selVert)
+        #if len(self.rois.masks)==0:
+        SelVerts, SelPaths = self.set_allroi()
+        self.selector.selPaths.insert(0,SelPaths)
+        self.selector.selVerts.insert(0,SelVerts)
         mask_by_phase={}
         
     def get_mask(self,selVerts,phase=None):
@@ -2887,7 +3011,7 @@ class EBSDData(getPhases):
         SelPaths = Path(SelVerts)
         #self.rois.masks.append(SelPaths.contains_points(np.vstack((self.X,self.Y)).T))
         #self.rois.allroidx = len(self.rois.masks)-1
-        self.rois.masks.append(SelPaths.contains_points(np.vstack((self.X,self.Y)).T))
+        #self.rois.masks.append(SelPaths.contains_points(np.vstack((self.X,self.Y)).T))
 
 
         return SelVerts, SelPaths
@@ -3623,30 +3747,55 @@ class MisorientationClustering(ClusteringAlgorithm):
         """Perform misorientation-based clustering."""
         # Get data
         X, Y = data.X, data.Y
-        #print(X)
         if self.roi is None:
             sel = data.rois.masks[0]
         else:
-            sel=data.rois.masks[self.roi]
+            sel = data.rois.masks[self.roi]
 
         nph = data.unique_phases_id.shape[0]
-        if not isinstance(self.ang_thr,np.ndarray) and not isinstance(self.ang_thr,list):
-            self.ang_thr = [self.ang_thr]*nph
 
-        if not isinstance(self.dmax,np.ndarray) and not isinstance(self.dmax,list):
-            self.dmax = [self.dmax]*nph
+        # ---- resolve any per-phase DICT parameters (e.g. {'A': 50, 'B': 30})
+        #      into plain lists, ordered to match the phase iteration order
+        #      _cluster_multiphase uses internally (list(data.phase_ids.values())) ----
+        phase_order = list(data.phase_ids.keys())  # e.g. ['A', 'B'], same order as .values()
 
-        if not isinstance(self.minidxs,np.ndarray) and not isinstance(self.minidxs,list):
-            self.minidxs = [self.minidxs]*nph
+        def _resolve_dict_param(val, name):
+            if isinstance(val, dict):
+                missing = [p for p in phase_order if p not in val]
+                if missing:
+                    raise ValueError(f"'{name}' dict is missing entries for phase(s) {missing} "
+                                    f"(expected keys: {phase_order})")
+                return [val[p] for p in phase_order]
+            return val
 
-        if not isinstance(self.distance,np.ndarray) and not isinstance(self.distance,list):
-            self.distance = [self.distance]*nph
+        self.ang_thr = _resolve_dict_param(self.ang_thr, 'ang_thr')
+        self.dmax = _resolve_dict_param(self.dmax, 'dmax')
+        self.minidxs = _resolve_dict_param(self.minidxs, 'minidxs')
+        self.distance = _resolve_dict_param(self.distance, 'distance')
+        self.perimeteronly = _resolve_dict_param(self.perimeteronly, 'perimeteronly')
 
-        if not isinstance(self.perimeteronly,np.ndarray) and not isinstance(self.perimeteronly,list):
-            self.perimeteronly = [self.perimeteronly]*nph
-        neighbors=[]
-        for distance, perimeteronly in zip(self.distance,self.perimeteronly):
-            neighbors.append(data.compute_neighbors(distance=distance, perimeteronly=perimeteronly, distance_convention=self.distance_convention, roi=self.roi))
+        # ---- existing scalar/list broadcasting, unchanged -- dicts are
+        #      already plain lists by this point, so this only fires for
+        #      genuine scalars ----
+        if not isinstance(self.ang_thr, np.ndarray) and not isinstance(self.ang_thr, list):
+            self.ang_thr = [self.ang_thr] * nph
+
+        if not isinstance(self.dmax, np.ndarray) and not isinstance(self.dmax, list):
+            self.dmax = [self.dmax] * nph
+
+        if not isinstance(self.minidxs, np.ndarray) and not isinstance(self.minidxs, list):
+            self.minidxs = [self.minidxs] * nph
+
+        if not isinstance(self.distance, np.ndarray) and not isinstance(self.distance, list):
+            self.distance = [self.distance] * nph
+
+        if not isinstance(self.perimeteronly, np.ndarray) and not isinstance(self.perimeteronly, list):
+            self.perimeteronly = [self.perimeteronly] * nph
+
+        neighbors = []
+        for distance, perimeteronly in zip(self.distance, self.perimeteronly):
+            neighbors.append(data.compute_neighbors(distance=distance, perimeteronly=perimeteronly,
+                                                    distance_convention=self.distance_convention, roi=self.roi))
         # Perform clustering (using your existing algorithm)
         labels, com, cluster_phase_map = self._cluster_multiphase(
             data.X, data.Y, data.quaternions, data.sym_quats_dict,
@@ -3655,17 +3804,17 @@ class MisorientationClustering(ClusteringAlgorithm):
             dmax=self.dmax,
             minidxs=self.minidxs)
         # Create result object
-        result = ClusteringResult(labels, self, data, 
-                                  parameters={
+        result = ClusteringResult(labels, self, data,
+                                parameters={
                                     'ang_thr': self.ang_thr,
                                     'dmax': self.dmax,
                                     'minidxs': self.minidxs,
-                                    'roi':self.roi,
-                                    'distance':self.distance,
-                                    'perimeteronly':self.perimeteronly,
-                                    'distance_convention':self.distance_convention,
+                                    'roi': self.roi,
+                                    'distance': self.distance,
+                                    'perimeteronly': self.perimeteronly,
+                                    'distance_convention': self.distance_convention,
                                     }, cluster_phases_id=cluster_phase_map, com=com)
-        
+
         return result
     
     def _cluster_multiphase(self,X, Y, Q, sym_quats_dict, neighbors, Sel, phases_id, phase_ids,
@@ -4008,7 +4157,37 @@ class ClusteringResult:
     @property
     def n_clusters(self):
         return len(self.get_unique_clusters())
-    
+    def get_recipe_min_size(self, phase):
+        """
+        Return the minidxs (minimum cluster pixel count) value used by the
+        ORIGINAL clustering algorithm's recipe for `phase`, as stored in
+        self.parameters['minidxs'] by MisorientationClustering.fit(). This
+        survives through merge_clusters_by_orientation/symmetrize_clusters
+        (both shallow-copy self via copy.copy, so self.parameters carries
+        over unless something explicitly reassigns it).
+
+        Parameters
+        ----------
+        phase : str
+
+        Returns
+        -------
+        min_size : int
+        """
+        if not hasattr(self, 'parameters') or self.parameters is None or 'minidxs' not in self.parameters:
+            raise AttributeError(
+                "self.parameters['minidxs'] not found -- this ClusteringResult wasn't "
+                "produced by MisorientationClustering.fit(), or parameters weren't preserved. "
+                "Pass min_size explicitly instead of relying on min_size='recipe'."
+            )
+        minidxs = self.parameters['minidxs']
+        phase_order = list(self.data.phase_ids.keys())
+        if phase not in phase_order:
+            raise ValueError(f"Phase '{phase}' not found in self.data.phase_ids (expected one of {phase_order})")
+        idx = phase_order.index(phase)
+        if isinstance(minidxs, (list, np.ndarray)):
+            return int(minidxs[idx])
+        return int(minidxs)  # scalar, same for all phases
     def _getMask(self, roi=None,cluster_id=None, phase=None):
         if roi is None:
             roimask = self.data.rois.masks[0]
@@ -6552,6 +6731,315 @@ class ClusteringResult:
             'phase_name': self.data.phase_names[phase_id],
         }
 
+
+    def get_neighbor_cluster_misorientations(self, boundary_result, phase, min_size='recipe',
+                                            merge_groups_all=None, exclude_pairs=None, include_pairs=None):
+        """
+        Compute misorientation angle (deg) between every pair of NEIGHBORING
+        (physically adjacent) clusters of the same phase, using cluster
+        average orientations (self.avg_orientations) and full symmetry.
+
+        Restricted to same-phase pairs: misorientation via a shared crystal
+        symmetry group is only meaningful within one phase. Inter-phase
+        boundaries are not included here -- use check_twin_relationship /
+        map_twin_relationships for orientation-relationship analysis across
+        phases.
+
+        This is the TRUE MINIMUM disorientation (standard Mackenzie/GB-
+        misorientation convention) -- NOT the T-loop-adjusted angle used by
+        check_twin_relationship/map_twin_relationships/map_kink_axes. A
+        confirmed twin/kink relationship will generally NOT show up at its
+        tabulated shear angle or 180 deg here; it appears at whatever its
+        minimum symmetric representative's angle actually is.
+
+        Uses cluster AVERAGE orientations -- for individual pixel-pair
+        misorientations at boundaries instead, see
+        get_pixel_boundary_misorientations.
+
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results (grouped_boundaries, cluster_phases_id).
+            Must be built from THIS clustering_result (same self.labels).
+        phase : str
+            Phase to restrict to.
+        min_size : int, optional
+            Clusters smaller than this (pixels) are excluded entirely.
+        merge_groups_all : dict, optional
+        {phase: {root_id: [fragment cluster ids]}}, from
+        merge_clusters_by_orientation. REQUIRED if self is a MERGED
+        ClusteringResult (i.e. boundary_result was built on the
+        original unmerged clustering_result, but self's cluster labels
+        are merged roots) -- without this, fragment-level labels in
+        boundary_result won't match self.avg_orientations' root-level
+        keys, and every merged cluster's neighbor relationships are
+        silently dropped (no error, just missing/wrong data). Leave
+        None only when self IS the original unmerged clustering_result.
+
+        exclude_pairs : set/list of (cluster_a, cluster_b) tuples, or list
+        of dict with 'cluster_a'/'cluster_b' keys, optional
+        Neighboring pairs to EXCLUDE from the result -- e.g. pairs
+        already identified as twins via map_twin_relationships'
+        `matches`, to isolate the "non-twin" boundary population.
+        Order-independent (both (a,b) and (b,a) are treated as the
+        same pair). Default None (no exclusion).
+
+        include_pairs : set/list of (cluster_a, cluster_b) tuples, or list
+        of dict with 'cluster_a'/'cluster_b' keys, optional
+        If given, RESTRICT the result to only these neighboring pairs
+        (e.g. only pairs already identified as twins/kinks, to look at
+        their misorientation distribution in isolation). Applied before
+        exclude_pairs, so both can be combined (e.g. include twin
+        matches but exclude a few specific ones). Order-independent,
+        same format as exclude_pairs. Default None (no restriction).
+
+        exclude_pairs, include_pairs : optional
+        Each accepts EITHER a flat list of pairs (tuples, or dicts with
+        'cluster_a'/'cluster_b' keys), OR a list of such lists (e.g.
+        [matches, kink_results]) -- in the latter case all sublists are
+        flattened together before building the pair set. Mixing both
+        forms in one list is fine too (each element is inspected
+        individually).
+
+        Returns
+        -------
+        miso_angles : dict {(cluster_a, cluster_b): angle_deg}
+            a < b, one entry per unique same-phase neighboring pair.
+        boundary_lengths : dict {(cluster_a, cluster_b): n_pixels}
+            Boundary length (in boundary pixel count) for each pair.
+        
+        """
+
+        phase_id = self.data.phase_ids[phase]
+        sizes = self.cluster_sizes
+
+        def _to_pair_set(items):
+            s = set()
+            for item in items:
+                if isinstance(item, list):
+                    # a nested list of pairs, e.g. one of [matches, kink_results]
+                    s |= _to_pair_set(item)
+                    continue
+                if isinstance(item, dict):
+                    a, b = item['cluster_a'], item['cluster_b']
+                else:
+                    a, b = item
+                s.add(tuple(sorted((a, b))))
+            return s
+
+        include_set = _to_pair_set(include_pairs) if include_pairs is not None else None
+        exclude_set = _to_pair_set(exclude_pairs) if exclude_pairs is not None else set()
+
+        frag_to_root = {}
+        if merge_groups_all is not None:
+            for root, fragments in merge_groups_all[phase].items():
+                for f in fragments:
+                    frag_to_root[f] = root
+
+        def _resolve(label):
+            return frag_to_root.get(label, label)
+
+        neighbors = {}
+        boundary_lengths = {}
+        if min_size == 'recipe':
+            min_size = self.get_recipe_min_size(phase)        
+
+        for i, cluster_label in enumerate(boundary_result.clusters):
+            cluster_label = int(cluster_label)
+            if boundary_result.cluster_phases_id[i] != phase_id:
+                continue
+            root_a = _resolve(cluster_label)
+            if root_a not in self.avg_orientations:
+                continue
+            if min_size is not None and sizes.get(root_a, 0) < min_size:
+                continue
+
+            boundaries = boundary_result.grouped_boundaries[i]
+            boundary_phases_id = boundary_result.grouped_boundary_phases_id[i]
+
+            nbs = set()
+            for nb_label, coords in boundaries.items():
+                if nb_label == -1:
+                    continue
+                if boundary_phases_id.get(nb_label) != phase_id:
+                    continue
+                root_b = _resolve(nb_label)
+                if root_b == root_a:
+                    continue
+                if root_b not in self.avg_orientations:
+                    continue
+                if min_size is not None and sizes.get(root_b, 0) < min_size:
+                    continue
+
+                pair = tuple(sorted((root_a, root_b)))
+                if include_set is not None and pair not in include_set:
+                    continue
+                if pair in exclude_set:
+                    continue
+
+                nbs.add(root_b)
+                boundary_lengths[pair] = boundary_lengths.get(pair, 0) + len(coords)
+
+            if nbs:
+                neighbors.setdefault(root_a, set()).update(nbs)
+
+        if not neighbors:
+            return {}, {}
+
+        all_ids = set(neighbors.keys()) | {n for nbs in neighbors.values() for n in nbs}
+        avg_M = {c: self.avg_orientations[c] for c in all_ids}
+
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        symops = symops_all[np.array([round(np.linalg.det(s)) == 1 for s in symops_all])]
+
+        miso_angles = compute_cluster_boundary_misorientations_fast(avg_M, neighbors, symops)
+
+        return miso_angles, boundary_lengths
+
+    def plot_neighbor_cluster_misorientation_histogram(self, boundary_result, phase, bins=50,
+                                                        min_size='recipe', weight_by_length=False,
+                                                        facecolor=None, edgecolor='black',
+                                                        fig=None, ax=None, return_val=False, 
+                                                        merge_groups_all=None,exclude_pairs=None, include_pairs=None, **kwargs):
+        """
+        Plot a histogram of misorientation angles between NEIGHBORING
+        (physically adjacent) clusters of the same phase, using cluster
+        AVERAGE orientations (true minimum disorientation -- see
+        get_neighbor_cluster_misorientations). For individual pixel-pair
+        misorientations at boundaries instead, see
+        plot_pixel_boundary_misorientation_histogram.
+
+        Parameters
+        ----------
+        boundary_result : BoundaryResult
+            Boundary analysis results.
+        phase : str
+            Phase to restrict to.
+        bins : int, optional
+            Number of histogram bins. Default 50.
+        min_size : int, optional
+            Clusters smaller than this (pixels) are excluded entirely.
+        weight_by_length : bool, optional
+            If True, weight each pair's contribution by its boundary length
+            (pixel count) instead of counting each pair once. Default False.
+        facecolor : color spec, optional
+            Bar fill color. Default None (matplotlib's own default).
+        edgecolor : color spec, optional
+            Bar edge color. Default 'black'.
+        fig, ax : matplotlib Figure, Axes, optional
+            Existing fig/ax to draw into. If ax is None, a new one is
+            created. If ax is provided and already has a title, the new
+            title is appended below it.
+        return_val : bool, optional
+            If True, also return (miso_angles, boundary_lengths).
+        merge_groups_all : dict, optional
+        {phase: {root_id: [fragment cluster ids]}}, from
+        merge_clusters_by_orientation. REQUIRED if self is a MERGED
+        ClusteringResult (i.e. boundary_result was built on the
+        original unmerged clustering_result, but self's cluster labels
+        are merged roots) -- without this, fragment-level labels in
+        boundary_result won't match self.avg_orientations' root-level
+        keys, and every merged cluster's neighbor relationships are
+        silently dropped (no error, just missing/wrong data). Leave
+        None only when self IS the original unmerged clustering_result.
+        
+        exclude_pairs : set/list of (cluster_a, cluster_b) tuples, or list
+        of dict with 'cluster_a'/'cluster_b' keys, optional
+        Neighboring pairs to EXCLUDE from the result -- e.g. pairs
+        already identified as twins via map_twin_relationships'
+        `matches`, to isolate the "non-twin" boundary population.
+        Order-independent (both (a,b) and (b,a) are treated as the
+        same pair). Default None (no exclusion).
+
+        include_pairs : set/list of (cluster_a, cluster_b) tuples, or list
+        of dict with 'cluster_a'/'cluster_b' keys, optional
+        If given, RESTRICT the result to only these neighboring pairs
+        (e.g. only pairs already identified as twins/kinks, to look at
+        their misorientation distribution in isolation). Applied before
+        exclude_pairs, so both can be combined (e.g. include twin
+        matches but exclude a few specific ones). Order-independent,
+        same format as exclude_pairs. Default None (no restriction).
+
+        exclude_pairs, include_pairs : optional
+        Each accepts EITHER a flat list of pairs (tuples, or dicts with
+        'cluster_a'/'cluster_b' keys), OR a list of such lists (e.g.
+        [matches, kink_results]) -- in the latter case all sublists are
+        flattened together before building the pair set. Mixing both
+        forms in one list is fine too (each element is inspected
+        individually).
+
+        **kwargs
+            Passed through to ax.hist (e.g. alpha). Do not pass
+            'facecolor'/'edgecolor'/'color' here -- use the named
+            parameters above instead.
+
+        Returns
+        -------
+        fig, ax : matplotlib Figure, Axes
+        miso_angles, boundary_lengths : only if return_val=True
+        """
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        miso_angles, boundary_lengths = self.get_neighbor_cluster_misorientations(
+            boundary_result, phase, min_size=min_size,
+            merge_groups_all=merge_groups_all, exclude_pairs=exclude_pairs,
+            include_pairs=include_pairs
+        )
+
+        if not miso_angles:
+            print(f"No same-phase neighboring cluster pairs found for phase '{phase}' "
+                f"(after inclusion/exclusion filters, if any).")
+            return (fig, ax, miso_angles, boundary_lengths) if return_val else (fig, ax)
+
+        pairs = list(miso_angles.keys())
+        angles = np.array([miso_angles[p] for p in pairs])
+
+        if weight_by_length:
+            weights = np.array([boundary_lengths[p] for p in pairs], dtype=float)
+        else:
+            weights = None
+
+        hist_kwargs = dict(bins=bins, weights=weights, **kwargs)
+        if facecolor is not None:
+            hist_kwargs['facecolor'] = facecolor
+        if edgecolor is not None:
+            hist_kwargs['edgecolor'] = edgecolor
+        ax.hist(angles, **hist_kwargs)
+
+        ax.set_xlabel('Misorientation angle (deg)')
+        ax.set_ylabel('Boundary length (px)' if weight_by_length else 'Number of neighboring pairs')
+
+        def _count_pairs(items):
+            s = set()
+            for item in items:
+                if isinstance(item, list):
+                    s |= _count_pairs_set(item)
+                    continue
+                if isinstance(item, dict):
+                    a, b = item['cluster_a'], item['cluster_b']
+                else:
+                    a, b = item
+                s.add(tuple(sorted((a, b))))
+            return s
+
+        def _count_pairs_set(items):
+            return _count_pairs(items)
+
+        filt_note = ""
+        if include_pairs:
+            filt_note += f", restricted to {len(_count_pairs(include_pairs))} pair(s)"
+        if exclude_pairs:
+            filt_note += f", {len(_count_pairs(exclude_pairs))} pair(s) excluded"
+        new_title = (f"Neighbor cluster misorientation histogram — {phase}, "
+                    f"{len(pairs)} pairs" + (" (length-weighted)" if weight_by_length else "") + filt_note)
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
+
+        if return_val:
+            return fig, ax, miso_angles, boundary_lengths
+        return fig, ax 
+
     def get_zone_axis_transform(self, cluster_id, uvw=(0, 0, 1), second_uvw=None, phase=None):
         """
         Build a sample_transform matrix for plot_cluster_pole_figure that
@@ -6893,6 +7381,10 @@ class ClusteringResult:
         if cluster_ids is None:
             cluster_ids = list(self.labels_by_phase[phase])
         cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+
+        if min_size == 'recipe':
+            min_size = self.get_recipe_min_size(phase)        
+
         if min_size is not None:
             sizes = self.cluster_sizes
             cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
@@ -7224,7 +7716,7 @@ class ClusteringResult:
         }    
 
 
-    def map_kink_axes(self, phase, max_miller_index=2, tol_deg=5.0, min_size=None,
+    def map_kink_axes(self, phase, max_miller_index=2, tol_deg=5.0, min_size='recipe',
                     cluster_ids=None, print_result=False, print_top_n_per_pair=3,
                     sort_by='size'):
         """
@@ -7277,6 +7769,10 @@ class ClusteringResult:
         if cluster_ids is None:
             cluster_ids = list(self.labels_by_phase[phase])
         cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+
+        if min_size == 'recipe':
+            min_size = self.get_recipe_min_size(phase)        
+
         if min_size is not None:
             sizes = self.cluster_sizes
             cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
@@ -7548,7 +8044,7 @@ class ClusteringResult:
         }
 
 
-    def map_twin_relationships(self, phase, system, modes, tol_deg=5.0, min_size=None,
+    def map_twin_relationships(self, phase, system, modes, tol_deg=5.0, min_size='recipe',
                                 cluster_ids=None, print_result=False, print_matches_only=True,
                                 sort_by='deviation'):
         """
@@ -7648,10 +8144,11 @@ class ClusteringResult:
 
         if isinstance(modes, str):
             modes = [modes]
-
         if cluster_ids is None:
             cluster_ids = list(self.labels_by_phase[phase])
         cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+        if min_size == 'recipe':
+            min_size = self.get_recipe_min_size(phase)        
         if min_size is not None:
             sizes = self.cluster_sizes
             cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
@@ -8139,7 +8636,7 @@ class ClusteringResult:
                 print()
 
         return pairs_results
-    def merge_clusters_by_orientation(self, threshold_deg=2.0, phase=None, min_size=None,
+    def merge_clusters_by_orientation(self, threshold_deg=2.0, phase=None, min_size='recipe',
                                         return_disor_matrices=False):
         """
         Merge clusters within the same phase whose average orientations are
@@ -8167,6 +8664,7 @@ class ClusteringResult:
         min_size : int, optional
             Clusters smaller than this (pixels) are excluded from merge
             consideration and kept as-is.
+            if 'recipe', uses self.recipe['min_cluster_size'] if present, else 0.
         return_disor_matrices : bool, optional
             If True, also return the NxN disorientation matrices used for
             grouping (one per phase processed).
@@ -8186,7 +8684,7 @@ class ClusteringResult:
             phases_to_process = [phase]
         else:
             phases_to_process = list(phase)
-
+    
         if not hasattr(self, 'avg_orientations') or self.avg_orientations is None:
             self.getAvgOri()
 
@@ -8196,9 +8694,10 @@ class ClusteringResult:
         disor_matrices = {}
 
         for ph in phases_to_process:
+            this_min_size = self.get_recipe_min_size(ph) if min_size == 'recipe' else min_size
             cluster_ids = [c for c in self.labels_by_phase[ph] if c in self.avg_orientations]
-            if min_size is not None:
-                cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= min_size]
+            if this_min_size is not None:
+                cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= this_min_size]
 
             if len(cluster_ids) < 2:
                 merge_groups_all[ph] = {int(c): [int(c)] for c in cluster_ids}
