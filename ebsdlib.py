@@ -7458,7 +7458,13 @@ class ClusteringResult:
             'axis_dev_deg' : float, for the single best match
             'variant_cartesian' : (3,) ndarray, for the single best match
             'best_T_idx' : int
-            'T' : (3,3) ndarray
+            'T' : (3,3) ndarray, the symmetry operation such that T @ M_fwd (=
+                T @ G2 @ G1.T) has the matching axis. G2_used = T @ G2 is
+                cluster B's kink-consistent branch; cluster A (G1) is unchanged.
+                NOTE: this is the OPPOSITE convention from an earlier version
+                (M_fwd @ T, correcting G1 instead) -- see check_twin_relationship's
+                docstring for the same change and its implications for downstream
+                code (e.g. Schmid factor calculations).
             'all_matches_by_axis' : dict {axis_idx: list of dict}
                 EVERY (T, variant) combination satisfying tol_deg for that
                 axis, each {'axis_dev_deg', 'kink_angle_deg', 'T_idx',
@@ -7494,7 +7500,8 @@ class ClusteringResult:
         all_matches = [[] for _ in axes]
 
         for t_idx, T in enumerate(symops_proper):
-            M_T = M_fwd @ T
+            #M_T = M_fwd @ T
+            M_T = T @ M_fwd
             q = _R.from_matrix(M_T).as_quat()
             if q[3] < 0:
                 q = -q
@@ -7605,7 +7612,13 @@ class ClusteringResult:
             'kink_angle_deg' : float, angle of the single best match (see warning)
             'axis_dev_deg' : float
             'best_T_idx' : int
-            'T' : (3,3) ndarray
+            'T' : (3,3) ndarray, the symmetry operation such that T @ M_fwd (=
+                T @ G2 @ G1.T) has the matching axis. G2_used = T @ G2 is
+                cluster B's kink-consistent branch; cluster A (G1) is unchanged.
+                NOTE: this is the OPPOSITE convention from an earlier version
+                (M_fwd @ T, correcting G1 instead) -- see check_twin_relationship's
+                docstring for the same change and its implications for downstream
+                code (e.g. Schmid factor calculations).
             'variant_cartesian' : (3,) ndarray
             'is_match' : bool
             'all_matches_by_axis' : only if return_all_matches=True
@@ -7658,7 +7671,8 @@ class ClusteringResult:
         jj = np.array([j for _, j in pair_idx])
 
         M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
-        M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
+        #M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
+        M_T = np.einsum('tij,pjk->ptik', symops_proper, M_fwd)  # (P,Ns,3,3)
 
         q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
         flip = q[..., 3] < 0
@@ -7881,7 +7895,8 @@ class ClusteringResult:
         all_matches = [[] for _ in families]
 
         for t_idx, T in enumerate(symops_proper):
-            M_T = M_fwd @ T
+            #M_T = M_fwd @ T
+            M_T = T @ M_fwd
             q = _R.from_matrix(M_T).as_quat()
             if q[3] < 0:
                 q = -q
@@ -8049,8 +8064,8 @@ class ClusteringResult:
         jj = np.array([j for _, j in pair_idx])
 
         M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
-        M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
-
+        #M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
+        M_T = np.einsum('tij,pjk->ptik', symops_proper, M_fwd)  # (P,Ns,3,3)
         q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
         flip = q[..., 3] < 0
         q[flip] = -q[flip]
@@ -8133,26 +8148,27 @@ class ClusteringResult:
 
         PREREQUISITE: self.avg_orientations for cluster_a/cluster_b must
         already be resolved to a mutually consistent branch (e.g. via
-        symmetrize_clusters with a shared reference_cluster_id) -- see
-        prior docstring notes for why.
+        symmetrize_clusters with a shared reference_cluster_id).
 
         Searches the FULL general two-sided symmetric-equivalence space:
-        for M_fwd = G2 @ G1.T, every M_T = M_fwd @ T (T over all proper
-        symops) is tested, and for each M_T, its axis/angle is compared
-        against all 12 equivalent variants of each of three target
-        families (n1_a/180deg, a1_a/180deg, n2_a/shear_angle). This T-loop
-        is REQUIRED, not optional -- confirmed empirically: for one real
-        pair, the minimum-angle representative (T=identity-equivalent) only
-        matched K2_shear (angle=37 deg, nowhere near 180), while a DIFFERENT
-        representative (specific T != identity) matched K1_180 almost
-        exactly (angle_dev=0.15 deg, axis_dev=1.00 deg) -- a real Type I
-        twin relationship that would have been completely missed without
-        this search. Algebraically, (T-loop) x (12-variant target search)
-        together reparametrize the FULL {S_b @ M @ S_a.T} space (not a
-        subset), so this is a complete search, not a heuristic.
+        for M_fwd = G2 @ G1.T, every M_T = T @ M_fwd (T over all proper
+        symops) is tested. NOTE: T now corrects CLUSTER B's branch, not
+        cluster A's -- M_T = T @ G2 @ G1.T = (T @ G2) @ G1.T, i.e. the
+        branch actually consistent with a found T is G2_used = T @ G2,
+        with G1 held fixed. This is the opposite convention from an
+        earlier version of this function (which used M_T = M_fwd @ T,
+        correcting G1 instead) -- ANY DOWNSTREAM CODE that applied T to
+        cluster_a's twin-element vectors (e.g. Schmid factor calculations,
+        K1-boundary-trace pole-figure plotting) must be updated: T should
+        now be applied to n1_a/a1_a/n2_a on CLUSTER B's side (or,
+        equivalently, axial_B = T.dot(G2.dot(axial_dir)) with untransformed
+        n1/a1), while cluster A uses raw G1 with untransformed n1_a/a1_a/
+        n2_a -- do not mix the old and new conventions.
 
-        Does NOT use C_a -- see earlier notes on why C_a (as tabulated here)
-        does not represent the correct rotation for non-compound modes.
+        As before, this T-loop is REQUIRED (not optional) and, combined with
+        the 12-variant target search, reparametrizes the FULL
+        {S_b @ M @ S_a.T} space -- a complete search, not a heuristic. Does
+        NOT use C_a -- see earlier notes on why.
 
         Parameters
         ----------
@@ -8163,29 +8179,24 @@ class ClusteringResult:
         tol_deg : float, optional
             Match tolerance (degrees) for BOTH axis and angle. Default 5.0.
 
-        Additionally stores which SPECIFIC one of the 12 crystallographically-
-        equivalent twin variants is identified as physically operating
-        (Miller indices K1_a/K2_a/eta1_a/eta2_a for that variant, if present
-        in twinSys), and the actual symmetry operation T (3x3 matrix) that
-        reveals the match (M_fwd @ T has the matching axis/angle) --
-        confirmed necessary and validated against true brute-force
-        S2 @ M @ S1.T search (see prior discussion).
-
         Returns
         -------
         result : dict
-            ... (same fields as before, plus:)
+            'cluster_a', 'cluster_b', 'system', 'mode'
+            'is_match' : bool, True if any condition matched
+            'best_condition' : 'K1_180', 'eta1_180', or 'K2_shear'
+            'best_T_idx' : int, index into symops_proper
             'T' : (3,3) ndarray
-                The symmetry operation such that (G2 @ G1.T) @ T has the
-                matching axis/angle for best_condition.
-            'twin_elements' : dict
-                Miller-index (and Cartesian, where available) twin elements
-                for the SPECIFIC operating variant (variant_idx) of the
-                matched mode: keys drawn from whichever of
-                'K1_a','K2_a','eta1_a','eta2_a' (Miller) and
-                'n1_a','n2_a','a1_a','a2_a' (Cartesian) exist in
-                self.data.twinSys[system][mode], each sliced to
-                [variant_idx]. Missing keys are simply omitted.
+                The symmetry operation such that T @ (G2 @ G1.T) has the
+                matching axis/angle for best_condition -- i.e. G2_used =
+                T @ G2 is cluster B's twin-consistent branch; cluster A
+                (G1) is unchanged.
+            'axis_dev_deg', 'angle_dev_deg' : float
+            'variant_idx' : int, which tabulated twin variant matched
+            'angle_deg' : float
+            'twin_elements' : dict, Miller/Cartesian twin elements for the
+                SPECIFIC operating variant (variant_idx)
+            'checks' : dict, per-condition breakdown
         """
         from scipy.spatial.transform import Rotation as _R
 
@@ -8222,7 +8233,7 @@ class ClusteringResult:
         best_per_condition = {k: None for k in target_families}
 
         for t_idx, T in enumerate(symops_proper):
-            M_T = M_fwd @ T
+            M_T = T @ M_fwd   # <-- CHANGED: was M_fwd @ T
             q = _R.from_matrix(M_T).as_quat()
             if q[3] < 0:
                 q = -q
@@ -8359,8 +8370,9 @@ class ClusteringResult:
                 independently satisfied tol_deg for best_mode (more than
                 one entry indicates a compound twin)
             'best_T_idx' : int, index into this phase's proper symops
-            'T' : (3,3) ndarray, the actual symmetry operation such that
-                M_fwd @ T has the matching axis/angle for best_condition
+            'T' : (3,3) ndarray, the symmetry operation such that T @ M_fwd has
+                the matching axis/angle for best_condition -- i.e. G2_used = T @
+                G2 (cluster B's branch), cluster A unchanged.
             'variant_idx' : int, which tabulated twin variant matched,
                 for best_condition
             'twin_elements' : dict, Miller/Cartesian twin elements for the
@@ -8413,7 +8425,10 @@ class ClusteringResult:
         M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])  # (P,3,3)
 
         # ---- M_T = M_fwd @ T for every pair, every T: (P, Ns, 3, 3) ----
-        M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)
+        #M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)
+        # ---- M_T = T @ M_fwd for every pair, every T: (P, Ns, 3, 3) ----
+        # CHANGED: was np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  (M_fwd @ T)
+        M_T = np.einsum('tij,pjk->ptik', symops_proper, M_fwd)
 
         q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
         flip = q[..., 3] < 0
@@ -8495,8 +8510,9 @@ class ClusteringResult:
             v_idx_p = int(v_idx_arr[p])
 
             twin_data = twin_data_by_mode[m]
+            #twin_data.keys()
             twin_elements = {}
-            for key in ('K1_a', 'K2_a', 'eta1_a', 'eta2_a', 'n1_a', 'n2_a', 'a1_a', 'a2_a'):
+            for key in twin_data.keys():#('K1_a', 'K2_a', 'eta1_a', 'eta2_a', 'n1_a', 'n2_a', 'a1_a', 'a2_a'):
                 if key in twin_data:
                     arr = np.asarray(twin_data[key])
                     if v_idx_p < len(arr):
