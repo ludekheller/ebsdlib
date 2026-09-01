@@ -19,6 +19,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import PolygonSelector
 import matplotlib.path as mpltPath
+import matplotlib.patches as patches
 
 #from orilib import * # Orientations, quaternions, Euler angles
 #from projlib import * # Stereographic projections
@@ -150,21 +151,248 @@ def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
     print(f"checkpoint saved -> {path}")
 
 
-
 def _apply_roi_verts(d, roi_verts):
-    """Rebuild the ROI selection non-interactively from stored polygon vertices."""
+    """
+    (Re)build the ROI selection non-interactively from stored polygon
+    vertices. ALWAYS resets d.rois.masks/masks_by_phase first, so this
+    is safe to call repeatedly (e.g. after adding/removing an ROI) --
+    always a full, consistent rebuild from roi_verts alone, never a
+    partial/stale merge with whatever was there before.
+    """
     from matplotlib.path import Path
     verts = [np.asarray(v, float) for v in roi_verts]
- 
+
     class _StoredSelector:
         pass
     sel = _StoredSelector()
     sel.selVerts = list(verts)
     sel.selPaths = [Path(v) for v in verts]
     d.selector = sel
+
+    d.rois.masks = []
+    d.rois.masks_by_phase = []
+
     d.set_rois()
     return d
- 
+
+def get_current_roi_verts(d):
+    """
+    Return the list of REAL (user-drawn) ROI polygon vertices currently
+    stored in d.selector, EXCLUDING the auto-inserted whole-scan
+    placeholder set_rois() always puts at index 0. Only valid on an
+    already-FINALIZED d (i.e. after set_rois() has run at least once).
+    """
+    if not hasattr(d, 'selector') or not getattr(d.selector, 'selVerts', None):
+        return []
+    return list(d.selector.selVerts[1:])  # skip index 0 = all-ROI placeholder
+
+
+def add_rois_interactive(d, roi_d, show_current=True, colorcode=False, figsize=(10, 10)):
+    """
+    Open a SINGLE interactive figure showing existing ROIs overlaid (if
+    any), on which you then draw ADDITIONAL ROI polygon(s). Draw the new
+    polygon(s), then call finalize_added_rois(d, recipe).
+
+    Parameters
+    ----------
+    d : EBSDData
+    roi_d : array-like (3,)
+        IPF direction for the plot (same role as select_rois's own `d`
+        parameter -- a direction vector, not dataEBSD).
+    show_current : bool, optional
+        If True (default), overlay existing ROI outlines/labels on the
+        SAME figure used for the new selection (0 = whole-scan
+        placeholder). Default True.
+    colorcode : bool, optional
+        Passed to plot_IPF. Default False.
+    figsize : tuple, optional
+        Default (10, 10).
+    """
+    fig, AX = plt.subplots(1, figsize=figsize)
+    fig, ax = d.plot_IPF(ax=AX, fig=fig, d=roi_d, phase='A', colorcode=colorcode)
+
+    if show_current and hasattr(d, 'selector') and getattr(d.selector, 'selPaths', None):
+        for roiID in range(len(d.rois.masks_by_phase)):
+            patch = patches.PathPatch(d.selector.selPaths[roiID], facecolor='None', edgecolor='k', lw=2)
+            com = np.mean(d.selector.selVerts[roiID], axis=0)
+            ax.add_patch(patch)
+            ax.text(com[0], com[1], f'{roiID}', fontsize=36, color='k', ha='center', va='center',
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.7))
+        ax.set_title('Existing ROIs shown (0 = whole scan) — draw the NEW ROI(s) now')
+
+    d._pending_existing_roi_verts = get_current_roi_verts(d)
+    d.selector = selectROI(ax)
+    plt.show()
+    print("Draw the NEW ROI polygon(s), then call finalize_added_rois(dataEBSD, recipe).")
+
+def finalize_added_rois(d, recipe=None):
+    """
+    Call after drawing new polygon(s) via add_rois_interactive(). Combines
+    the newly-drawn polygon(s) with the ROIs that existed before, and
+    fully rebuilds d.rois.masks/masks_by_phase from the combined set.
+    """
+    # ASSUMPTION worth verifying: a freshly opened selector (via
+    # select_rois -> selectROI(ax)) starts with selVerts containing ONLY
+    # what you just drew, no placeholder -- unlike get_current_roi_verts,
+    # which skips index 0. Print d.selector.selVerts right after drawing,
+    # before calling this, to confirm this holds for your selectROI class.
+    new_verts = list(d.selector.selVerts)
+    existing_verts = getattr(d, '_pending_existing_roi_verts', [])
+    combined_verts = existing_verts + new_verts
+
+    _apply_roi_verts(d, combined_verts)
+
+    if hasattr(d, '_pending_existing_roi_verts'):
+        del d._pending_existing_roi_verts
+
+    if recipe is not None:
+        recipe['roi_verts'] = combined_verts
+        print(f"stored {len(combined_verts)} ROI polygon(s) in recipe['roi_verts']")
+
+    print(f"Total real ROIs now: {len(combined_verts)} "
+          f"(roiID 1..{len(combined_verts)}; roiID 0 is the whole-scan placeholder).")
+    return d
+def remove_roi(d, roi_index, recipe=None):
+    """
+    Remove ONE real ROI by its 1-based index (roiID convention: 0 =
+    whole-scan placeholder, cannot be removed; 1..N = real ROIs).
+    Fully rebuilds d.rois.masks/masks_by_phase from the remaining set.
+    """
+    existing_verts = get_current_roi_verts(d)
+    if roi_index < 1 or roi_index > len(existing_verts):
+        raise ValueError(f"roi_index must be between 1 and {len(existing_verts)} "
+                          f"(0 is the whole-scan placeholder and cannot be removed)")
+
+    remaining_verts = [v for i, v in enumerate(existing_verts, start=1) if i != roi_index]
+    _apply_roi_verts(d, remaining_verts)
+
+    if recipe is not None:
+        recipe['roi_verts'] = remaining_verts
+        print(f"stored {len(remaining_verts)} ROI polygon(s) in recipe['roi_verts']")
+
+    print(f"Removed ROI {roi_index}. Total real ROIs now: {len(remaining_verts)} "
+          f"(roiID 1..{len(remaining_verts)}).")
+    return d
+
+def save_rois_only(path, dataEBSD):
+    """
+    Save ONLY the ROI polygon vertices from dataEBSD to a small,
+    standalone HDF5 file -- independent of save_checkpoint, no
+    clustering_result/boundary_result/recipe needed at all.
+    """
+    with h5py.File(str(path), 'w') as f:
+        f.attrs['format'] = 'rois-only'
+        _save_rois(f, dataEBSD)
+    print(f"ROIs saved -> {path}")    
+def renumber_rois(d, new_order, recipe=None):
+    """
+    Reorder REAL ROIs (roiID 1..N) according to new_order, keeping
+    roiID 0 as the whole-scan placeholder always. Fully rebuilds
+    d.rois.masks/masks_by_phase from the reordered set.
+
+    Parameters
+    ----------
+    d : EBSDData
+    new_order : list of int, or dict {int: int}
+        LIST form: a permutation of range(1, N+1) (current 1-based
+        roiIDs) giving the desired NEW order. E.g. [3, 1, 2] means:
+        what is currently roiID 3 becomes roiID 1, current roiID 1
+        becomes roiID 2, current roiID 2 becomes roiID 3.
+
+        DICT form: {old_id: new_id} mapping, e.g. {1: 2} means ROI 1
+        becomes ROI 2. May be given as a SWAP shorthand -- if a value
+        isn't itself given as a key, its reverse mapping is filled in
+        automatically (so {1: 2} alone is understood as ROI1<->ROI2:
+        ROI 1 becomes 2 AND ROI 2 becomes 1). To specify a longer cycle
+        instead of a swap (e.g. 1->2->3->1), give ALL of its entries
+        explicitly ({1: 2, 2: 3, 3: 1}) -- any key you provide yourself
+        is respected as-is and never auto-overridden. IDs not mentioned
+        at all keep their current position. The result must be a valid
+        permutation of 1..N (each new_id used exactly once) or a
+        ValueError is raised.
+    recipe : dict, optional
+        If given, recipe['roi_verts'] is updated to the new order.
+
+    Returns
+    -------
+    d : EBSDData (mutated in place, also returned for chaining)
+    """
+    existing_verts = get_current_roi_verts(d)  # 0-indexed list, real ROIs only
+    n = len(existing_verts)
+    expected = set(range(1, n + 1))
+
+    if isinstance(new_order, dict):
+        mapping = dict(new_order)  # old_id -> new_id, copy so we don't mutate caller's dict
+
+        # auto-fill reverse (swap shorthand) for values not already given as keys
+        for old_id, new_id in list(mapping.items()):
+            if new_id not in mapping:
+                mapping[new_id] = old_id
+
+        # any id not mentioned at all keeps its current position
+        for i in expected:
+            if i not in mapping:
+                mapping[i] = i
+
+        if set(mapping.keys()) != expected or set(mapping.values()) != expected:
+            raise ValueError(f"dict form of new_order does not resolve to a valid permutation "
+                              f"of {sorted(expected)}: resolved mapping = {mapping}")
+
+        order_list = [None] * n
+        for old_id, new_id in mapping.items():
+            order_list[new_id - 1] = old_id
+        new_order = order_list
+
+    else:
+        new_order = list(new_order)
+        if set(new_order) != expected or len(new_order) != n:
+            raise ValueError(f"new_order must be a permutation of {sorted(expected)}, got {new_order}")
+
+    reordered_verts = [existing_verts[i - 1] for i in new_order]
+
+    _apply_roi_verts(d, reordered_verts)
+
+    if recipe is not None:
+        recipe['roi_verts'] = reordered_verts
+        print(f"stored {len(reordered_verts)} ROI polygon(s) in recipe['roi_verts'] (reordered)")
+
+    print(f"ROIs renumbered. New mapping: " +
+          ", ".join(f"old {old} -> new {new}" for new, old in enumerate(new_order, start=1)))
+    return d
+def move_roi_to_position(d, current_id, target_id, recipe=None):
+    """
+    Move ONE ROI from current_id to target_id, shifting everything
+    between them by one position (a rotation, not a swap) -- e.g. for
+    a forgotten ROI that got appended at the end (current_id=15) but
+    should really be roiID 7 (target_id=7): ROIs 7..14 each shift up
+    by one (7->8, 8->9, ..., 14->15), and 15 becomes 7.
+
+    Equivalent to renumber_rois with the appropriate cyclic mapping
+    built automatically -- use this instead of hand-building that dict.
+
+    Parameters
+    ----------
+    d : EBSDData
+    current_id : int
+        Where the ROI currently is (1-based).
+    target_id : int
+        Where it should end up (1-based).
+    recipe : dict, optional
+    """
+    existing_verts = get_current_roi_verts(d)
+    n = len(existing_verts)
+    if not (1 <= current_id <= n) or not (1 <= target_id <= n):
+        raise ValueError(f"current_id and target_id must both be in 1..{n}")
+
+    if current_id == target_id:
+        print("current_id == target_id, nothing to do.")
+        return d
+
+    order = list(range(1, n + 1))          # [1, 2, ..., n], in NEW-position order
+    order.remove(current_id)                # take it out of its old spot
+    order.insert(target_id - 1, current_id) # reinsert at the target spot (0-based index)
+
+    return renumber_rois(d, order, recipe=recipe)
 def load_checkpoint(path, dataEBSD=None):
     """Restore the pipeline. If dataEBSD is None it is rebuilt from the recipe,
     with ROIs restored automatically from this same checkpoint file."""
@@ -2947,10 +3175,17 @@ class EBSDData(getPhases):
 
     def set_rois(self):
         """
-        Set selected ROIS as masks. Idempotent -- safe to call more than once.
+        Set selected ROIS as masks. Idempotent -- safe to call more than
+        once, using an explicit completion flag rather than inferring
+        completion from list-length equality (which can coincidentally
+        match mid-build for specific polygon counts, e.g. exactly 1 real
+        ROI -- confirmed as a real bug: masks=[all-ROI] (len 1) equals
+        selPaths=[one drawn polygon] (len 1) BEFORE the real polygon is
+        ever processed, causing set_rois() to wrongly no-op and skip
+        building masks_by_phase entirely).
         """
-        if len(self.rois.masks) > 0 and len(self.rois.masks) == len(self.selector.selPaths):
-            return
+        if getattr(self.rois, '_built_for_selector', None) is self.selector:
+            return  # already fully built for this exact selector object
 
         self._ensure_allroi_mask()
 
@@ -2970,6 +3205,9 @@ class EBSDData(getPhases):
         SelVerts, SelPaths = self.set_allroi()
         self.selector.selPaths.insert(0, SelPaths)
         self.selector.selVerts.insert(0, SelVerts)
+
+        self.rois._built_for_selector = self.selector
+
     def set_rois_ini(self):
         """
         Set selected ROIS as masks
@@ -8509,9 +8747,10 @@ class ClusteringResult:
 
         return pairs_results, matches
 
-    def find_boundary_sharing_twins(self, boundary_result, merge_groups_all, phase, system, modes,
-                                    tol_deg=5.0, min_size=None, cluster_ids=None,
-                                    boundary_only=False, print_result=False, sort_by='size'):
+    def find_boundary_sharing_twins(self, boundary_result, merge_groups_all=None, phase=None,
+                                 system=None, modes=None, tol_deg=5.0, min_size=None,
+                                 cluster_ids=None, boundary_only=False, print_result=False,
+                                 sort_by='size'):
         """
         Run map_twin_relationships, then annotate every returned match with
         whether the two matched clusters physically share a boundary, via
@@ -8523,9 +8762,12 @@ class ClusteringResult:
         boundary_result : BoundaryResult
             From BoundaryAnalyzer().analyze(clustering_result), where
             clustering_result is the UNMERGED result the merge was built from.
-        merge_groups_all : dict
+        merge_groups_all : dict, optional
             {phase: {root_id: [fragment cluster ids]}}, from
-            merge_clusters_by_orientation.
+            merge_clusters_by_orientation. If None (default), treated as
+            empty for every phase -- i.e. every cluster is its own single
+            fragment, appropriate when self is an UNMERGED clustering_result
+            (self.labels already match boundary_result.clusters directly).
         phase, system, modes, tol_deg, min_size, cluster_ids :
             Passed through to map_twin_relationships.
         boundary_only : bool, optional
@@ -8545,6 +8787,12 @@ class ClusteringResult:
             'boundary_length_px'. Filtered to boundary-sharing only if
             boundary_only=True.
         """
+        if merge_groups_all is None:
+            merge_groups_all = {}
+        if phase not in merge_groups_all:
+            merge_groups_all = dict(merge_groups_all)  # don't mutate caller's dict
+            merge_groups_all[phase] = {}
+
         pairs_results, matches = self.map_twin_relationships(
             phase=phase, system=system, modes=modes, tol_deg=tol_deg,
             min_size=min_size, cluster_ids=cluster_ids, sort_by=sort_by
@@ -8562,7 +8810,7 @@ class ClusteringResult:
 
         return pairs_results, matches
 
-    def find_boundary_sharing_kinks(self, boundary_result, merge_groups_all, phase,
+    def find_boundary_sharing_kinks(self, boundary_result, merge_groups_all=None, phase=None,
                                     max_miller_index=2, tol_deg=5.0, min_size=None,
                                     cluster_ids=None, boundary_only=False,
                                     print_result=False, print_top_n=None,
@@ -8576,9 +8824,16 @@ class ClusteringResult:
         ----------
         boundary_result : BoundaryResult
             From BoundaryAnalyzer().analyze(clustering_result), where
-            clustering_result is the UNMERGED result the merge was built from.
-        merge_groups_all : dict
-            {phase: {root_id: [fragment cluster ids]}}
+            clustering_result is the UNMERGED result the merge was built from
+            (or, if self itself IS the unmerged result, boundary_result was
+            built directly from self -- see merge_groups_all below).
+        merge_groups_all : dict, optional
+            {phase: {root_id: [fragment cluster ids]}}, from
+            merge_clusters_by_orientation. If None (default), treated as
+            empty for every phase -- i.e. every cluster is its own single
+            fragment, appropriate when self is an UNMERGED clustering_result
+            (self.labels already match boundary_result.clusters directly,
+            no translation needed).
         phase, max_miller_index, tol_deg, min_size, cluster_ids :
             Passed through to map_kink_axes.
         boundary_only : bool, optional
@@ -8587,10 +8842,7 @@ class ClusteringResult:
         print_result : bool, optional
             Default False.
         print_top_n : int or None, optional
-            Maximum number of PAIRS to print (after sort_by ordering and
-            any boundary_only filtering). None (default) prints all pairs.
-            Independent of print_top_n_per_pair, which limits candidates
-            shown WITHIN each printed pair.
+            Maximum number of PAIRS to print. None (default) prints all.
         print_top_n_per_pair : int or 'all', optional
             Default 3.
         sort_by : {'size', 'cluster_id'}, optional
@@ -8600,10 +8852,16 @@ class ClusteringResult:
         -------
         pairs_results : list of dict
             ALL pairs with at least one kink-axis match (NOT truncated by
-            print_top_n -- that only affects what's printed), each
-            annotated with 'shares_boundary' and 'boundary_length_px'.
-            Filtered to boundary-sharing only if boundary_only=True.
+            print_top_n), each annotated with 'shares_boundary' and
+            'boundary_length_px'. Filtered to boundary-sharing only if
+            boundary_only=True.
         """
+        if merge_groups_all is None:
+            merge_groups_all = {}
+        if phase not in merge_groups_all:
+            merge_groups_all = dict(merge_groups_all)  # don't mutate caller's dict
+            merge_groups_all[phase] = {}
+
         pairs_results = self.map_kink_axes(
             phase=phase, max_miller_index=max_miller_index, tol_deg=tol_deg,
             min_size=min_size, cluster_ids=cluster_ids, sort_by=sort_by
@@ -8635,7 +8893,143 @@ class ClusteringResult:
                         f"{c['kink_angle_deg']:>10.2f}° {c['T_idx']:>6}")
                 print()
 
-        return pairs_results
+        return pairs_results 
+
+    def summarize_relationship_statistics(self, phase, matches=None, kink_results=None,
+                                        print_result=True):
+        """
+        Partition ALL CLUSTERED pixels of `phase` (every pixel belonging to
+        ANY cluster, regardless of size -- excludes only unclustered/
+        background pixels) into MUTUALLY EXCLUSIVE categories based on each
+        cluster's best relationship status, so percentages sum to 100%:
+
+        - boundary-sharing: cluster appears in at least one matched pair
+        with shares_boundary=True
+        - non-boundary: cluster appears in at least one matched pair, but
+        NONE of them share a boundary (crystallographically valid, but
+        no physically touching twin/kink partner found)
+        - none: cluster appears in no matched pair at all
+
+        Computed separately for twin, kink, and twin-or-kink (union).
+
+        Also reports pairwise combinatorics for each of matches/kink_results
+        individually: how many of the C(n_eligible, 2) mathematically
+        possible cluster pairings actually turned out to be matches, and
+        which eligible clusters (if any) never appear in ANY match.
+
+        Parameters
+        ----------
+        phase : str
+        matches : list of dict, optional
+            From map_twin_relationships / find_boundary_sharing_twins.
+            Needs 'shares_boundary' for the boundary/non-boundary split;
+            without it, only matched-vs-none is reported.
+        kink_results : list of dict, optional
+            From map_kink_axes / find_boundary_sharing_kinks. Same
+            boundary-annotation requirement as matches.
+        print_result : bool, optional
+            Default True.
+
+        Returns
+        -------
+        stats : dict
+            'total_clustered_pixels' : int, ALL clustered pixels of `phase`
+            'n_eligible_clusters' : int
+            'max_possible_pairs' : int, C(n_eligible_clusters, 2)
+            'twin', 'kink', 'twin_or_kink' : each, if the corresponding
+                input was given, a dict:
+                {'boundary': {...}, 'non_boundary': {...}, 'none': {...},
+                'n_matched_pairs', 'pct_of_max_pairs',
+                'n_distinct_clusters', 'clusters_outside_eligible',
+                'clusters_with_no_match'}
+                None if the corresponding input wasn't provided.
+        """
+        sizes = self.cluster_sizes
+        all_clustered_ids = list(self.labels_by_phase[phase])
+        all_clustered_set = set(all_clustered_ids)
+        total_clustered_pixels = sum(sizes.get(c, 0) for c in all_clustered_ids)
+
+        n_eligible = len(all_clustered_ids)
+        max_possible_pairs = n_eligible * (n_eligible - 1) // 2
+
+        def _partition(items):
+            boundary_set = set()
+            matched_set = set()
+            for m in (items or []):
+                matched_set.add(m['cluster_a'])
+                matched_set.add(m['cluster_b'])
+                if m.get('shares_boundary', False):
+                    boundary_set.add(m['cluster_a'])
+                    boundary_set.add(m['cluster_b'])
+            non_boundary_set = matched_set - boundary_set
+            none_set = all_clustered_set - matched_set
+            return boundary_set, non_boundary_set, none_set, matched_set
+
+        def _stat(cluster_set):
+            n_px = sum(sizes.get(c, 0) for c in cluster_set)
+            pct = 100.0 * n_px / total_clustered_pixels if total_clustered_pixels > 0 else 0.0
+            return {'n_clusters': len(cluster_set), 'n_pixels': n_px, 'pct': pct}
+
+        def _build(items):
+            if items is None:
+                return None
+            b, nb, n, matched_set = _partition(items)
+            n_pairs = len(items)
+            return {
+                'boundary': _stat(b), 'non_boundary': _stat(nb), 'none': _stat(n),
+                'n_matched_pairs': n_pairs,
+                'pct_of_max_pairs': 100.0 * n_pairs / max_possible_pairs if max_possible_pairs > 0 else 0.0,
+                'n_distinct_clusters': len(matched_set),
+                'clusters_outside_eligible': matched_set - all_clustered_set,
+                'clusters_with_no_match': all_clustered_set - matched_set,
+            }
+
+        stats = {
+            'total_clustered_pixels': total_clustered_pixels,
+            'n_eligible_clusters': n_eligible,
+            'max_possible_pairs': max_possible_pairs,
+        }
+        stats['twin'] = _build(matches)
+        stats['kink'] = _build(kink_results)
+
+        if matches is not None or kink_results is not None:
+            combined = (matches or []) + (kink_results or [])
+            stats['twin_or_kink'] = _build(combined)
+        else:
+            stats['twin_or_kink'] = None
+
+        if print_result:
+            print(f"Phase '{phase}': {n_eligible} cluster(s), "
+                f"{total_clustered_pixels} total clustered pixels\n")
+
+            def _print_block(label, d):
+                if d is None:
+                    print(f"{label}: (not provided)\n")
+                    return
+                print(f"{label}:")
+                for key, title in [('boundary', '  shares boundary'),
+                                    ('non_boundary', '  no boundary (matched, not touching)'),
+                                    ('none', '  no relationship')]:
+                    s = d[key]
+                    print(f"  {title:<40}: {s['n_clusters']:>4} cluster(s), "
+                        f"{s['n_pixels']:>7} px ({s['pct']:.2f}%)")
+                print(f"\n  Total eligible clusters: {n_eligible}")
+                print(f"  Distinct clusters appearing across all {d['n_matched_pairs']} matched pairs: "
+                    f"{d['n_distinct_clusters']}")
+                print(f"  Clusters in matches but NOT in the eligible set (should be empty): "
+                    f"{d['clusters_outside_eligible']}")
+                print(f"  Eligible clusters that appear in NO match at all: {d['clusters_with_no_match']}")
+                print(f"\n  Max possible pairs among {n_eligible} clusters: "
+                    f"C({n_eligible},2) = {max_possible_pairs}")
+                print(f"  Actual matched pairs: {d['n_matched_pairs']} "
+                    f"({d['pct_of_max_pairs']:.1f}% of all possible combinations)")
+                print()
+
+            _print_block('Twin relationship', stats['twin'])
+            _print_block('Kink relationship', stats['kink'])
+            _print_block('Twin OR kink', stats['twin_or_kink'])
+
+        return stats
     def merge_clusters_by_orientation(self, threshold_deg=2.0, phase=None, min_size='recipe',
                                         return_disor_matrices=False):
         """
