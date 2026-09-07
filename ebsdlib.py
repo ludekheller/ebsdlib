@@ -660,6 +660,14 @@ def default_checkpoint_name(recipe):
 
 
 # ---- public API ------------------------------------------------------------
+def _rotation_about_axis(axis, angle_deg):
+    """Rodrigues' rotation formula: proper rotation matrix about `axis`
+    (need not be pre-normalized) by angle_deg (degrees)."""
+    a = np.asarray(axis, dtype=float)
+    a = a / np.linalg.norm(a)
+    K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    ang = np.radians(angle_deg)
+    return np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)
 
 
 
@@ -3058,7 +3066,7 @@ class EBSDData(getPhases):
             else:
                 sel=self.rois.masks_by_phase[roi][phase]
         return sel,phase
-    def plot_colmap(self,d=[1,0,0], tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, mask=None, fig=None, ax=None, **kwargs):
+    def plot_colmap(self,d=[1,0,0], tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, mask=None, fig=None, ax=None, d_IPF=None, **kwargs):
         if tiling is None:
             if self._ebsdData.grid.lower() == 'hexgrid':
                 tiling == "hex"
@@ -3074,7 +3082,7 @@ class EBSDData(getPhases):
         if globalScale:
             ax.set_xlim((self.X.min(),self.X.max()))
             ax.set_ylim((self.Y.max(),self.Y.min()))
-        colmap = self._ebsdData.plot_IPF_lh(d=d,tiling=tiling,scalebar=scalebar,d_IPF=None,ax=ax,sel=mask,**kwargs)#(gray=scan.IQ)
+        colmap = self._ebsdData.plot_IPF_lh(d=d,tiling=tiling,scalebar=scalebar,ax=ax,sel=mask, d_IPF=d_IPF,**kwargs)#(gray=scan.IQ)
 
         return fig,ax
 
@@ -5683,7 +5691,7 @@ class ClusteringResult:
                                 pixel_symbol_kwargs=None, pixel_hist_kwargs=None,
                                 avg_plot=None, avg_symbol_kwargs=None, avg_hist_kwargs=None,
                                 sample_transform=None, min_size=None,
-                                show_legend=True, return_val=False):
+                                show_legend=True, return_val=False, **kwargs):
         """
         Plot pole positions for one or more clusters, on a stereographic
         (Wulff) or equal-area (Schmidt) net.
@@ -5786,11 +5794,12 @@ class ClusteringResult:
         (v_crystal = M @ v_sample). Pole figures need crystal -> sample:
         v_sample = M.T @ uvw. sample_transform is applied after that.
         """
-        if ax is None:
-            if equalarea:
-                fig, ax = schmidtnet(ax=None, basedirs=False, facecolor='None')
-            else:
-                fig, ax = wulffnet(ax=None, basedirs=False, facecolor='None')
+      
+        if equalarea:
+            fig, ax = schmidtnet(ax=ax, basedirs=False, facecolor='None', **kwargs)
+        else:
+            fig, ax = wulffnet(ax=ax, basedirs=False, facecolor='None', **kwargs)
+    
         fig = ax.figure
 
         uvw = np.asarray(uvw, dtype=float)
@@ -8265,22 +8274,31 @@ class ClusteringResult:
                 'variant_idx': v_idx, 'T_idx': t_idx, 'angle_deg': angle,
             }
 
+        matched_conditions = [k for k, v in checks.items() if v['is_match']]
         _, best_condition, best_T_idx, axis_dev, angle_dev, variant_idx, angle = best_overall
         T_matrix = symops_proper[best_T_idx]
 
+        # determine the expected number of variants from a known-good key
+        n_variants = len(np.asarray(twin_data['n1_a']))
+
         twin_elements = {}
-        for key in ('K1_a', 'K2_a', 'eta1_a', 'eta2_a', 'n1_a', 'n2_a', 'a1_a', 'a2_a'):
-            if key in twin_data:
-                arr = np.asarray(twin_data[key])
-                if variant_idx < len(arr):
-                    twin_elements[key] = arr[variant_idx]
+        for key, val in twin_data.items():
+            if key == 'shear_angle':
+                continue  # already extracted separately, not per-variant
+            arr = np.asarray(val)
+            if arr.shape[0] != n_variants:
+                continue  # not a per-variant array in this system's tabulation, skip
+            if variant_idx < len(arr):
+                twin_elements[key] = arr[variant_idx]
 
         return {
             'cluster_a': cluster_a,
             'cluster_b': cluster_b,
             'system': system,
             'mode': mode,
-            'is_match': any(v['is_match'] for v in checks.values()),
+            'is_match': len(matched_conditions) > 0,
+            'matched_conditions': matched_conditions,
+            #'is_match': any(v['is_match'] for v in checks.values()),
             'best_condition': best_condition,
             'best_T_idx': best_T_idx,
             'T': T_matrix,
@@ -8762,7 +8780,459 @@ class ClusteringResult:
         matches = sorted([r for r in pairs_results if r['is_match']], key=lambda r: r['angle_deg'])
 
         return pairs_results, matches
+    def _true_min_disorientation(self, M, reference_mat, phase):
+        symops = list(np.array(self.data.phases[phase]['symops']))
+        D = np.asarray(disorimat(np.array([reference_mat, M]), symops), dtype=float)
+        return float(D[0, 1])
+    def check_martensite_twin_correspondence(self, report, axial_dir,
+                                            lattice_vec=(1, 1, 0), target_M_uvw=(0, 1, 0),
+                                            candidate_off_target_tol=1e-2,
+                                            candidate_variants=None,
+                                            loading_sense='tension',
+                                            mode_to_martensite_plane=None,
+                                            system='NiTi', phase_A='A', phase_M='M',
+                                            tol_deg=5.0, print_result=True):
+        """
+        Select the most likely martensite correspondence variant and check
+        every matched austenite twin against it, ALL IN ONE CALL.
 
+        If candidate_variants is not given explicitly, it is derived
+        internally:
+        1. evaluate_lattice_direction_homogeneity finds the most homogeneous
+        symmetric equivalent of `lattice_vec`, pooled across every
+        Matrix/Twin/Kink-matched cluster in `report` (anchored to the
+        Matrix root's own orientation).
+        2. That direction is mapped into martensite Miller indices via each
+        of the 12 CId variants; a variant is a CANDIDATE if the
+        predicted martensite direction is parallel (within
+        candidate_off_target_tol, relative magnitude) to target_M_uvw --
+        i.e. consistent with the confirmed shared austenite zone axis
+        mapping onto a specific, expected martensite direction.
+
+        From the resulting candidate set, the variant with MAXIMUM (tension)
+        or MINIMUM (compression) transformation strain along axial_dir is
+        selected. Every matched twin in report['twin_results'] is then
+        checked against that selected variant's predicted martensite K1
+        plane, per mode_to_martensite_plane.
+
+        Parameters
+        ----------
+        report : dict
+            Output of check_parent_reconstruction (needs 'merged_root',
+            'twin_results', 'kink_results', 'parent_mat').
+        axial_dir : array-like (3,)
+            SAMPLE-frame loading direction, used for both the
+            transformation-strain-based variant selection and (unchanged)
+            elsewhere in this pipeline's Schmid factor calculations.
+        lattice_vec : array-like (3,), optional
+            Miller-index austenite direction to test for homogeneity across
+            the reconstructed network. Only used if candidate_variants is
+            None. Default (1,1,0).
+        target_M_uvw : array-like (3,), optional
+            Expected martensite Miller-index direction that the confirmed
+            homogeneous austenite direction should map onto. Only used if
+            candidate_variants is None. Default (0,1,0) (i.e. <010>_M).
+        candidate_off_target_tol : float, optional
+            Relative-magnitude tolerance for the off-target component when
+            filtering candidate variants (see step 2 above). Only used if
+            candidate_variants is None. Default 1e-2.
+        candidate_variants : list of int, optional
+            Manual override: skip the internal homogeneity/candidate-
+            filtering steps entirely and use this list directly. Default
+            None (auto-derived, as described above).
+        loading_sense : {'tension', 'compression'}, optional
+            'tension' (default): select the candidate with MAXIMUM
+            transformation strain. 'compression': MINIMUM.
+        mode_to_martensite_plane : dict {str: array-like(3,)}, optional
+            Maps austenite twin mode key -> expected martensite {hkl} twin
+            plane. Default:
+            {'112': [1,0,-1], '113': [3,0,-2], '114': [2,0,-1],
+            '115': [5,0,-2], '116': [3,0,-1]}
+        system : str, optional
+            Default 'NiTi'.
+        phase_A, phase_M : str, optional
+            Default 'A'/'M'.
+        tol_deg : float, optional
+            Angular tolerance (degrees) for the plane-parallelism check.
+            Default 5.0.
+        print_result : bool, optional
+
+        Returns
+        -------
+        result : dict
+            'best_variant', 'best_strain', 'loading_sense',
+            'candidate_variants', 'strain_of_candidates',
+            'correspondence_results' -- same as before, plus:
+            'homogeneous_lattice_vec' : the Miller-index direction found
+                most homogeneous (None if candidate_variants was given
+                manually, since the homogeneity step was skipped).
+        """
+        if loading_sense not in ('tension', 'compression'):
+            raise ValueError("loading_sense must be 'tension' or 'compression'")
+
+        if mode_to_martensite_plane is None:
+            mode_to_martensite_plane = {
+                '112': [1, 0, -1],
+                '113': [3, 0, -2],
+                '114': [2, 0, -1],
+                '115': [5, 0, -2],
+                '116': [3, 0, -1],
+            }
+
+        axial_dir = np.asarray(axial_dir, dtype=float)
+        axial_dir = axial_dir / np.linalg.norm(axial_dir)
+
+        parent_mat = report.get('parent_mat')
+        if parent_mat is None:
+            raise ValueError("report does not contain 'parent_mat' -- pass a report from "
+                            "check_parent_reconstruction (built after the parent_mat fix).")
+
+        homogeneous_lattice_vec = None
+
+        if candidate_variants is None:
+            # ---- derive candidate_variants internally ----
+            merged_root = report['merged_root']
+            matched_cluster_ids = [r['cluster_b'] for r in report['twin_results'] if r['is_match']] + \
+                                [r['cluster_b'] for r in report.get('kink_results', []) if r['is_match']]
+            if merged_root is not None:
+                matched_cluster_ids.append(merged_root)
+
+            anchor_cluster_id = merged_root
+            if anchor_cluster_id is None:
+                # fall back to the closest cluster by disorientation to parent_mat
+                disor = {c: self._true_min_disorientation(self.avg_orientations[c], parent_mat, phase_A)
+                        for c in matched_cluster_ids if c in self.avg_orientations}
+                if not disor:
+                    raise ValueError("No merged_root and no matched clusters available to anchor "
+                                    "the homogeneity check -- cannot derive candidate_variants "
+                                    "automatically. Pass candidate_variants explicitly instead.")
+                anchor_cluster_id = min(disor, key=disor.get)
+                if print_result:
+                    print(f"Warning: report['merged_root'] is None; falling back to closest "
+                        f"matched cluster {anchor_cluster_id} as homogeneity anchor.")
+
+            homog_results = self.evaluate_lattice_direction_homogeneity(
+                anchor_cluster_id=anchor_cluster_id, lattice_vec=list(lattice_vec), phase=phase_A,
+                cluster_ids=matched_cluster_ids, units='deg', print_result=False
+            )
+            best = homog_results[0]
+            homogeneous_lattice_vec = best['lattice_vec']
+
+            CId = self.data.OR[system]['CId']
+            target = np.asarray(target_M_uvw, dtype=float)
+            candidate_variants = []
+            for i in range(CId.shape[2]):
+                v_M_uvw = CId[:, :, i].dot(homogeneous_lattice_vec)
+                total_norm = np.linalg.norm(v_M_uvw)
+                if total_norm <= 1e-8:
+                    continue
+                # off-target component: the part of v_M_uvw not along `target`
+                target_unit = target / np.linalg.norm(target)
+                proj = np.dot(v_M_uvw, target_unit) * target_unit
+                off_target = np.linalg.norm(v_M_uvw - proj)
+                rel_off = off_target / total_norm
+                if rel_off < candidate_off_target_tol:
+                    candidate_variants.append(i)
+
+            if print_result:
+                print(f"Most homogeneous direction: {homogeneous_lattice_vec} "
+                    f"(mean spread {best['mean_spread']:.2f}°)")
+                print(f"Candidate variants (maps onto <{'{},{},{}'.format(*[int(x) for x in target])}>_M "
+                    f"within tol={candidate_off_target_tol}): {candidate_variants}\n")
+
+        if not candidate_variants:
+            raise ValueError("candidate_variants is empty -- nothing to select from "
+                            "(no variant satisfied the off-target tolerance)")
+
+        self.data.getTrStrain(phase=phase_A, oris=parent_mat.dot(axial_dir))
+        strain_of_candidates_arr = self.data.trStrain[1][candidate_variants]
+        strain_of_candidates = {v: float(s) for v, s in zip(candidate_variants, strain_of_candidates_arr)}
+
+        if loading_sense == 'tension':
+            best_variant = max(strain_of_candidates, key=strain_of_candidates.get)
+        else:
+            best_variant = min(strain_of_candidates, key=strain_of_candidates.get)
+        best_strain = strain_of_candidates[best_variant]
+
+        if print_result:
+            print(f"Candidate variants and transformation strain along axial_dir ({loading_sense}):")
+            for v in candidate_variants:
+                marker = "  <-- selected" if v == best_variant else ""
+                print(f"  variant {v:>2}: strain = {strain_of_candidates[v]:+.4f}{marker}")
+            print(f"\nSelected variant: {best_variant} (strain = {best_strain:+.4f})\n")
+
+        CIp = self.data.OR[system]['CIp']
+        CId = self.data.OR[system]['CId']
+        Lr_M = np.asarray(self.data.phases[phase_M]['Lr'])
+
+        correspondence_results = []
+
+        if print_result:
+            print(f"{'cluster_b':>10} {'mode':>6} {'K1_a (A hkl)':>16} {'-> M hkl':>16} "
+                f"{'expected M plane':>18} {'dev':>8} {'match':>6} "
+                f"{'eta1_a (A uvw)':>16} {'-> M uvw':>16}")
+            print("-" * 118)
+
+        for r in report['twin_results']:
+            if not r['is_match']:
+                continue
+
+            mode = r['mode']
+            K1_hkl = np.asarray(r['twin_elements']['K1_a'], dtype=float)
+            eta1_uvw = np.asarray(r['twin_elements']['eta1_a'], dtype=float)
+
+            K1_M_hkl = CIp[:, :, best_variant].dot(K1_hkl)
+            eta1_M_uvw = CId[:, :, best_variant].dot(eta1_uvw)
+
+            expected_plane = mode_to_martensite_plane.get(mode)
+            dev = None
+            plane_match = None
+
+            if expected_plane is not None:
+                expected_plane = np.asarray(expected_plane, dtype=float)
+
+                v_pred_cart = Lr_M.dot(K1_M_hkl)
+                v_pred_cart = v_pred_cart / np.linalg.norm(v_pred_cart)
+                v_exp_cart = Lr_M.dot(expected_plane)
+                v_exp_cart = v_exp_cart / np.linalg.norm(v_exp_cart)
+
+                cosang = np.clip(abs(v_pred_cart.dot(v_exp_cart)), -1.0, 1.0)
+                dev = float(np.degrees(np.arccos(cosang)))
+                plane_match = dev < tol_deg
+
+            entry = {
+                'cluster_b': r['cluster_b'],
+                'mode': mode,
+                'K1_a_hkl': K1_hkl,
+                'K1_M_hkl': K1_M_hkl,
+                'eta1_a_uvw': eta1_uvw,
+                'eta1_M_uvw': eta1_M_uvw,
+                'expected_M_plane': expected_plane,
+                'plane_angle_dev_deg': dev,
+                'plane_match': plane_match,
+            }
+            correspondence_results.append(entry)
+
+            if print_result:
+                dev_str = f"{dev:.2f}°" if dev is not None else "n/a"
+                match_str = ('yes' if plane_match else 'no') if plane_match is not None else 'n/a'
+                exp_str = str(np.round(expected_plane, 2)) if expected_plane is not None else 'n/a'
+                print(f"{r['cluster_b']:>10} {mode:>6} {str(np.round(K1_hkl, 2)):>16} "
+                    f"{str(np.round(K1_M_hkl, 2)):>16} {exp_str:>18} {dev_str:>8} {match_str:>6} "
+                    f"{str(np.round(eta1_uvw, 2)):>16} {str(np.round(eta1_M_uvw, 2)):>16}")
+
+        if print_result:
+            n_checked = sum(1 for e in correspondence_results if e['plane_match'] is not None)
+            n_match = sum(1 for e in correspondence_results if e['plane_match'])
+            print(f"\n{n_match}/{n_checked} checked twins consistent with their expected "
+                f"inherited martensite twin plane (tol_deg={tol_deg})")
+
+        return {
+            'best_variant': best_variant,
+            'best_strain': best_strain,
+            'loading_sense': loading_sense,
+            'candidate_variants': candidate_variants,
+            'strain_of_candidates': strain_of_candidates,
+            'correspondence_results': correspondence_results,
+            'homogeneous_lattice_vec': homogeneous_lattice_vec,
+        }
+    def plot_martensite_ipf_map(self, phase, system, best_variant, report, visualizer, axial_dir=None,
+                                ax=None, fig=None, figsize=(9, 8), tiling=None, roi=None,
+                                globalScale=False, cluster_ids=None, colorfill='white',
+                                show_colorkey=True, colorkey_rect=(0.35, 0.8, 0.12, 0.12),
+                                return_val=False, **kwargs):
+        """
+        Plot the microstructure via plotClusters(color_by='color'), coloring
+        each cluster by an IPF color for the direction axial_dir would have
+        in the MARTENSITE lattice under correspondence variant best_variant.
+
+        For each cluster, its RAW average orientation Ga is first branch-
+        corrected via the T found by check_twin_relationship (T @ Ga is the
+        twin-consistent branch, per the T @ M_fwd convention -- see
+        check_twin_relationship's docstring), THEN mapped to the martensite
+        lattice: Gm = T_AM_variant . (T . Ga), d_IPF = Gm . axial_dir.
+        T is looked up per-cluster from report['twin_results'] (matched
+        entries only); clusters with no match (e.g. the matrix root itself)
+        use T = identity.
+
+        d_IPF is folded into the C2h (monoclinic 2/m) fundamental sector by
+        flipping sign for z<0, then taking abs(y) -- consistent with
+        DirectionColorKeyTSL(symmetry.C2h)'s expected input range.
+
+        Parameters
+        ----------
+        phase, system, best_variant : as before.
+        report : dict
+            Output of check_parent_reconstruction (used to look up each
+            cluster's branch-correcting T from report['twin_results']).
+        visualizer : EBSDVisualizer instance
+        axial_dir : array-like (3,), optional
+            Default [0,0,1].
+        ax, fig, figsize, tiling, roi, globalScale, cluster_ids, colorfill,
+        show_colorkey, colorkey_rect, return_val, **kwargs : as before.
+
+        Returns
+        -------
+        fig, ax
+        """
+        from orix.vector import Vector3d
+        from orix.quaternion import symmetry
+        from orix import plot as orix_plot
+        import matplotlib.colors as mcolors
+
+        if axial_dir is None:
+            axial_dir = np.array([0., 0., 1.])
+        axial_dir = np.asarray(axial_dir, dtype=float)
+        axial_dir = axial_dir / np.linalg.norm(axial_dir)
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        fig = ax.figure
+
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase])
+
+        # ---- per-cluster branch-correcting T, from matched twin results ----
+        T_map = {}
+        for r in report.get('twin_results', []):
+            if r['is_match']:
+                T_map[r['cluster_b']] = r['T']
+        # (kink_results carry no T matrix directly, per earlier discussion -- only
+        #  best_T_idx; not included here. Add if you have a way to reconstruct it.)
+
+        T_AM_variant = self.data.defGrad[system]['A']['T_AM'][:, :, best_variant]
+
+        d_IPF_list = []
+        valid_cluster_ids = []
+        for cid in cluster_ids:
+            if cid not in self.avg_orientations:
+                continue
+            Ga = self.avg_orientations[cid]
+            T = T_map.get(cid, np.eye(3))
+            Gm = T_AM_variant.dot(T.dot(Ga))
+            d_IPF = Gm.dot(axial_dir)
+            norm = np.linalg.norm(d_IPF)
+            if norm < 1e-8:
+                continue
+            d_IPF_list.append(d_IPF / norm)
+            valid_cluster_ids.append(cid)
+
+        d_IPF_arr = np.array(d_IPF_list)
+
+        # fold into C2h fundamental sector
+        d_IPF_arr[d_IPF_arr[:, 2] < 0, :] = -1 * d_IPF_arr[d_IPF_arr[:, 2] < 0, :]
+        d_IPF_arr[:, 1] = np.abs(d_IPF_arr[:, 1])
+        #print(d_IPF_arr.shape)
+        w = Vector3d(d_IPF_arr)
+
+        dirkey_ma = orix_plot.DirectionColorKeyTSL(symmetry.C2h)
+        colors_rgb = dirkey_ma.direction2color(w)
+
+        N = self.labels.shape[0]
+
+        def _to_rgba255(color_01):
+            rgb255 = np.round(np.asarray(color_01) * 255).astype(int)
+            return np.append(rgb255, 255)
+
+        Colors = np.tile(_to_rgba255(mcolors.to_rgb(colorfill)), (N, 1))
+        d_IPF_per_pixel = np.full((N, 3), np.nan)
+        for cid, d_IPF in zip(valid_cluster_ids, d_IPF_arr):
+            mask_c = np.isin(self.labels, [cid])
+            d_IPF_per_pixel[mask_c] = d_IPF
+
+        #w = Vector3d(d_IPF_arr)
+        for cid, rgb in zip(valid_cluster_ids, colors_rgb):
+            rgba = _to_rgba255(rgb)
+            mask_c = np.isin(self.labels, [cid])
+            Colors[mask_c] = rgba
+        visualizer.plotClusters(self, ax=ax, tiling=tiling, roi=roi, phase=phase,
+                                color_by='color', color=Colors, globalScale=globalScale,
+                                colorfill=colorfill,d_IPF=d_IPF_per_pixel,  **kwargs)
+
+        if show_colorkey:
+            rc = {'font.size': 6}
+            with plt.rc_context(rc):
+                ax_ckey = fig.add_axes(list(colorkey_rect), projection="ipf",
+                                        symmetry=symmetry.C2h, zorder=2)
+                ax_ckey.plot_ipf_color_key(show_title=True)
+                ax_ckey.patch.set_facecolor("None")
+
+        ax.set_title(f"Hypothetical martensite IPF (variant {best_variant})")
+
+        return (fig, ax) if return_val else (fig, ax)
+    
+    def compute_variant_strain_tensor(self, system, best_variant, parent_mat, phase_A='A',
+                                    verify_against_axial_dir=None, print_result=True):
+        """
+        Compute the Green-Lagrange transformation strain tensor for a
+        given martensite correspondence variant, in the SAMPLE frame
+        (transformed via parent_mat, same convention as
+        compute_average_strain_tensor: T_sample = parent_mat.T @ T_crystal
+        @ parent_mat).
+
+        E_crystal = 0.5 * (F.T @ F - I), where F = defGrad[system][phase_A]
+        ['F_AM'][:,:,best_variant] (austenite -> martensite deformation
+        gradient, crystal frame). This is the standard Green-Lagrange
+        (finite) strain measure -- NOT independently confirmed against
+        your codebase's own internal convention; use verify_against_axial_dir
+        to cross-check against getTrStrain's own scalar resolved-strain
+        output before trusting this tensor's absolute scale.
+
+        Parameters
+        ----------
+        system : str
+            e.g. 'NiTi'.
+        best_variant : int
+            Index (0-11) into F_AM's variant axis.
+        parent_mat : (3,3) ndarray
+            Reconstructed parent orientation (sample -> crystal).
+        phase_A : str, optional
+            Default 'A'.
+        verify_against_axial_dir : array-like (3,), optional
+            If given, cross-checks the tensor's resolved elongation along
+            this SAMPLE-frame direction against self.data.getTrStrain's own
+            scalar output for the same direction/variant -- prints both so
+            you can confirm the strain convention matches. Recommended.
+        print_result : bool, optional
+
+        Returns
+        -------
+        result : dict
+            'tensor', 'eigenvalues', 'eigenvectors' (same structure as
+            compute_average_strain_tensor's output).
+        """
+        F = self.data.defGrad[system][phase_A]['F_AM'][:, :, best_variant]
+        E_crystal = 0.5 * (F.T @ F - np.eye(3))
+        E_sample = parent_mat.T @ E_crystal @ parent_mat
+
+        eigvals, eigvecs = np.linalg.eigh(E_sample)
+
+        if print_result:
+            print(f"Transformation strain tensor (sample frame), variant {best_variant}")
+            print(E_sample)
+            print("\nPrincipal strains (ascending) and directions (sample-frame unit vectors):")
+            for i in range(3):
+                print(f"  ε_{i+1} = {eigvals[i]:+.4f}   direction = {eigvecs[:, i]}")
+
+        if verify_against_axial_dir is not None:
+            v = np.asarray(verify_against_axial_dir, dtype=float)
+            v = v / np.linalg.norm(v)
+
+            # elongation from THIS tensor: sqrt(1 + 2*v.E.v) - 1 (exact Green-Lagrange relation)
+            quad = v.dot(E_sample).dot(v)
+            elong_from_tensor = np.sqrt(max(1 + 2 * quad, 0.0)) - 1
+
+            self.data.getTrStrain(phase=phase_A, oris=parent_mat.dot(v))
+            elong_from_getTrStrain = float(self.data.trStrain[1][best_variant])
+
+            print(f"\nVerification along axial_dir={verify_against_axial_dir}:")
+            print(f"  elongation from this tensor:      {elong_from_tensor:+.4f}")
+            print(f"  elongation from getTrStrain:       {elong_from_getTrStrain:+.4f}")
+            if not np.isclose(elong_from_tensor, elong_from_getTrStrain, atol=1e-3):
+                print("  *** MISMATCH -- strain convention may differ from getTrStrain's own. "
+                    "Treat the ellipse as illustrative only until this is resolved. ***")
+
+        return {'tensor': E_sample, 'eigenvalues': eigvals, 'eigenvectors': eigvecs}
     def find_boundary_sharing_twins(self, boundary_result, merge_groups_all=None, phase=None,
                                  system=None, modes=None, tol_deg=5.0, min_size=None,
                                  cluster_ids=None, boundary_only=False, print_result=False,
@@ -9179,7 +9649,1616 @@ class ClusteringResult:
             return new_result, merge_groups_all, disor_matrices
         return new_result, merge_groups_all
 
+    def merge_clusters_to_reference(self, reference_mat, threshold_deg=5.0, phase=None,
+                                    min_size='recipe', cluster_ids=None,
+                                    return_disor_values=False):
+        """
+        Merge clusters within `phase` whose average orientation has a TRUE
+        MINIMUM disorientation (full symmetry group, via disorimat) to a
+        given REFERENCE orientation below threshold_deg -- e.g. merging
+        clusters found to be the same physical orientation as a
+        reconstructed parent grain (reconstruct_parent_orientation /
+        reconstruct_parent_orientation_directed) on a different symmetric
+        branch, rather than genuinely twin/kink-related.
 
+        Unlike merge_clusters_by_orientation (mutual pairwise complete-
+        linkage among ALL clusters), this checks distance to ONE FIXED
+        reference only -- every qualifying cluster joins a SINGLE group,
+        regardless of mutual pairwise distance among themselves.
+
+        Same conventions as merge_clusters_by_orientation: merged fragments
+        take the label of the SMALLEST cluster id among them (the "root"),
+        and the returned merge_groups dict follows the identical
+        {phase: {root_id: [fragment cluster ids]}} structure -- drop-in
+        compatible with find_boundary_sharing_twins/_kinks,
+        print_pixel_to_average_misorientation_summary, etc. Unmerged
+        clusters appear as their own singleton group, same as
+        merge_clusters_by_orientation.
+
+        Parameters
+        ----------
+        reference_mat : (3,3) ndarray
+            Reference orientation matrix (e.g. result['parent_mat']).
+        threshold_deg : float, optional
+            Disorientation threshold (degrees). Default 5.0.
+        phase : str
+            Phase to merge within. REQUIRED (a reference orientation only
+            makes sense for one specific phase, unlike
+            merge_clusters_by_orientation which accepts a list).
+        min_size : int, None, or 'recipe', optional
+            Same as merge_clusters_by_orientation. Default 'recipe'.
+        cluster_ids : list of int, optional
+            Restrict the candidate set. Default: all clusters of `phase`
+            (min_size-filtered).
+        return_disor_values : bool, optional
+            If True, also return {cluster_id: disorientation_deg} for every
+            candidate checked (not just the merged ones), for inspection.
+
+        Returns
+        -------
+        new_result : ClusteringResult
+        merge_groups_all : dict {phase: {root_id: [fragment cluster ids]}}
+        disor_values : dict {cluster_id: disorientation_deg}, only if
+            return_disor_values=True.
+        """
+        import copy
+
+        if phase is None or not isinstance(phase, str):
+            raise ValueError("phase must be given as a single phase name (a reference "
+                            "orientation only makes sense for one specific phase)")
+
+        if not hasattr(self, 'avg_orientations') or self.avg_orientations is None:
+            self.getAvgOri()
+
+        sizes = self.cluster_sizes
+        this_min_size = self.get_recipe_min_size(phase) if min_size == 'recipe' else min_size
+
+        if cluster_ids is None:
+            cluster_ids = [c for c in self.labels_by_phase[phase] if c in self.avg_orientations]
+        else:
+            cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
+        if this_min_size is not None:
+            cluster_ids = [c for c in cluster_ids if sizes.get(c, 0) >= this_min_size]
+
+        new_labels = self.labels.copy()
+
+        if not cluster_ids:
+            merge_groups_all = {phase: {}}
+            if return_disor_values:
+                return copy.copy(self), merge_groups_all, {}
+            return copy.copy(self), merge_groups_all
+
+        # disorimat extends symops with improper operations internally, so
+        # pass the full stored symmetry set as-is, as a plain list.
+        symops = list(np.array(self.data.phases[phase]['symops']))
+
+        M = np.array([reference_mat] + [self.avg_orientations[c] for c in cluster_ids])
+        disor_matrix = np.asarray(disorimat(M, symops), dtype=float)
+        disor_to_ref = disor_matrix[0, 1:]  # row 0 = reference, columns 1..n = cluster_ids
+
+        disor_values = {c: float(d) for c, d in zip(cluster_ids, disor_to_ref)}
+
+        matched = [c for c, d in disor_values.items() if d < threshold_deg]
+        unmatched = [c for c in cluster_ids if c not in matched]
+
+        merge_groups = {}
+        if matched:
+            root = min(matched)
+            merge_groups[root] = matched
+            for frag in matched:
+                if frag != root:
+                    new_labels[self.labels == frag] = root
+        for c in unmatched:
+            merge_groups[c] = [c]
+
+        merge_groups_all = {phase: {int(r): [int(f) for f in fr] for r, fr in merge_groups.items()}}
+
+        new_result = copy.copy(self)
+        new_result.labels = new_labels
+
+        new_result._clusters_unique = None
+        new_result._cluster_sizes = None
+        new_result._cluster_sizes_by_phase = None
+        new_result._cluster_phases_id = None
+        new_result._com = None
+        new_result._cluster_areas = None
+        new_result._cluster_perimeters = None
+        new_result._cluster_equivalent_diameters = None
+        new_result._cluster_sphericities = None
+
+        _ = new_result.cluster_phases_id
+        new_result.get_phase_labels()
+        new_result.getAvgOri()
+        _ = new_result.com
+
+        if return_disor_values:
+            return new_result, merge_groups_all, disor_values
+        return new_result, merge_groups_all
+
+
+    def check_parent_reconstruction(self, parent_mat, merge_groups_all, phase, system, modes,
+                                    axial_dir=None, tol_deg=5.0, disor_values=None,pre_merge_sizes=None,
+                                    sort_by='size',include_kink=True, max_miller_index=2, kink_tol_deg=5.0,
+                                    print_result=True):
+        """
+        Combined report for a reconstructed-parent workflow: prints which
+        clusters were merged into the reference orientation (via
+        merge_clusters_to_reference), then runs check_parent_twin_relationships
+        against every REMAINING (non-merged) cluster of the phase --
+        automatically excluding the merged root, since testing whether the
+        parent's own now-merged orientation has a twin relationship to
+        ITSELF is not meaningful (the T-loop can find a spurious
+        small-angle-deviation/large-axis-deviation "near match" there
+        purely by chance -- see check_parent_twin_relationships's notes).
+
+        Call this on the ClusteringResult RETURNED BY
+        merge_clusters_to_reference (i.e. self already has the merge
+        applied), passing that same call's merge_groups_all.
+
+        Parameters
+        ----------
+        parent_mat : (3,3) ndarray
+            The same reference orientation used for merge_clusters_to_reference.
+        merge_groups_all : dict
+            {phase: {root_id: [fragment cluster ids]}}, as returned by
+            merge_clusters_to_reference (or merge_clusters_by_orientation).
+        phase : str
+        system, modes, tol_deg, sort_by : passed to check_parent_twin_relationships.
+        axial_dir : array-like (3,), optional
+            If given, Schmid factors are computed and printed (see
+            check_parent_twin_relationships).
+        disor_values : dict {cluster_id: disorientation_deg}, optional
+            From merge_clusters_to_reference's return_disor_values=True --
+            if given, each merged fragment's disorientation to parent_mat
+            is shown in the merge report. If None, that column is omitted.
+        include_kink : bool, optional
+        If True (default), run check_parent_kink_relationships ONLY
+        against clusters that did NOT show a twin relationship in
+        twin_results (i.e. cluster categories are mutually exclusive:
+        Matrix / Twin / Kink-only / No match).
+        max_miller_index, kink_tol_deg : passed to check_parent_kink_relationships.
+        print_result : bool, optional
+            Default True.
+        pre_merge_sizes : dict {cluster_id: n_pixels}, optional
+        Pixel counts from the PRE-MERGE ClusteringResult (e.g.
+        original_result.cluster_sizes, where original_result is the
+        object merge_clusters_to_reference was called ON, before
+        merging). Needed to correctly report each individual merged
+        FRAGMENT's own pixel count -- self (this method's own object)
+        is the POST-merge result, where every fragment's pixels have
+        already been relabeled to the merged root, so self.cluster_sizes
+        would incorrectly show 0 px for every fragment except the root
+        itself. If None, falls back to self.cluster_sizes (will show
+        0 px for non-root fragments, with a warning).
+
+        Returns
+        -------
+        result : dict
+            'merged_root' : int or None (None if no group was actually merged)
+            'merged_fragments' : list of int
+            'merged_pixels' : int
+            'twin_results' : list of dict, from check_parent_twin_relationships,
+                run against every cluster EXCEPT merged_root
+        """
+        if pre_merge_sizes is not None:
+            sizes = pre_merge_sizes
+        else:
+            sizes = self.cluster_sizes
+            merged_groups_check = {r: f for r, f in merge_groups_all[phase].items() if len(f) > 1}
+            if merged_groups_check and print_result:
+                print("Warning: no pre_merge_sizes given -- fragment pixel counts below will show "
+                    "0 for every merged fragment except the root (their pixels were already "
+                    "relabeled onto the root in self). Pass pre_merge_sizes=<original_result>."
+                    "cluster_sizes for correct per-fragment counts.\n")
+
+        merged_groups = {r: frags for r, frags in merge_groups_all[phase].items() if len(frags) > 1}
+
+        merged_root = None
+        merged_fragments = []
+        if merged_groups:
+            if len(merged_groups) > 1:
+                print(f"Warning: expected at most one merged group, found {len(merged_groups)}: "
+                    f"{merged_groups}. Using the first.")
+            merged_root, merged_fragments = next(iter(merged_groups.items()))
+
+            if print_result:
+                print(f"Clusters merged with reference parent orientation (root cluster {merged_root}):")
+                if disor_values is not None:
+                    print(f"{'Cluster':>10} {'Px':>8} {'Disorientation to parent_mat':>30}")
+                    print("-" * 50)
+                else:
+                    print(f"{'Cluster':>10} {'Px':>8}")
+                    print("-" * 20)
+                for c in sorted(merged_fragments, key=lambda c: -sizes.get(c, 0)):
+                    if disor_values is not None:
+                        d = disor_values.get(c)
+                        d_str = f"{d:.2f}°" if d is not None else "(root itself)"
+                        print(f"{c:>10} {sizes.get(c, 0):>8} {d_str:>30}")
+                    else:
+                        print(f"{c:>10} {sizes.get(c, 0):>8}")
+
+                total_merged_px = sum(sizes.get(c, 0) for c in merged_fragments)
+                print(f"\nTotal: {len(merged_fragments)} clusters, {total_merged_px} px "
+                    f"merged into cluster {merged_root}\n")
+        elif print_result:
+            print("No clusters were merged with the reference orientation.\n")
+
+        remaining_candidates = None
+        if merged_root is not None:
+            remaining_candidates = [c for c in self.labels_by_phase[phase] if c != merged_root]
+
+        twin_results = self.check_parent_twin_relationships(
+            parent_mat=parent_mat, phase=phase, system=system, modes=modes,
+            axial_dir=axial_dir, tol_deg=tol_deg, sort_by=sort_by,
+            cluster_ids=remaining_candidates, print_result=print_result
+        )
+        kink_results = []
+        if include_kink:
+            no_twin_match = [r['cluster_b'] for r in twin_results if not r['is_match']]
+            if no_twin_match:
+                if print_result:
+                    print()  # spacer before the kink table
+                kink_results = self.check_parent_kink_relationships(
+                    parent_mat=parent_mat, phase=phase, cluster_ids=no_twin_match,
+                    max_miller_index=max_miller_index, tol_deg=kink_tol_deg, print_result=print_result
+                )
+
+        return {
+            'merged_root': merged_root,
+            'merged_fragments': merged_fragments,
+            'merged_pixels': sum(sizes.get(c, 0) for c in merged_fragments) if merged_fragments else 0,
+            'twin_results': twin_results,
+            'kink_results': kink_results,
+            'parent_mat': parent_mat,   # <-- ADD
+        }
+
+    def plot_parent_reconstruction_summary(self, check_result, phase, result_full=None,
+                                            sf_field='sf_parent', mode_martensite_labels=None,
+                                            martensite_prefix='M', martensite_bar_text='M-confirmed',
+                                            vertical_bar_labels=None, vertical_label_y_frac=0.05,
+                                            small_bar_threshold_frac=0.5,
+                                            small_bar_vlabel_offset=None,
+                                            pair_annotation_stagger=None,
+                                            xtick_rotation=45, bar_label_rotation=45,
+                                            bar_label_offset=0.0, bar_label_bbox=True,
+                                            bar_label_bbox_kwargs=None,
+                                            fig=None, axes=None, figsize=(12, 5),
+                                            matrix_color='black', twin_color='lightgray',
+                                            twin_confirmed_color='crimson',
+                                            kink_color='darkgray', no_or_color='white',
+                                            mode_colors=None, martensite_bar_color='crimson',
+                                            bar_width=0.8, tight_gap_frac=0.0, normal_gap_frac=0.4,
+                                            width_ratios=(1, 2.5),
+                                            ylim_left=None, ylim_right=None,
+                                            grid=False, grid_kwargs=None,
+                                            fontsize_axis=11, fontsize_bar_label=8,
+                                            return_val=False,small_bar_vlabel_offset_fac=0.5):
+        """
+        Two-panel summary figure for a parent-reconstruction analysis.
+
+        Left panel: Matrix / Twin OR / Kink OR / No OR found -- FOUR
+        mutually-exclusive categories summing to exactly 100% of phase
+        pixels. Matrix, Kink OR, and No OR found are each a SINGLE bar. IF
+        result_full is given, "Twin OR" is drawn as a PAIR of adjacent
+        (touching) bars sharing one x-tick label: bar 1 = the total Twin OR
+        value (unchanged), bar 2 = its martensite-confirmed subset -- its
+        own percentage is relative to the Twin OR total, not the whole
+        phase. Every bar keeps its usual top annotation (cluster count,
+        percentage); bars from result_full additionally get an IN-BAR
+        vertical text label distinguishing austenite vs. reconstructed
+        martensite (see vertical_bar_labels).
+
+        Right panel: pixel count per identified twinning MODE. IF
+        result_full is given, each mode gets a main austenite bar plus a
+        smaller martensite-confirmed subset bar beside it (x-tick-labeled
+        with the martensite plane notation, e.g. "M20-1"), each carrying
+        its own top annotation as before. Using the SAME in-bar vertical
+        labeling as the left panel (same placement logic, same default
+        text), these two bars are additionally labeled 'austenite' /
+        'reconstructed mart.' inside them.
+
+        In-bar vertical label placement (both panels, identical logic): for
+        a bar whose height is >= small_bar_threshold_frac of that panel's
+        own y-axis range, the label is drawn INSIDE the bar, near its base
+        (vertical_label_y_frac of that bar's own height). For a smaller
+        bar, there is usually no room for a tall rotated label inside it,
+        so the label is drawn ABOVE that bar's own top annotation instead,
+        separated by small_bar_vlabel_offset.
+
+        For the touching Twin OR pair specifically, the second (confirmed)
+        bar's top annotation is additionally shifted HORIZONTALLY by
+        pair_annotation_stagger (a fraction of bar_width), to avoid the two
+        bars' diagonal (bar_label_rotation) annotations visually colliding
+        -- a vertical stagger was tried first and made diagonal-text
+        collisions worse, since 45 degree text occupies a diagonal swath of
+        space that a vertical shift does not separate cleanly.
+
+        Parameters
+        ----------
+        check_result : dict
+            Output of check_parent_reconstruction (needs 'merged_pixels',
+            'merged_fragments', 'twin_results'; 'kink_results' used if
+            present, else the Kink OR bar is 0).
+        phase : str
+        result_full : dict, optional
+            Output of check_martensite_twin_correspondence (needs
+            'correspondence_results', each entry with 'cluster_b', 'mode',
+            'plane_match', 'expected_M_plane'). If None (default), both
+            panels behave as if no martensite correspondence check had
+            been run: a single Twin OR bar (left) and a single bar per mode
+            (right), no martensite split, no in-bar vertical labels.
+        sf_field : {'sf_parent', 'sf_cluster'}, optional
+            Which Schmid factor field to average/std over per mode, in the
+            right panel's top annotation. Default 'sf_parent'.
+        mode_martensite_labels : dict {austenite_mode: martensite_label}, optional
+            Right panel only. Manual martensite notation per mode for the
+            confirmed-subset bar's x-tick label (e.g. {'114': '20-1'}); any
+            mode not given is auto-built from
+            result_full['correspondence_results']'s own 'expected_M_plane'
+            field.
+        martensite_prefix : str, optional
+            Right panel only. Prepended to each resolved martensite
+            notation for the x-tick label (e.g. 'M' -> 'M20-1'). Default 'M'.
+        martensite_bar_text : str, optional
+            Right panel only. First line of the TOP annotation drawn above
+            each mode's confirmed-subset bar (a second line with that bar's
+            own confirmed-cluster count is appended automatically). This is
+            separate from the in-bar vertical label (see
+            vertical_bar_labels['mode_martensite']). Default 'M-confirmed'.
+        vertical_bar_labels : dict, optional
+            Only used when result_full is given. Overrides any subset of
+            the default in-bar vertical text labels:
+            {'twin_austenite': 'austenite', 'twin_martensite':
+            'reconstructed mart.', 'kink_austenite': 'austenite',
+            'no_or_austenite': 'austenite', 'mode_austenite': 'austenite',
+            'mode_martensite': 'reconstructed mart.'}. Pass a dict with only
+            the keys you want to change.
+        vertical_label_y_frac : float, optional
+            For LARGE bars (see small_bar_threshold_frac): vertical
+            position of the in-bar label, as a fraction of that bar's OWN
+            height (0.0 = base, 1.0 = top). Same value used in both panels.
+            Default 0.05.
+        small_bar_threshold_frac : float, optional
+            A bar is "small" (its in-bar label moves above its top
+            annotation instead of inside it) if its height is below this
+            fraction of that panel's OWN y-axis range. Same value used in
+            both panels (each panel's range is estimated independently).
+            Default 0.5.
+        small_bar_vlabel_offset : float, optional
+            For SMALL bars: additional vertical gap, in DATA units of that
+            panel, between the bar's top annotation and its in-bar label
+            (drawn above that annotation). None (default) -> auto-computed,
+            per panel, as 0.15 times that panel's estimated y-axis range.
+        pair_annotation_stagger : float, optional
+            Horizontal offset, as a FRACTION of bar_width, applied to the
+            Twin OR pair's SECOND (confirmed) bar's top annotation, to
+            avoid collision with the first bar's diagonal annotation. None
+            (default) -> auto-computed as 0.4 * bar_width equivalent
+            (interpreted as a bar_width fraction internally).
+        xtick_rotation : float, optional
+            Rotation (degrees) for ALL x-tick labels, both panels. Default 45.
+        bar_label_rotation : float, optional
+            Rotation (degrees) for the TOP text annotations (count/SF/%,
+            and martensite_bar_text). Does NOT affect in-bar vertical
+            labels, which are always rotated 90 degrees. Default 45.
+        bar_label_offset : float, optional
+            Vertical offset, in DATA units, applied to every bar-TOP
+            annotation (not the in-bar vertical labels). Can be negative to
+            shift text down onto the bar. Default 0.0.
+        bar_label_bbox : bool, optional
+            If True (default), draw a white background rectangle behind
+            every bar-top AND in-bar vertical text annotation, for legibility.
+        bar_label_bbox_kwargs : dict, optional
+            Extra kwargs for the background rectangle (matplotlib text
+            `bbox` dict format), merged over {'facecolor': 'white',
+            'edgecolor': 'none', 'alpha': 0.85, 'pad': 1}.
+        fig, axes : optional
+            Existing Figure/2-element Axes array. If axes is None (default),
+            created via plt.subplots(1, 2, ...).
+        figsize : tuple, optional
+            Only used when axes is None. Default (12, 5).
+        matrix_color, twin_color, kink_color, no_or_color : color spec, optional
+            Colors for Matrix / Twin OR (total) / Kink OR / No OR found.
+        twin_confirmed_color : color spec, optional
+            Color for the Twin OR martensite-confirmed subset bar. Default
+            'crimson'.
+        mode_colors : list of color specs, or dict {mode: color}, optional
+            Right panel: colors for each mode's MAIN (austenite) bar.
+        martensite_bar_color : color spec, optional
+            Right panel: color for every mode's confirmed-subset bar.
+            Default 'crimson'.
+        bar_width : float, optional
+            Default 0.8.
+        tight_gap_frac : float, optional
+            Extra gap, as a fraction of bar_width, between bars WITHIN a
+            touching pair. Default 0.0 (bars touch).
+        normal_gap_frac : float, optional
+            Extra gap, as a fraction of bar_width, between separate
+            categories/modes. Default 0.4.
+        width_ratios : tuple of 2 floats, optional
+            Default (1, 2.5).
+        ylim_left, ylim_right : tuple (ymin, ymax), optional
+            Explicit y-axis limits. If None, auto-scaled with headroom.
+        grid : bool, optional
+            Horizontal gridlines behind the bars, both panels. Default False.
+        grid_kwargs : dict, optional
+            Extra kwargs for ax.grid. Only used if grid=True.
+        fontsize_axis : int, optional
+            Default 11.
+        fontsize_bar_label : int, optional
+            Used for both top annotations and in-bar vertical labels.
+            Default 8.
+        return_val : bool, optional
+            Kept for API consistency with other plotting methods in this
+            class. Default False.
+
+        Returns
+        -------
+        fig : matplotlib Figure
+        axes : (2,) array of matplotlib Axes
+            axes[0] is the left (category) panel, axes[1] is the right
+            (twin-mode) panel.
+
+        Examples
+        --------
+        Basic call, no martensite correspondence information:
+
+        >>> fig, axes = notmerged_new_result.plot_parent_reconstruction_summary(
+        ...     check_result=report, phase='A'
+        ... )
+
+        With the martensite correspondence split (both panels), default
+        styling:
+
+        >>> fig, axes = notmerged_new_result.plot_parent_reconstruction_summary(
+        ...     check_result=report, result_full=result_full, phase='A'
+        ... )
+
+        Custom colors, grid, larger fonts, explicit width ratio:
+
+        >>> fig, axes = notmerged_new_result.plot_parent_reconstruction_summary(
+        ...     check_result=report, result_full=result_full, phase='A',
+        ...     sf_field='sf_parent', figsize=(12, 5), width_ratios=(1, 1.5),
+        ...     grid=True, grid_kwargs={'color': 'gray', 'linestyle': '--', 'alpha': 0.4},
+        ...     mode_colors=['r', 'g', 'b'], fontsize_axis=12, fontsize_bar_label=9,
+        ...     xtick_rotation=45, bar_label_rotation=45
+        ... )
+
+        Custom in-bar vertical label text, and manual martensite notation
+        for one specific mode:
+
+        >>> fig, axes = notmerged_new_result.plot_parent_reconstruction_summary(
+        ...     check_result=report, result_full=result_full, phase='A',
+        ...     vertical_bar_labels={'twin_martensite': 'reconstructed mart.',
+        ...                           'mode_martensite': 'reconstructed mart.'},
+        ...     mode_martensite_labels={'114': '20-1'},
+        ...     martensite_bar_text='M-verified'
+        ... )
+
+        Tuning label placement/collision parameters directly:
+
+        >>> fig, axes = notmerged_new_result.plot_parent_reconstruction_summary(
+        ...     check_result=report, result_full=result_full, phase='A',
+        ...     small_bar_threshold_frac=0.5, small_bar_vlabel_offset=2500,
+        ...     pair_annotation_stagger=0.4
+        ... )
+        """
+        if sf_field not in ('sf_parent', 'sf_cluster'):
+            raise ValueError("sf_field must be 'sf_parent' or 'sf_cluster'")
+
+        def _format_hkl(hkl):
+            return ''.join(f'{int(x)}' for x in hkl)
+
+        default_vlabels = {
+            'twin_austenite': 'austenite',
+            'twin_martensite': 'reconstructed mart.',
+            'kink_austenite': 'austenite',
+            'no_or_austenite': 'austenite',
+            'mode_austenite': 'austenite',
+            'mode_martensite': 'reconstructed mart.',
+        }
+        vlabels = dict(default_vlabels)
+        if vertical_bar_labels:
+            vlabels.update(vertical_bar_labels)
+
+        bbox_props = None
+        if bar_label_bbox:
+            bbox_props = dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1)
+            if bar_label_bbox_kwargs:
+                bbox_props.update(bar_label_bbox_kwargs)
+
+        if axes is None:
+            fig, axes = plt.subplots(1, 2, figsize=figsize,
+                                    gridspec_kw={'width_ratios': list(width_ratios)})
+        fig = axes[0].figure
+
+        def _place_vlabel(ax, bar, height, vlabel, ann_y, y_range_estimate, small_gap):
+            if not vlabel:
+                return
+            if height < small_bar_threshold_frac * y_range_estimate:
+                vy = ann_y + small_gap
+            else:
+                vy = height * vertical_label_y_frac
+            ax.text(bar.get_x() + bar.get_width() / 2, vy, vlabel,
+                    ha='center', va='bottom', fontsize=fontsize_bar_label, rotation=90,
+                    bbox=bbox_props)
+
+        merged_px = check_result['merged_pixels']
+        n_matrix_clusters = len(check_result['merged_fragments'])
+        twin_results = check_result['twin_results']
+        kink_results = check_result.get('kink_results', [])
+
+        total_phase_px = sum(self.cluster_sizes.get(c, 0) for c in self.labels_by_phase[phase])
+        rest_px = total_phase_px - merged_px
+
+        matched = [r for r in twin_results if r['is_match']]
+        matched_px = sum(r['n_pixels'] for r in matched)
+        matched_n = len(matched)
+        n_twin_clusters = len(twin_results)
+
+        kink_matched = [r for r in kink_results if r['is_match']]
+        kink_px = sum(r['n_pixels'] for r in kink_matched)
+        kink_n = len(kink_matched)
+
+        no_match_px = rest_px - matched_px - kink_px
+        no_match_n = n_twin_clusters - matched_n - kink_n
+
+        confirmed_ids = set()
+        if result_full is not None:
+            confirmed_ids = {e['cluster_b'] for e in result_full['correspondence_results']
+                            if e.get('plane_match')}
+
+        tight_step = bar_width * (1 + tight_gap_frac)
+        normal_step = bar_width * (1 + normal_gap_frac)
+        pair_stagger_x = (pair_annotation_stagger if pair_annotation_stagger is not None else 0.4) * bar_width
+
+        # ---- build LEFT PANEL bars ----
+        bars_x, bars_h, bars_n, bars_color, bars_vlabel, bars_is_second = [], [], [], [], [], []
+        tick_x, tick_label = [], []
+
+        x = 0.0
+        bars_x.append(x); bars_h.append(merged_px); bars_n.append(n_matrix_clusters)
+        bars_color.append(matrix_color); bars_vlabel.append(None); bars_is_second.append(False)
+        tick_x.append(x); tick_label.append('Matrix')
+        x += normal_step
+
+        if result_full is not None:
+            twin_confirmed_px = sum(r['n_pixels'] for r in matched if r['cluster_b'] in confirmed_ids)
+            twin_confirmed_n = sum(1 for r in matched if r['cluster_b'] in confirmed_ids)
+
+            x_twin1 = x
+            bars_x.append(x_twin1); bars_h.append(matched_px); bars_n.append(matched_n)
+            bars_color.append(twin_color); bars_vlabel.append(vlabels['twin_austenite']); bars_is_second.append(False)
+            x_twin2 = x + tight_step
+            bars_x.append(x_twin2); bars_h.append(twin_confirmed_px); bars_n.append(twin_confirmed_n)
+            bars_color.append(twin_confirmed_color); bars_vlabel.append(vlabels['twin_martensite']); bars_is_second.append(True)
+            tick_x.append((x_twin1 + x_twin2) / 2); tick_label.append('Twin OR')
+            x = x_twin2 + normal_step
+        else:
+            bars_x.append(x); bars_h.append(matched_px); bars_n.append(matched_n)
+            bars_color.append(twin_color); bars_vlabel.append(None); bars_is_second.append(False)
+            tick_x.append(x); tick_label.append('Twin OR')
+            x += normal_step
+
+        x_kink = x
+        bars_x.append(x_kink); bars_h.append(kink_px); bars_n.append(kink_n)
+        bars_color.append(kink_color)
+        bars_vlabel.append(vlabels['kink_austenite'] if result_full is not None else None)
+        bars_is_second.append(False)
+        tick_x.append(x_kink); tick_label.append('Kink OR')
+        x += normal_step
+
+        x_noor = x
+        bars_x.append(x_noor); bars_h.append(no_match_px); bars_n.append(no_match_n)
+        bars_color.append(no_or_color)
+        bars_vlabel.append(vlabels['no_or_austenite'] if result_full is not None else None)
+        bars_is_second.append(False)
+        tick_x.append(x_noor); tick_label.append('No OR found')
+
+        # ---- percentages: 4 mutually-exclusive bars sum to 100% of total_phase_px ----
+        excl_h = [merged_px, matched_px, kink_px, no_match_px]
+        raw_pct_excl = [100 * h / total_phase_px if total_phase_px > 0 else 0.0 for h in excl_h]
+        rounded_pct_excl = [round(p) for p in raw_pct_excl]
+        diff_excl = 100 - sum(rounded_pct_excl)
+        if rounded_pct_excl:
+            rounded_pct_excl[-1] += diff_excl
+        pct_matrix, pct_twin_tot, pct_kink, pct_noor = rounded_pct_excl
+
+        if result_full is not None:
+            pct_twin_conf = round(100 * twin_confirmed_px / matched_px) if matched_px > 0 else 0
+            bars_pct = [pct_matrix, pct_twin_tot, pct_twin_conf, pct_kink, pct_noor]
+            bars_pct_base = ['of px', 'of px', 'of Twin OR px', 'of px', 'of px']
+        else:
+            bars_pct = [pct_matrix, pct_twin_tot, pct_kink, pct_noor]
+            bars_pct_base = ['of px', 'of px', 'of px', 'of px']
+
+        ax0 = axes[0]
+        if grid:
+            ax0.set_axisbelow(True)
+            ax0.grid(axis='y', **(grid_kwargs or {}))
+
+        bars0 = ax0.bar(bars_x, bars_h, width=bar_width, color=bars_color, edgecolor='black')
+        ax0.set_xticks(tick_x)
+        ax0.set_xticklabels(tick_label, rotation=xtick_rotation, ha='right' if xtick_rotation else 'center')
+
+        y_range_left = ((ylim_left[1] - ylim_left[0]) if ylim_left is not None
+                        else (max(bars_h) * 1.35 if bars_h else 1.0))
+        small_gap_left = small_bar_vlabel_offset if small_bar_vlabel_offset is not None else small_bar_vlabel_offset_fac * y_range_left
+
+        annotation_top_y = []
+        for b, n, pct, base, is_second in zip(bars0, bars_n, bars_pct, bars_pct_base, bars_is_second):
+            x0 = b.get_x() + b.get_width() / 2 + (pair_stagger_x if is_second else 0.0)
+            y0 = b.get_height() + bar_label_offset
+            label = f"{n} cluster{'s' if n != 1 else ''}\n{pct:.0f}% {base}"
+            ax0.text(x0, y0, label,
+                    ha='center', va='bottom', fontsize=fontsize_bar_label, rotation=bar_label_rotation,
+                    bbox=bbox_props)
+            annotation_top_y.append(y0)
+
+        for b, h, vlabel, ann_y in zip(bars0, bars_h, bars_vlabel, annotation_top_y):
+            _place_vlabel(ax0, b, h, vlabel, ann_y, y_range_left, small_gap_left)
+
+        if ylim_left is not None:
+            ax0.set_ylim(*ylim_left)
+        else:
+            ax0.set_ylim(top=max(bars_h) * 1.35)
+        ax0.set_ylabel('Pixels (px)', fontsize=fontsize_axis)
+        title0 = ("Pixels/clusters vs. category (martensite-confirmed twins split out)"
+                if result_full is not None else
+                "Pixels/clusters vs. 'Matrix/Twin OR/Kink OR/No OR found'")
+        ax0.set_title(title0, fontsize=fontsize_axis)
+        ax0.tick_params(axis='both', labelsize=fontsize_axis)
+
+        # ---- RIGHT PANEL ----
+        modes = sorted({r['mode'] for r in matched})
+
+        mode_px_total, mode_px_conf, mode_n_conf, mode_n, mode_sf_mean, mode_sf_std = {}, {}, {}, {}, {}, {}
+        for mode in modes:
+            rows = [r for r in matched if r['mode'] == mode]
+            mode_px_total[mode] = sum(r['n_pixels'] for r in rows)
+            mode_px_conf[mode] = sum(r['n_pixels'] for r in rows if r['cluster_b'] in confirmed_ids)
+            mode_n_conf[mode] = sum(1 for r in rows if r['cluster_b'] in confirmed_ids)
+            mode_n[mode] = len(rows)
+            sf_vals = [r[sf_field] for r in rows if r.get(sf_field) is not None]
+            mode_sf_mean[mode] = float(np.mean(sf_vals)) if sf_vals else None
+            mode_sf_std[mode] = float(np.std(sf_vals)) if sf_vals else None
+
+        if mode_colors is None:
+            cmap = plt.cm.tab10
+            mode_color_map = {m: cmap(i % 10) for i, m in enumerate(modes)}
+        elif isinstance(mode_colors, dict):
+            cmap = plt.cm.tab10
+            mode_color_map = {m: mode_colors.get(m, cmap(i % 10)) for i, m in enumerate(modes)}
+        else:
+            mode_color_map = {m: mode_colors[i % len(mode_colors)] for i, m in enumerate(modes)}
+
+        resolved_labels = {}
+        if result_full is not None:
+            for mode in modes:
+                entries = [e for e in result_full['correspondence_results']
+                            if e['mode'] == mode and e.get('plane_match')]
+                m_plane = entries[0].get('expected_M_plane') if entries else None
+                resolved_labels[mode] = _format_hkl(m_plane) if m_plane is not None else None
+            if mode_martensite_labels:
+                resolved_labels.update(mode_martensite_labels)
+
+        ax1 = axes[1]
+        if grid:
+            ax1.set_axisbelow(True)
+            ax1.grid(axis='y', **(grid_kwargs or {}))
+
+        all_bar_x, all_bar_h, all_bar_c, all_tick_x, all_tick_label = [], [], [], [], []
+        mode_main_x, mart_bar_x, mart_bar_h = {}, {}, {}
+
+        x = 0.0
+        for mode in modes:
+            color = mode_color_map[mode]
+            all_bar_x.append(x); all_bar_h.append(mode_px_total[mode]); all_bar_c.append(color)
+            mode_main_x[mode] = x
+            all_tick_x.append(x)
+            all_tick_label.append(mode)
+
+            if result_full is not None:
+                x2 = x + tight_step
+                all_bar_x.append(x2); all_bar_h.append(mode_px_conf[mode]); all_bar_c.append(martensite_bar_color)
+                mart_bar_x[mode] = x2
+                mart_bar_h[mode] = mode_px_conf[mode]
+                all_tick_x.append(x2)
+                mart_tick = f"{martensite_prefix}{resolved_labels[mode]}" if resolved_labels.get(mode) else ''
+                all_tick_label.append(mart_tick)
+                x = x2 + normal_step
+            else:
+                x += normal_step
+
+        bars1 = ax1.bar(all_bar_x, all_bar_h, width=bar_width, color=all_bar_c, edgecolor='black')
+        ax1.set_xticks(all_tick_x)
+        ax1.set_xticklabels(all_tick_label, rotation=xtick_rotation, ha='right' if xtick_rotation else 'center')
+
+        raw_pct1 = [100 * mode_px_total[m] / matched_px if matched_px > 0 else 0.0 for m in modes]
+        rounded_pct1 = [round(p) for p in raw_pct1]
+        diff1 = 100 - sum(rounded_pct1)
+        if rounded_pct1:
+            rounded_pct1[-1] += diff1
+
+        y_range_right = ((ylim_right[1] - ylim_right[0]) if ylim_right is not None
+                        else ((max(all_bar_h) if all_bar_h else 1) * 1.5))
+        small_gap_right = small_bar_vlabel_offset if small_bar_vlabel_offset is not None else small_bar_vlabel_offset_fac * y_range_right
+
+        bars1_by_x = {b.get_x() + b.get_width() / 2: b for b in bars1}
+
+        for i, mode in enumerate(modes):
+            sf_m, sf_s = mode_sf_mean[mode], mode_sf_std[mode]
+            n = mode_n[mode]
+            label = f"{n} cluster{'s' if n != 1 else ''}\n"
+            label += f"SF={sf_m:+.2f}±{sf_s:.2f}\n" if sf_m is not None else "SF: n/a\n"
+            label += f"{rounded_pct1[i]:.0f}% of Twin OR px"
+            ann_y_main = mode_px_total[mode] + bar_label_offset
+            ax1.text(mode_main_x[mode], ann_y_main, label,
+                    ha='center', va='bottom', fontsize=fontsize_bar_label, rotation=bar_label_rotation,
+                    bbox=bbox_props)
+
+            if result_full is not None:
+                main_bar = bars1_by_x.get(mode_main_x[mode])
+                if main_bar is not None:
+                    _place_vlabel(ax1, main_bar, mode_px_total[mode], vlabels['mode_austenite'],
+                                ann_y_main, y_range_right, small_gap_right)
+
+            if result_full is not None and mode in mart_bar_x:
+                n_conf = mode_n_conf[mode]
+                mart_label = f"{martensite_bar_text}\n{n_conf} cluster{'s' if n_conf != 1 else ''}"
+                ann_y_mart = mart_bar_h[mode] + bar_label_offset
+                ax1.text(mart_bar_x[mode], ann_y_mart, mart_label,
+                        ha='center', va='bottom', fontsize=fontsize_bar_label, rotation=bar_label_rotation,
+                        bbox=bbox_props)
+
+                mart_bar = bars1_by_x.get(mart_bar_x[mode])
+                if mart_bar is not None:
+                    _place_vlabel(ax1, mart_bar, mode_px_conf[mode], vlabels['mode_martensite'],
+                                ann_y_mart, y_range_right, small_gap_right)
+
+        max_h1 = max(all_bar_h) if all_bar_h else 1
+        if ylim_right is not None:
+            ax1.set_ylim(*ylim_right)
+        else:
+            ax1.set_ylim(top=max_h1 * 1.5)
+        ax1.set_ylabel('Pixels (px)', fontsize=fontsize_axis)
+        ax1.set_xlabel('Twinning orientation relationship', fontsize=fontsize_axis)
+        title1 = ('Pixels/clusters/Schmid factor vs. twin mode (right bar = M-confirmed subset)'
+                if result_full is not None else
+                'Pixels/clusters/Schmid factor vs. twinning orientation relationship')
+        ax1.set_title(title1, fontsize=fontsize_axis)
+        ax1.tick_params(axis='both', labelsize=fontsize_axis)
+
+        fig.tight_layout()
+
+        return (fig, axes) if return_val else (fig, axes)
+
+
+    def plot_martensite_correspondence_summary(self, check_result, result_full, phase,
+                                                sf_field='sf_parent', mode_martensite_labels=None,
+                                                fig=None, axes=None, figsize=(12, 5),
+                                                confirmed_color='crimson', unconfirmed_color='lightgray',
+                                                mode_colors=None, width_ratios=(1, 2.5),
+                                                ylim_left=None, ylim_right=None,
+                                                grid=False, grid_kwargs=None,
+                                                fontsize_axis=11, fontsize_bar_label=8,
+                                                return_val=False):
+        """
+        Two-panel summary showing how much of the austenite Twin OR
+        population also has a MARTENSITE-CONFIRMED correspondence (via
+        check_martensite_twin_correspondence).
+
+        Left panel: TWO mutually-exclusive bars, both drawn from clusters
+        with a matched austenite twinning orientation relationship
+        (check_result['twin_results'], is_match=True) -- "M-confirmed"
+        (plane_match=True in result_full['correspondence_results']) vs
+        "Not confirmed" (everything else among Twin OR clusters) -- height
+        = pixel count, each annotated with cluster count and percentage of
+        total Twin OR pixels.
+
+        Right panel: pixel count per austenite twin MODE, among ONLY the
+        M-confirmed clusters, annotated with cluster count, mean +/- std of
+        the chosen Schmid factor field (looked up from check_result
+        ['twin_results'] by cluster_b), and percentage of total M-confirmed
+        pixels. Bars are labeled by the martensite notation (see
+        mode_martensite_labels).
+
+        Parameters
+        ----------
+        check_result : dict
+            Output of check_parent_reconstruction (needs 'twin_results').
+        result_full : dict
+            Output of check_martensite_twin_correspondence (needs
+            'correspondence_results', each with 'cluster_b', 'mode',
+            'plane_match', 'expected_M_plane').
+        phase : str
+        sf_field : {'sf_parent', 'sf_cluster'}, optional
+            Default 'sf_parent'.
+        mode_martensite_labels : dict {austenite_mode: martensite_label}, optional
+            Same convention as plot_martensite_correspondence_map_clusters:
+            maps austenite mode -> a manual martensite notation string for
+            the right panel's bar labels, e.g. {'114': '20-1'}. If None
+            (default), auto-built from correspondence_results'
+            'expected_M_plane' field per mode; any mode you DO provide
+            overrides the auto-built value.
+        fig, axes : optional
+        figsize : tuple, optional
+            Default (12, 5).
+        confirmed_color, unconfirmed_color : color spec, optional
+        mode_colors : list of color specs, or dict {mode: color}, optional
+        width_ratios : tuple of 2 floats, optional
+            Default (1, 2.5).
+        ylim_left, ylim_right : tuple (ymin, ymax), optional
+        grid : bool, optional
+        grid_kwargs : dict, optional
+        fontsize_axis, fontsize_bar_label : int, optional
+        return_val : bool, optional
+
+        Returns
+        -------
+        fig, axes
+        """
+        if sf_field not in ('sf_parent', 'sf_cluster'):
+            raise ValueError("sf_field must be 'sf_parent' or 'sf_cluster'")
+
+        def _format_hkl(hkl):
+            return ''.join(f'{int(x)}' for x in hkl)  # e.g. [2,0,-1] -> "20-1"
+
+        if axes is None:
+            fig, axes = plt.subplots(1, 2, figsize=figsize,
+                                    gridspec_kw={'width_ratios': list(width_ratios)})
+        fig = axes[0].figure
+
+        twin_results = check_result['twin_results']
+        twin_by_cluster = {r['cluster_b']: r for r in twin_results if r['is_match']}
+
+        twin_matched_px = sum(r['n_pixels'] for r in twin_results if r['is_match'])
+        twin_matched_n = len(twin_by_cluster)
+
+        correspondence = result_full['correspondence_results']
+        confirmed = [e for e in correspondence if e.get('plane_match')]
+        confirmed_ids = {e['cluster_b'] for e in confirmed}
+
+        confirmed_px = sum(self.cluster_sizes.get(c, 0) for c in confirmed_ids)
+        confirmed_n = len(confirmed_ids)
+        unconfirmed_px = twin_matched_px - confirmed_px
+        unconfirmed_n = twin_matched_n - confirmed_n
+
+        ax0 = axes[0]
+        if grid:
+            ax0.set_axisbelow(True)
+            ax0.grid(axis='y', **(grid_kwargs or {}))
+        heights0 = [confirmed_px, unconfirmed_px]
+        counts0 = [confirmed_n, unconfirmed_n]
+        labels0 = ['M-confirmed', 'Not confirmed']
+        colors0 = [confirmed_color, unconfirmed_color]
+        bars0 = ax0.bar(labels0, heights0, color=colors0, edgecolor='black')
+
+        raw_pct0 = [100 * h / twin_matched_px if twin_matched_px > 0 else 0.0 for h in heights0]
+        rounded_pct0 = [round(p) for p in raw_pct0]
+        diff0 = 100 - sum(rounded_pct0)
+        if rounded_pct0:
+            rounded_pct0[-1] += diff0
+
+        for b, n, pct in zip(bars0, counts0, rounded_pct0):
+            label = f"{n} cluster{'s' if n != 1 else ''}\n{pct:.0f}% of Twin OR px"
+            ax0.text(b.get_x() + b.get_width() / 2, b.get_height(), label,
+                    ha='center', va='bottom', fontsize=fontsize_bar_label)
+        if ylim_left is not None:
+            ax0.set_ylim(*ylim_left)
+        else:
+            ax0.set_ylim(top=max(heights0) * 1.35 if max(heights0) > 0 else 1)
+        ax0.set_ylabel('Pixels (px)', fontsize=fontsize_axis)
+        ax0.set_title("Twin OR pixels/clusters vs. martensite correspondence", fontsize=fontsize_axis)
+        ax0.tick_params(axis='both', labelsize=fontsize_axis)
+
+        modes = sorted({e['mode'] for e in confirmed})
+
+        auto_labels = {}
+        for mode in modes:
+            example = next(e for e in confirmed if e['mode'] == mode)
+            m_plane = example.get('expected_M_plane')
+            auto_labels[mode] = _format_hkl(m_plane) if m_plane is not None else mode
+        if mode_martensite_labels is None:
+            resolved_labels = auto_labels
+        else:
+            resolved_labels = dict(auto_labels)
+            resolved_labels.update(mode_martensite_labels)
+
+        mode_px, mode_n, mode_sf_mean, mode_sf_std = {}, {}, {}, {}
+        for mode in modes:
+            ids = [e['cluster_b'] for e in confirmed if e['mode'] == mode]
+            mode_px[mode] = sum(self.cluster_sizes.get(c, 0) for c in ids)
+            mode_n[mode] = len(ids)
+            sf_vals = [twin_by_cluster[c][sf_field] for c in ids
+                        if c in twin_by_cluster and twin_by_cluster[c].get(sf_field) is not None]
+            mode_sf_mean[mode] = float(np.mean(sf_vals)) if sf_vals else None
+            mode_sf_std[mode] = float(np.std(sf_vals)) if sf_vals else None
+
+        if mode_colors is None:
+            cmap = plt.cm.tab10
+            colors1 = [cmap(i % 10) for i in range(len(modes))]
+        elif isinstance(mode_colors, dict):
+            cmap = plt.cm.tab10
+            colors1 = [mode_colors.get(m, cmap(i % 10)) for i, m in enumerate(modes)]
+        else:
+            colors1 = [mode_colors[i % len(mode_colors)] for i in range(len(modes))]
+
+        ax1 = axes[1]
+        if grid:
+            ax1.set_axisbelow(True)
+            ax1.grid(axis='y', **(grid_kwargs or {}))
+
+        heights1 = [mode_px[m] for m in modes]
+        bar_labels1 = [resolved_labels[m] for m in modes]
+        bars1 = ax1.bar(bar_labels1, heights1, color=colors1, edgecolor='black')
+
+        raw_pct1 = [100 * h / confirmed_px if confirmed_px > 0 else 0.0 for h in heights1]
+        rounded_pct1 = [round(p) for p in raw_pct1]
+        diff1 = 100 - sum(rounded_pct1)
+        if rounded_pct1:
+            rounded_pct1[-1] += diff1
+
+        for b, mode, pct in zip(bars1, modes, rounded_pct1):
+            sf_m, sf_s = mode_sf_mean[mode], mode_sf_std[mode]
+            n = mode_n[mode]
+            label = f"{n} cluster{'s' if n != 1 else ''}\n"
+            label += f"SF={sf_m:+.2f}±{sf_s:.2f}\n" if sf_m is not None else "SF: n/a\n"
+            label += f"{pct:.0f}% of M-confirmed px"
+            ax1.text(b.get_x() + b.get_width() / 2, b.get_height(), label,
+                    ha='center', va='bottom', fontsize=fontsize_bar_label)
+
+        if ylim_right is not None:
+            ax1.set_ylim(*ylim_right)
+        else:
+            ax1.set_ylim(top=(max(heights1) if heights1 else 1) * 1.35)
+        ax1.set_ylabel('Pixels (px)', fontsize=fontsize_axis)
+        ax1.set_xlabel('Martensite twin correspondence', fontsize=fontsize_axis)
+        ax1.set_title('Pixels/clusters/Schmid factor vs. martensite twin', fontsize=fontsize_axis)
+        ax1.tick_params(axis='both', labelsize=fontsize_axis)
+
+        fig.tight_layout()
+
+        return (fig, axes) if return_val else (fig, axes)
+
+    def plot_parent_reconstruction_map_clusters(self, check_result, phase, visualizer, ax=None,
+                                                fig=None, figsize=(9, 8),
+                                                tiling=None, roi=None, globalScale=False,
+                                                matrix_color='black', twin_color='crimson',
+                                                kink_color='royalblue', no_or_color='lightgray',
+                                                color_by_mode=False, mode_colors=None,
+                                                colorfill='white', legend_kwargs=None,
+                                                return_val=False, **kwargs):
+        """
+        Plot the microstructure via visualizer.plotClusters(color_by='color'),
+        with every pixel colored by its parent-reconstruction category:
+        Matrix, Twinning OR, Kinking OR, or No OR found.
+
+        Builds a full (N, 4) RGBA color array (values 0-255, matching
+        plotClusters's own (np.zeros((N,4)) + color).astype(int) handling
+        for color_by='color') and calls plotClusters directly. Every pixel
+        NOT belonging to a Matrix/Twin/Kink cluster is drawn as `colorfill`
+        (a neutral background, e.g. 'white') UNLESS it belongs to a cluster
+        that was explicitly tested and found to have no orientation
+        relationship at all -- those get `no_or_color` (e.g. 'lightgray')
+        instead. This distinction matters: unclustered/noise pixels (never
+        tested at all) are visually different from clustered-but-unrelated
+        pixels (tested, found nothing) -- conflating the two was a real bug
+        in an earlier version of this function, which initialized the
+        entire background to `no_or_color` and only explicitly colored the
+        Matrix/Twin/Kink categories, leaving every never-clustered pixel
+        gray too.
+
+        If color_by_mode=True, Twinning OR clusters are instead split into
+        one sub-category PER TWIN MODE (e.g. '114', '115', ...), each with
+        its own color and its own legend entry -- twin_color is then
+        ignored (used only as a fallback for any mode not covered by
+        mode_colors).
+
+        Parameters
+        ----------
+        check_result : dict
+            Output of check_parent_reconstruction (needs 'merged_root',
+            'twin_results'; 'kink_results' used if present, else no
+            clusters are colored kink_color).
+        phase : str
+        visualizer : EBSDVisualizer instance
+        ax : matplotlib Axes, optional
+            If None (default), a new figure and axes are created.
+        fig : matplotlib Figure, optional
+            Only used if ax is also given; ignored if ax is None (a new
+            fig/ax pair is created together in that case).
+        figsize : tuple, optional
+            Used only when ax is None. Default (9, 8).
+        tiling, roi, globalScale : passed through to plotClusters.
+        matrix_color : color spec, optional
+            Color for the Matrix (merged_root) cluster. Default 'black'.
+        twin_color : color spec, optional
+            Color for ALL twin-matched clusters when color_by_mode=False
+            (default), or a fallback for any mode not present in
+            mode_colors when color_by_mode=True. Default 'crimson'.
+        kink_color : color spec, optional
+            Color for kink-matched clusters. Default 'royalblue'.
+        no_or_color : color spec, optional
+            Color for clusters that were tested (present in
+            check_result['twin_results'], or reachable via the phase's
+            cluster list) but matched no orientation relationship at all.
+            Default 'lightgray'.
+        color_by_mode : bool, optional
+            Default False.
+        mode_colors : list of color specs, or dict {mode: color}, optional
+            Only used when color_by_mode=True. If a list, colors are
+            assigned to modes in sorted-mode order, cycling if shorter than
+            the number of modes present. If a dict, looked up by mode name
+            (falls back to the tab10 colormap for any mode not present in
+            the dict). Default None (uses the tab10 colormap for every
+            mode).
+        colorfill : color spec, optional
+            Background fill for every pixel NOT in a Matrix/Twin/Kink/
+            No-OR-found category -- i.e. unclustered/never-tested pixels.
+            Also passed through to plotClusters. Default 'white'.
+        legend_kwargs : dict, optional
+            Extra keyword arguments passed to ax.legend, merged OVER the
+            default {'loc': 'upper right', 'fontsize': 9} -- use this to
+            shrink the legend (e.g. smaller fontsize, tighter
+            handlelength/labelspacing/borderpad) when the plot panel is
+            narrow, or to reposition it. Default None (uses the defaults
+            above unchanged).
+        return_val : bool, optional
+        **kwargs
+            Additional arguments passed through to plotClusters.
+
+        Returns
+        -------
+        fig, ax
+
+        Examples
+        --------
+        Basic call, single color per category:
+
+        >>> visualizer = EBSDVisualizer()
+        >>> fig, ax = notmerged_new_result.plot_parent_reconstruction_map_clusters(
+        ...     check_result=report, phase='A', visualizer=visualizer,
+        ...     roi=recipe['roiID'], return_val=True
+        ... )
+
+        Colored by individual twin mode, with explicit mode colors:
+
+        >>> fig, ax = notmerged_new_result.plot_parent_reconstruction_map_clusters(
+        ...     check_result=report, phase='A', visualizer=visualizer, roi=recipe['roiID'],
+        ...     color_by_mode=True,
+        ...     mode_colors={'114': 'crimson', '115': 'orange', '113': 'purple'},
+        ...     return_val=True
+        ... )
+
+        Compact legend for a narrow multi-panel figure (e.g. one of several
+        subplots in a wide, short figure where the default legend would
+        overlap the plotted data or a second, overlaid legend):
+
+        >>> fig, ax = notmerged_new_result.plot_parent_reconstruction_map_clusters(
+        ...     ax=ax, fig=fig, check_result=report, phase='A', visualizer=visualizer,
+        ...     roi=recipe['roiID'], color_by_mode=True,
+        ...     mode_colors={'114': 'crimson', '115': 'orange', '113': 'purple'},
+        ...     legend_kwargs=dict(fontsize=5, handlelength=1.0, handletextpad=0.4,
+        ...                         labelspacing=0.3, borderpad=0.3),
+        ...     return_val=True
+        ... )
+
+        Reusing the legend's own rendered size/position to place a SECOND,
+        independently-drawn legend (e.g. from plot_deformation_ellipses)
+        directly above it without overlap:
+
+        >>> fig, ax = notmerged_new_result.plot_parent_reconstruction_map_clusters(
+        ...     check_result=report, phase='A', visualizer=visualizer, roi=recipe['roiID'],
+        ...     legend_kwargs=dict(fontsize=5), return_val=True
+        ... )
+        >>> bbox_axes = ax.get_legend().get_window_extent().transformed(ax.transAxes.inverted())
+        >>> notmerged_new_result.plot_deformation_ellipses(
+        ...     ax, [strain_result], labels=['Mean strain'],
+        ...     legend_kwargs={'fontsize': 5, 'loc': 'upper right',
+        ...                     'bbox_to_anchor': (bbox_axes.x0, bbox_axes.y0 + bbox_axes.height)}
+        ... )
+        """
+        import matplotlib.colors as mcolors
+        import matplotlib.patches as mpatches
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        fig = ax.figure
+
+        def _to_rgba255(color):
+            r, g, b, a = mcolors.to_rgba(color)
+            return np.round(np.array([r, g, b, a]) * 255).astype(int)
+
+        merged_root = check_result['merged_root']
+        twin_results = check_result['twin_results']
+        kink_results = check_result.get('kink_results', [])
+
+        matched_twins = [r for r in twin_results if r['is_match']]
+        twin_matched_ids = {r['cluster_b'] for r in matched_twins}
+        kink_matched_ids = {r['cluster_b'] for r in kink_results if r['is_match']}
+
+        all_phase_ids = list(self.labels_by_phase[phase])
+        accounted = set(twin_matched_ids) | set(kink_matched_ids)
+        if merged_root is not None:
+            accounted.add(merged_root)
+        no_or_ids = [c for c in all_phase_ids if c not in accounted]
+
+        N = self.labels.shape[0]
+        Colors = np.tile(_to_rgba255(colorfill), (N, 1))   # neutral background, NOT no_or_color
+
+        legend_entries = [('Matrix', matrix_color)]
+
+        if merged_root is not None:
+            Colors[np.isin(self.labels, [merged_root])] = _to_rgba255(matrix_color)
+
+        if color_by_mode:
+            modes_present = sorted({r['mode'] for r in matched_twins})
+            if mode_colors is None:
+                cmap = plt.cm.tab10
+                mode_color_map = {m: cmap(i % 10) for i, m in enumerate(modes_present)}
+            elif isinstance(mode_colors, dict):
+                cmap = plt.cm.tab10
+                mode_color_map = {m: (mode_colors[m] if m in mode_colors else cmap(i % 10))
+                                for i, m in enumerate(modes_present)}
+            else:
+                mode_color_map = {m: mode_colors[i % len(mode_colors)] for i, m in enumerate(modes_present)}
+
+            for mode in modes_present:
+                ids = sorted({r['cluster_b'] for r in matched_twins if r['mode'] == mode})
+                color = mode_color_map[mode]
+                Colors[np.isin(self.labels, ids)] = _to_rgba255(color)
+                legend_entries.append((f'Twin {mode}', color))
+        else:
+            ids = sorted(twin_matched_ids)
+            if ids:
+                Colors[np.isin(self.labels, ids)] = _to_rgba255(twin_color)
+            legend_entries.append(('Twinning OR', twin_color))
+
+        ids = sorted(kink_matched_ids)
+        if ids:
+            Colors[np.isin(self.labels, ids)] = _to_rgba255(kink_color)
+        legend_entries.append(('Kinking OR', kink_color))
+
+        if no_or_ids:
+            Colors[np.isin(self.labels, no_or_ids)] = _to_rgba255(no_or_color)
+        legend_entries.append(('No OR found', no_or_color))
+
+        visualizer.plotClusters(self, ax=ax, tiling=tiling, roi=roi, phase=phase,
+                                color_by='color', color=Colors, globalScale=globalScale,
+                                colorfill=colorfill, **kwargs)
+
+        handles = [mpatches.Patch(color=color, label=label) for label, color in legend_entries]
+        default_legend_kwargs = dict(loc='upper right', fontsize=9)
+        if legend_kwargs:
+            default_legend_kwargs.update(legend_kwargs)
+        ax.legend(handles=handles, **default_legend_kwargs)
+
+        return (fig, ax) if return_val else (fig, ax)    
+
+    def add_compression_axis_traces(self, ax, matches, parent_mat, CrystalRef2Spatial=None,
+                                    line_color='yellow', line_width=1.5, length_scale=0.5,
+                                    min_length=0.3, alpha=0.9):
+        """
+        Overlay, for each TWIN-matched cluster in `matches`, a line through
+        its centroid representing the projection of that match's
+        'Compression_a' direction into the SAMPLE frame.
+
+        'Compression_a' (m['twin_elements']['Compression_a']) is given in
+        the CLUSTER's own crystal frame; converted to the sample frame via
+        v_sample = G.T.dot(v_crystal), where G = self.avg_orientations[cluster_b]
+        (G maps sample -> crystal, so G.T maps crystal -> sample -- same
+        convention used earlier for the K1 boundary-plane trace on pole
+        figures). Only the X,Y components of v_sample are used to draw the
+        trace on the scan plane (the out-of-plane/Z component is ignored) --
+        this assumes self.data.X/Y correspond to v_sample's first two
+        components (standard EBSD sample-frame convention); flag if that's
+        not the case for your setup.
+
+        Drawn as a plain line (not an arrow) through the cluster centroid,
+        since a compression AXIS is sign-independent (the same physical
+        axis, not a directed vector).
+
+        Parameters
+        ----------
+        ax : matplotlib Axes
+            Existing axes with the microstructure already plotted (e.g.
+            from plot_parent_reconstruction_map_clusters).
+        matches : list of dict
+            e.g. notmerged_matches -- each entry needs 'cluster_b',
+            'is_match', 'twin_elements' (with 'Compression_a').
+        line_color, line_width, alpha : line style, optional.
+        length_scale : float, optional
+            Line half-length, as a multiple of sqrt(cluster pixel count),
+            in DATA units (same units as self.data.X/Y). Default 0.5.
+        min_length : float, optional
+            Minimum half-length regardless of cluster size (data units).
+            Default 0.3.
+
+        CrystalRef2Spatial : (3,3) ndarray, optional
+            Transform from the orientation-matrix SAMPLE frame convention
+            to MAP (X,Y pixel) coordinates. Default
+            [[0,1,0],[1,0,0],[0,0,1]] (X/Y swap, Z unchanged) -- EBSD map
+            pixel coordinates are conventionally swapped relative to the
+            sample-frame convention orientation matrices are expressed in.
+            Pass your own if this default doesn't match your setup.
+        """
+        if CrystalRef2Spatial is None:
+            CrystalRef2Spatial = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
+
+        for m in matches:
+            if not m.get('is_match', False):
+                continue
+            if 'Compression_a' not in m.get('twin_elements', {}):
+                continue
+
+            cluster_id = m['cluster_b']
+
+            vec_crystal = np.asarray(m['twin_elements']['Compression_a'], dtype=float)
+            vec_crystal = vec_crystal / np.linalg.norm(vec_crystal)
+            vec_sample = parent_mat.T.dot(vec_crystal)
+            vec_spatial = CrystalRef2Spatial.dot(vec_sample)
+
+            dir_xy = vec_spatial[:2]
+            norm_xy = np.linalg.norm(dir_xy)
+            if norm_xy < 1e-8:
+                continue
+
+            dir_xy = dir_xy / norm_xy
+
+            cx, cy = self._cluster_centroid(cluster_id)
+            n_px = self.cluster_sizes.get(cluster_id, 0)
+            half_len = max(length_scale * np.sqrt(n_px), min_length)
+
+            x0, y0 = cx - dir_xy[0] * half_len, cy - dir_xy[1] * half_len
+            x1, y1 = cx + dir_xy[0] * half_len, cy + dir_xy[1] * half_len
+            ax.plot([x0, x1], [y0, y1], color=line_color, lw=line_width, alpha=alpha, zorder=10)
+
+        return ax
+
+    def plot_deformation_ellipses(self, ax, strain_results, labels=None, CrystalRef2Spatial=None,
+                               center=None, scale=1.0, n_points=200, colors=None,
+                               line_width=2.0, alpha=0.9, fill=False, fill_alpha=0.15,
+                               show_undeformed=True, undeformed_color='black',undeformed_linestyle='--',
+                               undeformed_line_width=1.0, undeformed_alpha=0.8,
+                               undeformed_label='Undeformed',
+                               show_legend=True, legend_kwargs=None):
+        """
+        Overlay MULTIPLE deformation ellipses on ax, one per entry in
+        strain_results -- each a dict with 'tensor' (e.g. output of
+        compute_average_strain_tensor / compute_variant_strain_tensor).
+        All ellipses share the same center/scale for direct visual
+        comparison. A SINGLE legend covers every ellipse (deformed +
+        undeformed reference, if shown) -- no separate legend per call, so
+        nothing else on ax is disturbed.
+
+        Parameters
+        ----------
+        ax : matplotlib Axes
+        strain_results : list of dict
+            Each needs 'tensor' (3,3). E.g. [strain_result, variant_strain_result].
+        labels : list of str, optional
+            One label per entry, used for both the deformed line and (with
+            an " (undeformed)" suffix) its reference circle. Default:
+            ['Strain 1', 'Strain 2', ...].
+        CrystalRef2Spatial : (3,3) ndarray, optional
+            Default [[0,1,0],[1,0,0],[0,0,1]] (see prior docstring).
+        center : (2,), optional
+            Shared center for all ellipses. Default: center of ax's current
+            data limits.
+        scale : float, optional
+            Shared undeformed-circle radius. Default 1.0.
+        n_points : int, optional
+            Default 200.
+        colors : list of color specs, optional
+            One per entry. Default: matplotlib's default color cycle.
+        line_width, alpha, fill, fill_alpha : shared style for all deformed
+            ellipses, optional.
+        show_undeformed : bool, optional
+            Draw ONE shared undeformed reference circle (same center/scale
+            as every deformed ellipse, so a single circle suffices --
+            plotting one per entry would be redundant, identical geometry).
+            Default True.
+        undeformed_color, undeformed_line_width, undeformed_alpha : optional.
+            Style for the single shared undeformed circle. Defaults:
+            'black', 1.0, 0.8 (no longer derived per-entry from each
+            ellipse's own color, since there is only one circle now).
+        undeformed_label : str, optional
+            Legend label for the shared undeformed circle. Default 'Undeformed'.
+        undeformed_color, undeformed_line_width, undeformed_alpha : optional.
+            If None, each falls back to that entry's own deformed color/
+            line_width*0.5/alpha*0.6, same as the single-ellipse function.
+        show_legend : bool, optional
+            Default True. Adds ONE new legend for all ellipses, preserving
+            any existing legend on ax via add_artist (does not touch or
+            replace it).
+        legend_kwargs : dict, optional
+
+        Returns
+        -------
+        ax
+        """
+        import matplotlib.lines as mlines
+
+        if CrystalRef2Spatial is None:
+            CrystalRef2Spatial = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
+
+        n = len(strain_results)
+        if labels is None:
+            labels = [f'Strain {i+1}' for i in range(n)]
+        if colors is None:
+            prop_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+            colors = [prop_cycle[i % len(prop_cycle)] for i in range(n)]
+
+        if center is None:
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            center = (np.mean(xlim), np.mean(ylim))
+
+        theta = np.linspace(0, 2 * np.pi, n_points)
+        circle = np.stack([np.cos(theta), np.sin(theta), np.zeros_like(theta)], axis=0) * scale
+
+        new_handles = []
+
+        if show_undeformed:
+            xs0 = center[0] + circle[0, :]
+            ys0 = center[1] + circle[1, :]
+            ax.plot(xs0, ys0, color=undeformed_color, lw=undeformed_line_width, ls=undeformed_linestyle,
+                    alpha=undeformed_alpha, zorder=9)
+            new_handles.append(mlines.Line2D([], [], color=undeformed_color, lw=undeformed_line_width,
+                                            ls='--', alpha=undeformed_alpha, label=undeformed_label))
+
+        for sr, label, color in zip(strain_results, labels, colors):
+            T_sample = sr['tensor']
+            T_spatial = CrystalRef2Spatial @ T_sample @ CrystalRef2Spatial.T
+
+            F = np.eye(3) + T_spatial
+            deformed = F @ circle
+            xs = center[0] + deformed[0, :]
+            ys = center[1] + deformed[1, :]
+
+            if fill:
+                ax.fill(xs, ys, color=color, alpha=fill_alpha, zorder=9)
+            ax.plot(xs, ys, color=color, lw=line_width, alpha=alpha, zorder=10)
+            new_handles.append(mlines.Line2D([], [], color=color, lw=line_width, alpha=alpha,
+                                            label=label))
+
+        if show_legend:
+            existing_legend = ax.get_legend()
+            if existing_legend is not None:
+                ax.add_artist(existing_legend)
+            default_loc = 'lower right' if existing_legend is not None else 'best'
+            kwargs = {'loc': default_loc, **(legend_kwargs or {})}
+            ax.legend(handles=new_handles, **kwargs)
+
+        return ax        
+
+    def plot_martensite_correspondence_map_clusters(self, report, result_full, phase, visualizer,
+                                                    ax=None, fig=None, figsize=(9, 8),
+                                                    tiling=None, roi=None, globalScale=False,
+                                                    matrix_color='black', twin_color='crimson',
+                                                    other_color='lightgray',other_label='No OR found',
+                                                    color_by_mode=False, mode_colors=None,mode_martensite_labels=None,
+                                                    colorfill='white', return_val=False, legend_kwargs=None, **kwargs):
+        """
+        Plot the microstructure via visualizer.plotClusters(color_by='color'),
+        with pixels colored by MARTENSITE-CORRESPONDENCE-CONFIRMED category:
+        Matrix (merged_root) and Twin (a cluster whose austenite twin was
+        successfully matched to a known martensite twin plane, i.e.
+        plane_match=True in result_full['correspondence_results']) -- every
+        other cluster (twins that failed the martensite correspondence
+        check, kink-only matches, and clusters with no relationship at all)
+        is collapsed into a single 'Other/unidentified' catch-all category,
+        since this map is specifically about MARTENSITE-VERIFIED twins, not
+        the full austenite-only classification plot_parent_reconstruction_
+        map_clusters already provides.
+
+        Parameters
+        ----------
+        report : dict
+            Output of check_parent_reconstruction (needs 'merged_root').
+        result_full : dict
+            Output of check_martensite_twin_correspondence (needs
+            'correspondence_results', each entry with 'cluster_b' and
+            'plane_match').
+        phase : str
+        visualizer : EBSDVisualizer instance
+        ax, fig, figsize, tiling, roi, globalScale : as in
+            plot_parent_reconstruction_map_clusters.
+        matrix_color, other_color : color spec, optional
+        twin_color : color spec, optional
+            Used for ALL martensite-confirmed twin clusters when
+            color_by_mode=False (default), or as a fallback color when
+            color_by_mode=True and a mode isn't in mode_colors.
+        color_by_mode : bool, optional
+            If True, martensite-confirmed twin clusters are split into one
+            sub-category per austenite twin mode (e.g. '114', '115'), each
+            with its own color/legend entry. Default False.
+        mode_colors : list of color specs, or dict {mode: color}, optional
+            Same convention as plot_parent_reconstruction_map_clusters's
+            color_by_mode option. Default None (tab10 colormap).
+        mode_martensite_labels : dict {austenite_mode: martensite_label}, optional
+            Only used when color_by_mode=True. Maps each austenite twin
+            mode key to a martensite notation string for the legend, e.g.
+            {'114': '20-1'}. If None (default), AUTO-BUILT from
+            result_full['correspondence_results']'s own 'expected_M_plane'
+            field for each mode's first matched entry -- formatted as e.g.
+            '20-1' from Miller indices [2,0,-1]. Any mode you DO provide
+            explicitly in a passed-in dict overrides the auto-built value;
+            any mode with no expected_M_plane available falls back to its
+            own austenite mode key.
+        colorfill : optional
+            Passed through to plotClusters.
+        return_val : bool, optional
+        **kwargs
+            Passed through to plotClusters.
+
+        Returns
+        -------
+        fig, ax
+        """
+
+        import matplotlib.colors as mcolors
+        import matplotlib.patches as mpatches
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        fig = ax.figure
+
+        def _to_rgba255(color):
+            r, g, b, a = mcolors.to_rgba(color)
+            return np.round(np.array([r, g, b, a]) * 255).astype(int)
+
+        def _format_hkl(hkl):
+            return ''.join(f'{int(x)}' if x >= 0 else f'{int(x)}' for x in hkl)  # e.g. [2,0,-1] -> "20-1"
+
+        merged_root = report['merged_root']
+        confirmed_entries = [e for e in result_full['correspondence_results'] if e.get('plane_match')]
+        confirmed_ids = {e['cluster_b'] for e in confirmed_entries}
+
+        all_phase_ids = list(self.labels_by_phase[phase])
+        accounted = set(confirmed_ids)
+        if merged_root is not None:
+            accounted.add(merged_root)
+        other_ids = [c for c in all_phase_ids if c not in accounted]
+
+        N = self.labels.shape[0]
+        Colors = np.tile(_to_rgba255(colorfill), (N, 1))
+
+        legend_entries = [('Matrix', matrix_color)]
+
+        if merged_root is not None:
+            Colors[np.isin(self.labels, [merged_root])] = _to_rgba255(matrix_color)
+
+        if color_by_mode:
+            modes_present = sorted({e['mode'] for e in confirmed_entries})
+
+            # auto-build martensite labels from expected_M_plane, unless overridden
+            auto_labels = {}
+            for mode in modes_present:
+                example_entry = next(e for e in confirmed_entries if e['mode'] == mode)
+                m_plane = example_entry.get('expected_M_plane')
+                auto_labels[mode] = _format_hkl(m_plane) if m_plane is not None else mode
+            if mode_martensite_labels is None:
+                resolved_labels = auto_labels
+            else:
+                resolved_labels = dict(auto_labels)
+                resolved_labels.update(mode_martensite_labels)  # explicit entries override auto ones
+
+            if mode_colors is None:
+                cmap = plt.cm.tab10
+                mode_color_map = {m: cmap(i % 10) for i, m in enumerate(modes_present)}
+            elif isinstance(mode_colors, dict):
+                cmap = plt.cm.tab10
+                mode_color_map = {m: (mode_colors[m] if m in mode_colors else cmap(i % 10))
+                                for i, m in enumerate(modes_present)}
+            else:
+                mode_color_map = {m: mode_colors[i % len(mode_colors)] for i, m in enumerate(modes_present)}
+
+            for mode in modes_present:
+                ids = sorted({e['cluster_b'] for e in confirmed_entries if e['mode'] == mode})
+                color = mode_color_map[mode]
+                Colors[np.isin(self.labels, ids)] = _to_rgba255(color)
+                legend_entries.append((f'Twin {resolved_labels[mode]}', color))
+        else:
+            ids = sorted(confirmed_ids)
+            if ids:
+                Colors[np.isin(self.labels, ids)] = _to_rgba255(twin_color)
+            legend_entries.append(('Twin (M-confirmed)', twin_color))
+
+        if other_ids:
+            Colors[np.isin(self.labels, other_ids)] = _to_rgba255(other_color)
+        legend_entries.append((other_label, other_color))
+
+        visualizer.plotClusters(self, ax=ax, tiling=tiling, roi=roi, phase=phase,
+                                color_by='color', color=Colors, globalScale=globalScale,
+                                colorfill=colorfill, **kwargs)
+
+        handles = [mpatches.Patch(color=color, label=label) for label, color in legend_entries]
+
+        default_legend_kwargs = dict(loc='upper right', fontsize=9)
+        if legend_kwargs:
+            default_legend_kwargs.update(legend_kwargs)
+        ax.legend(handles=handles, **default_legend_kwargs)
+        #ax.legend(handles=handles, loc='upper right', fontsize=9)
+
+        return (fig, ax) if return_val else (fig, ax)
+
+    def compute_average_strain_tensor(self, matches, parent_mat, weight_by='n_pixels', print_result=True):
+        """
+        Compute a pixel-weighted average strain tensor, in the SAMPLE
+        frame, over every twin-matched cluster in `matches` that has a
+        'StrainTensor_a' entry.
+
+        'StrainTensor_a' is defined relative to the MATRIX (parent) crystal
+        frame, not the individual twin cluster's own orientation -- in
+        `matches` (from check_parent_twin_relationships), cluster_a is
+        ALWAYS the sentinel/parent_mat, so the correct transform uses
+        parent_mat (constant across all matches) on BOTH sides of the
+        tensor conjugation: T_sample = parent_mat.T @ T_crystal @ parent_mat
+        -- NOT self.avg_orientations[cluster_b] (the twin's own measured
+        orientation, which was incorrectly used in an earlier version).
+
+        Parameters
+        ----------
+        matches : list of dict
+            e.g. notmerged_matches.
+        parent_mat : (3,3) ndarray
+            The SAME reference orientation used to generate `matches`
+            (e.g. result['parent_mat']).
+        weight_by : {'n_pixels', 'equal'}, optional
+            Default 'n_pixels'.
+        print_result : bool, optional
+
+        Returns
+        -------
+        result : dict
+            'tensor', 'eigenvalues', 'eigenvectors', 'n_clusters', 'total_pixels'
+            (same structure as before).
+        """
+        T_sum = np.zeros((3, 3))
+        w_sum = 0.0
+        n_clusters = 0
+
+        for m in matches:
+            if not m.get('is_match', False):
+                continue
+            if 'StrainTensor_a' not in m.get('twin_elements', {}):
+                continue
+
+            cluster_id = m['cluster_b']
+            T_crystal = np.asarray(m['twin_elements']['StrainTensor_a'], dtype=float)
+            T_sample = parent_mat.T @ T_crystal @ parent_mat
+
+            w = float(self.cluster_sizes.get(cluster_id, 0)) if weight_by == 'n_pixels' else 1.0
+            if w <= 0:
+                continue
+
+            T_sum += w * T_sample
+            w_sum += w
+            n_clusters += 1
+
+        if w_sum == 0:
+            raise ValueError("No matched clusters with 'StrainTensor_a' and positive weight found.")
+
+        T_avg = T_sum / w_sum
+        eigvals, eigvecs = np.linalg.eigh(T_avg)
+
+        result = {
+            'tensor': T_avg, 'eigenvalues': eigvals, 'eigenvectors': eigvecs,
+            'n_clusters': n_clusters,
+            'total_pixels': int(w_sum) if weight_by == 'n_pixels' else None,
+        }
+
+        if print_result:
+            print(f"Average strain tensor (sample frame, relative to parent_mat), {n_clusters} cluster(s)"
+                + (f", {int(w_sum)} px total" if weight_by == 'n_pixels' else " (unweighted)"))
+            print(T_avg)
+            print("\nPrincipal strains (ascending) and directions (sample-frame unit vectors):")
+            for i in range(3):
+                print(f"  ε_{i+1} = {eigvals[i]:+.4f}   direction = {eigvecs[:, i]}")
+
+        return result        
     def merge_clusters_by_orientation_single_linkage(self, threshold_deg=2.0, phase=None, min_size=None):
         """
         Merge clusters within the same phase whose average orientations are
@@ -9343,6 +11422,915 @@ class ClusteringResult:
         print("-" * 30)
         for c in ordered:
             print(f"{c:>8} {sizes[c]:>10} {phase_names[phases[c]]:>8}")
+    # ============================================================================
+    # RECONSTRUCTION OF PARENT GRAIN ORIENTATION FROM SUBGRAINS
+    # ============================================================================
+    def reconstruct_parent_orientation_directed(self, phase, axial_dir, matches=None, kink_results=None,
+                                                root_cluster_id=None, sf_epsilon=1e-9, print_result=True):
+        """
+        Directed version of reconstruct_parent_orientation: TWIN edges are
+        oriented parent -> child using each edge's OWN Schmid factor sign
+        (the side with the HIGHER Schmid factor, under the given axial_dir,
+        is treated as the mechanically-favored, twin-nucleating "parent"
+        side for that specific event; propagation is only allowed in that
+        direction). KINK edges remain UNDIRECTED (bidirectional) -- a
+        proper Schmid factor needs a plane normal AND a shear direction,
+        but map_kink_axes only ever identifies a rotation axis, not a full
+        slip-system pair, so kink edges provide connectivity only, no
+        parent/child claim.
+
+        This can leave nodes UNREACHABLE that reconstruct_parent_orientation
+        (undirected) would have reached, if the only path to them requires
+        walking against a directed twin edge -- this is a meaningful
+        diagnostic (a genuine directionality conflict or an incomplete
+        network), not a bug.
+
+        Root selection: among nodes with NO incoming directed twin edge
+        (i.e. never the SF-unfavorable side of any twin relationship --
+        "source" candidates), the one whose reachable subtree (via directed
+        twin + undirected kink edges) covers the most total pixel weight is
+        chosen, unless root_cluster_id is given explicitly (in which case,
+        if it is NOT itself a source, a warning is printed -- using a
+        node identified as someone else's twin "child" as root is a red
+        flag, not necessarily wrong, but worth knowing).
+
+        UNVALIDATED, same caveat as reconstruct_parent_orientation, with
+        additional untested assumptions here: the sign/convention of your
+        axial_dir and Schmid factor formula, the choice to leave kink edges
+        undirected, and the tie-break/negative-negative handling below.
+
+        Parameters
+        ----------
+        phase : str
+        axial_dir : array-like (3,)
+            SAMPLE-frame loading direction (e.g. [0,0,1]), used to compute
+            each twin edge's Schmid factor on both sides via the SAME
+            formulas validated earlier: sf_A = (G_A.axial_dir).n1 *
+            (G_A.axial_dir).a1 (cluster_a, untransformed n1/a1); sf_B =
+            (T.(G_B.axial_dir)).n1 * (T.(G_B.axial_dir)).a1 (cluster_b, T
+            applied to axial_dir per the current T@M_fwd convention).
+        matches : list of dict, optional
+            From map_twin_relationships. Must have 'cluster_a', 'cluster_b',
+            'T', 'twin_elements' (with 'n1_a'/'a1_a').
+        kink_results : list of dict, optional
+            From map_kink_axes. Only 'cluster_a'/'cluster_b' needed.
+        root_cluster_id : int, optional
+            Override automatic source selection.
+        sf_epsilon : float, optional
+            If |sf_A - sf_B| < sf_epsilon for a twin edge (near-exact tie,
+            essentially never happens with real float data but guarded
+            anyway), falls back to the larger-pixel-count cluster as the
+            parent side for that edge, and flags it in 'edges'.
+        print_result : bool, optional
+
+        Returns
+        -------
+        result : dict
+            Same fields as reconstruct_parent_orientation, plus:
+            'source_candidates' : list of (cluster_id, reachable_pixel_weight),
+                sorted descending -- every node with no incoming directed
+                twin edge, and how much pixel weight it can reach. More
+                than one entry with substantial weight indicates the
+                network does not collapse to a single consistent source.
+            'edges' : list of dict, each {'cluster_a', 'cluster_b', 'type',
+                'direction' ('a_to_b'/'b_to_a'/'undirected'), 'sf_parent',
+                'sf_child' (twin edges only; None for kink), 'parent_sf_positive'
+                (bool, twin edges only -- False flags a weak/questionable
+                directionality call, both sides mechanically unfavorable),
+                'tie_broken_by_size' (bool)}
+            'unreachable_due_to_directionality' : list of int, nodes in the
+                SAME connected component as root (reachable if edges were
+                undirected) but unreachable given the direction constraints
+            'unreachable_clusters' : list of int, nodes not in root's
+                connected component at all (same meaning as before)
+        """
+        from scipy.spatial.transform import Rotation as _R
+        import collections
+
+        sizes = self.cluster_sizes
+        axial_dir = np.asarray(axial_dir, dtype=float)
+        axial_dir = axial_dir / np.linalg.norm(axial_dir)
+
+        edges_info = []   # for reporting
+        directed_adj = collections.defaultdict(list)   # parent -> [(child, O_forward, edge_info)]
+        undirected_adj = collections.defaultdict(list)  # both directions -> [(other, O_forward, 'forward'/'backward')]
+        all_nodes = set()
+        incoming_twin = collections.defaultdict(int)  # cluster_id -> count of incoming directed twin edges
+
+        for m in (matches or []):
+            A, B = m['cluster_a'], m['cluster_b']
+            all_nodes.add(A); all_nodes.add(B)
+
+            cond = m['best_condition']
+            key = {'K1_180': 'n1_a', 'eta1_180': 'a1_a', 'K2_shear': 'n2_a'}[cond]
+            angle = 180.0 if cond in ('K1_180', 'eta1_180') else m['shear_angle_deg']
+            axis = np.asarray(m['twin_elements'][key], dtype=float)
+            M_ideal = _rotation_about_axis(axis, angle)
+            T = m['T']
+            O_forward = T.T @ M_ideal   # predicts B (raw) from A (raw)
+
+            G_A = self.avg_orientations[A]
+            G_B = self.avg_orientations[B]
+            n1 = np.asarray(m['twin_elements']['n1_a'], dtype=float); n1 = n1 / np.linalg.norm(n1)
+            a1 = np.asarray(m['twin_elements']['a1_a'], dtype=float); a1 = a1 / np.linalg.norm(a1)
+
+            axial_A = G_A.dot(axial_dir)
+            axial_B = T.dot(G_B.dot(axial_dir))
+            sf_A = axial_A.dot(n1) * axial_A.dot(a1)
+            sf_B = axial_B.dot(n1) * axial_B.dot(a1)
+
+            tie_broken = False
+            if abs(sf_A - sf_B) < sf_epsilon:
+                tie_broken = True
+                parent, child, sf_parent, sf_child = (A, B, sf_A, sf_B) if sizes.get(A, 0) >= sizes.get(B, 0) else (B, A, sf_B, sf_A)
+            elif sf_A > sf_B:
+                parent, child, sf_parent, sf_child = A, B, sf_A, sf_B
+            else:
+                parent, child, sf_parent, sf_child = B, A, sf_B, sf_A
+
+            direction = 'a_to_b' if parent == A else 'b_to_a'
+            O_parent_to_child = O_forward if parent == A else O_forward.T
+
+            directed_adj[parent].append((child, O_parent_to_child))
+            incoming_twin[child] += 1
+
+            edges_info.append({
+                'cluster_a': A, 'cluster_b': B, 'type': 'twin',
+                'direction': direction, 'sf_parent': sf_parent, 'sf_child': sf_child,
+                'parent_sf_positive': bool(sf_parent > 0), 'tie_broken_by_size': tie_broken,
+            })
+
+        for m in (kink_results or []):
+            A, B = m['cluster_a'], m['cluster_b']
+            all_nodes.add(A); all_nodes.add(B)
+            G_A = self.avg_orientations[A]
+            G_B = self.avg_orientations[B]
+            O_forward = G_B @ G_A.T
+            undirected_adj[A].append((B, O_forward, 'forward'))
+            undirected_adj[B].append((A, O_forward, 'backward'))
+            edges_info.append({
+                'cluster_a': A, 'cluster_b': B, 'type': 'kink',
+                'direction': 'undirected', 'sf_parent': None, 'sf_child': None,
+                'parent_sf_positive': None, 'tie_broken_by_size': False,
+            })
+
+        if not all_nodes:
+            raise ValueError("No edges: matches and kink_results are both empty/None.")
+
+        # ---- combined adjacency for traversal: directed twin (one way only)
+        #      + undirected kink (both ways) ----
+        def _reachable_weight(start):
+            seen = {start}
+            queue = collections.deque([start])
+            while queue:
+                cur = queue.popleft()
+                for nbr, _ in directed_adj[cur]:
+                    if nbr not in seen:
+                        seen.add(nbr); queue.append(nbr)
+                for nbr, _, _ in undirected_adj[cur]:
+                    if nbr not in seen:
+                        seen.add(nbr); queue.append(nbr)
+            return seen, sum(sizes.get(n, 0) for n in seen)
+
+        sources = [n for n in all_nodes if incoming_twin.get(n, 0) == 0]
+        source_candidates = []
+        for s in sources:
+            _, w = _reachable_weight(s)
+            source_candidates.append((s, w))
+        source_candidates.sort(key=lambda kv: -kv[1])
+
+        if root_cluster_id is None:
+            if not source_candidates:
+                raise ValueError("No node qualifies as a source (every node has an incoming "
+                                "directed twin edge) -- the twin network contains a directed "
+                                "cycle; cannot pick an automatic root. Pass root_cluster_id explicitly.")
+            root_cluster_id = source_candidates[0][0]
+        else:
+            if incoming_twin.get(root_cluster_id, 0) > 0:
+                print(f"Warning: root_cluster_id {root_cluster_id} has {incoming_twin[root_cluster_id]} "
+                    f"incoming directed twin edge(s) -- it is identified as the SF-unfavorable "
+                    f"(child) side of at least one twin relationship. Using it as root anyway.")
+
+        # ---- BFS from root, directed twin (forward only) + undirected kink ----
+        Acc = {root_cluster_id: np.eye(3)}
+        path_length = {root_cluster_id: 0}
+        queue = collections.deque([root_cluster_id])
+        while queue:
+            cur = queue.popleft()
+            for nbr, O_parent_to_child in directed_adj[cur]:
+                if nbr in Acc:
+                    continue
+                Acc[nbr] = Acc[cur] @ O_parent_to_child.T
+                path_length[nbr] = path_length[cur] + 1
+                queue.append(nbr)
+            for nbr, O_forward, direction in undirected_adj[cur]:
+                if nbr in Acc:
+                    continue
+                Acc[nbr] = Acc[cur] @ (O_forward.T if direction == 'forward' else O_forward)
+                path_length[nbr] = path_length[cur] + 1
+                queue.append(nbr)
+
+        full_reach, _ = _reachable_weight(root_cluster_id)  # same set as Acc.keys(), sanity
+        all_reachable_undirected = set()  # nodes reachable if ALL edges were undirected
+        queue = collections.deque([root_cluster_id])
+        all_reachable_undirected.add(root_cluster_id)
+        full_undirected_adj = collections.defaultdict(set)
+        for e in edges_info:
+            full_undirected_adj[e['cluster_a']].add(e['cluster_b'])
+            full_undirected_adj[e['cluster_b']].add(e['cluster_a'])
+        while queue:
+            cur = queue.popleft()
+            for nbr in full_undirected_adj[cur]:
+                if nbr not in all_reachable_undirected:
+                    all_reachable_undirected.add(nbr)
+                    queue.append(nbr)
+
+        unreachable_due_to_direction = sorted(all_reachable_undirected - set(Acc.keys()))
+        unreachable_clusters = sorted(all_nodes - all_reachable_undirected)
+
+        per_node_pred = {node: acc @ self.avg_orientations[node] for node, acc in Acc.items()}
+
+        q_ref = mat_to_quat(per_node_pred[root_cluster_id])
+        q_sum = np.zeros(4)
+        total_px = 0
+        for node, pred_mat in per_node_pred.items():
+            q = mat_to_quat(pred_mat)
+            if q.dot(q_ref) < 0:
+                q = -q
+            w = sizes.get(node, 0)
+            q_sum += w * q
+            total_px += w
+        q_mean = q_sum / np.linalg.norm(q_sum)
+        parent_mat = quat_to_mat(q_mean)
+
+        per_node = {}
+        for node, pred_mat in per_node_pred.items():
+            R_rel = pred_mat @ parent_mat.T
+            trace = np.clip(np.trace(R_rel), -1.0, 3.0)
+            dev = float(np.degrees(np.arccos(np.clip((trace - 1) / 2, -1.0, 1.0))))
+            per_node[node] = {
+                'pred_mat': pred_mat, 'pred_quat': mat_to_quat(pred_mat),
+                'n_pixels': int(sizes.get(node, 0)), 'deviation_from_mean_deg': dev,
+                'path_length': path_length[node],
+            }
+
+        pixels_total = sum(sizes.get(n, 0) for n in all_nodes)
+
+        result = {
+            'parent_mat': parent_mat, 'parent_quat': q_mean, 'root_cluster_id': root_cluster_id,
+            'n_nodes_total': len(all_nodes), 'n_nodes_reconstructed': len(Acc),
+            'pixels_reconstructed': total_px, 'pixels_total': pixels_total,
+            'per_node': per_node, 'edges': edges_info,
+            'source_candidates': source_candidates,
+            'unreachable_due_to_directionality': unreachable_due_to_direction,
+            'unreachable_clusters': unreachable_clusters,
+        }
+
+        if print_result:
+            print(f"Directed parent orientation reconstruction, phase '{phase}'")
+            print(f"  Source candidates (no incoming twin edge): "
+                + ", ".join(f"{c} (w={w})" for c, w in source_candidates[:5])
+                + (" ..." if len(source_candidates) > 5 else ""))
+            print(f"  Root cluster: {root_cluster_id} ({sizes.get(root_cluster_id, 0)} px)")
+            print(f"  Nodes: {len(Acc)} reconstructed / {len(all_nodes)} total")
+            if unreachable_due_to_direction:
+                print(f"  {len(unreachable_due_to_direction)} node(s) unreachable due to "
+                    f"DIRECTIONALITY constraints: {unreachable_due_to_direction}")
+            if unreachable_clusters:
+                print(f"  {len(unreachable_clusters)} node(s) unreachable (disconnected): {unreachable_clusters}")
+            print(f"  Pixels: {total_px} reconstructed / {pixels_total} total "
+                f"({100*total_px/pixels_total:.1f}%)")
+            print(f"\n  Parent quaternion: {q_mean}")
+            devs = [v['deviation_from_mean_deg'] for v in per_node.values()]
+            print(f"  Per-node deviation from consensus: mean={np.mean(devs):.2f} deg, "
+                f"max={np.max(devs):.2f} deg")
+            weak = [e for e in edges_info if e['type'] == 'twin' and e['parent_sf_positive'] is False]
+            if weak:
+                print(f"\n  {len(weak)} twin edge(s) with a NEGATIVE parent-side Schmid factor "
+                    f"(both sides mechanically unfavorable under axial_dir -- weak directionality):")
+                for e in weak:
+                    print(f"    {e['cluster_a']}<->{e['cluster_b']}: dir={e['direction']}, "
+                        f"sf_parent={e['sf_parent']:.3f}, sf_child={e['sf_child']:.3f}")
+
+        return result
+
+    def reconstruct_parent_orientation(self, phase, matches=None, kink_results=None,
+                                        root_cluster_id=None, print_result=True):
+        """
+        Estimate the orientation of the single parent grain that fragmented
+        into the observed subgrains, via graph-based reconstruction over
+        identified twin/kink relationships -- NOT via any per-cluster
+        metric (e.g. Schmid factor, cluster size alone). Twin/kink
+        relationships are real physical reorientations (not measurement/
+        branch ambiguity), so subgrains cannot simply be symmetrized onto a
+        common value; instead, each subgrain's orientation is propagated
+        back through the graph of known twin/kink operators to a common
+        reference (the root cluster's own branch), and all independent
+        votes are combined, weighted by pixel size.
+
+        For TWIN edges, the DENOISED, EXACT ideal operator is used (built
+        from the matched condition's tabulated axis and IDEAL angle -- 180
+        deg for K1_180/eta1_180, the mode's shear_angle for K2_shear) --
+        NOT the noisy measured relative orientation. For KINK-only edges
+        (no independently known ideal angle exists), the raw measured
+        relation is used; this adds graph CONNECTIVITY but no denoising by
+        itself.
+
+        NOTE: this is a SINGLE-SHORTEST-PATH (BFS tree) reconstruction, not
+        a full multi-path least-squares rotation average -- each node's
+        predicted parent orientation uses only the shortest graph path to
+        root, not every possible path. Large disagreement between nodes'
+        individual predictions (see 'deviation_from_mean_deg' in the
+        output) is a diagnostic that either the network mixes genuinely
+        different parent grains, or a full multi-path optimization would
+        be worth building.
+
+        Parameters
+        ----------
+        phase : str
+        matches : list of dict, optional
+            From map_twin_relationships / find_boundary_sharing_twins.
+            Each entry must have 'cluster_a', 'cluster_b', 'T',
+            'best_condition', 'twin_elements', 'shear_angle_deg'.
+        kink_results : list of dict, optional
+            From map_kink_axes / find_boundary_sharing_kinks. Each entry
+            must have 'cluster_a', 'cluster_b' (T/axis details are not
+            needed for kink edges -- see design note above).
+        root_cluster_id : int, optional
+            Cluster to use as the reference frame (the reconstructed
+            parent is expressed in THIS cluster's own branch). Default:
+            the largest-by-pixel-size cluster in the largest connected
+            component of the graph.
+        print_result : bool, optional
+            Print a summary. Default True.
+
+        Returns
+        -------
+        result : dict
+            'parent_mat' : (3,3) ndarray, reconstructed parent orientation
+                (pixel-weighted average over all reachable nodes' votes)
+            'parent_quat' : (4,) ndarray
+            'root_cluster_id' : int
+            'n_nodes_total' : int, total distinct clusters appearing in
+                matches/kink_results
+            'n_nodes_reconstructed' : int, clusters actually reachable
+                from root (some may be in disconnected sub-networks)
+            'pixels_reconstructed' : int, total pixels of reachable clusters
+            'pixels_total' : int, total pixels of all nodes in matches/
+                kink_results (reachable + unreachable)
+            'per_node' : dict {cluster_id: {'pred_mat', 'pred_quat',
+                'n_pixels', 'deviation_from_mean_deg', 'path_length'}}
+                path_length = number of edges from root (0 for root itself)
+            'unreachable_clusters' : list of int, nodes present in the
+                edge list but not connected to root
+        """
+        from scipy.spatial.transform import Rotation as _R
+        import collections
+
+        sizes = self.cluster_sizes
+
+        # ---- build edge list: (cluster_a, cluster_b, O_forward) ----
+        edges = []
+        edge_types = []   # NEW: (cluster_a, cluster_b, 'twin'/'kink'), for plotting
+
+        for m in (matches or []):
+            A, B = m['cluster_a'], m['cluster_b']
+            cond = m['best_condition']
+            key = {'K1_180': 'n1_a', 'eta1_180': 'a1_a', 'K2_shear': 'n2_a'}[cond]
+            angle = 180.0 if cond in ('K1_180', 'eta1_180') else m['shear_angle_deg']
+            axis = np.asarray(m['twin_elements'][key], dtype=float)
+            M_ideal = _rotation_about_axis(axis, angle)
+            T = m['T']
+            O_forward = T.T @ M_ideal
+            edges.append((A, B, O_forward))
+            edge_types.append((A, B, 'twin'))   # NEW
+
+        for m in (kink_results or []):
+            A, B = m['cluster_a'], m['cluster_b']
+            G_A = self.avg_orientations[A]
+            G_B = self.avg_orientations[B]
+            O_forward = G_B @ G_A.T
+            edges.append((A, B, O_forward))
+            edge_types.append((A, B, 'kink'))   # NEW
+
+        if not edges:
+            raise ValueError("No edges: matches and kink_results are both empty/None.")
+
+        # ---- build adjacency ----
+        adj = collections.defaultdict(list)
+        all_nodes = set()
+        for A, B, O_forward in edges:
+            adj[A].append((B, O_forward, 'forward'))   # A -> B is the edge's own forward direction
+            adj[B].append((A, O_forward, 'backward'))  # B -> A is the reverse
+            all_nodes.add(A)
+            all_nodes.add(B)
+
+        # ---- choose root ----
+        if root_cluster_id is None:
+            # largest connected component, then largest cluster within it
+            visited_global = set()
+            components = []
+            for start in all_nodes:
+                if start in visited_global:
+                    continue
+                comp = set()
+                queue = collections.deque([start])
+                visited_global.add(start)
+                comp.add(start)
+                while queue:
+                    cur = queue.popleft()
+                    for nbr, _, _ in adj[cur]:
+                        if nbr not in visited_global:
+                            visited_global.add(nbr)
+                            comp.add(nbr)
+                            queue.append(nbr)
+                components.append(comp)
+            largest_comp = max(components, key=lambda c: sum(sizes.get(n, 0) for n in c))
+            root_cluster_id = max(largest_comp, key=lambda n: sizes.get(n, 0))
+
+        if root_cluster_id not in all_nodes:
+            raise ValueError(f"root_cluster_id {root_cluster_id} not present in matches/kink_results")
+
+        # ---- BFS, accumulating Acc[node] such that Acc[node] @ G_node ~ G_root ----
+        Acc = {root_cluster_id: np.eye(3)}
+        path_length = {root_cluster_id: 0}
+        queue = collections.deque([root_cluster_id])
+        while queue:
+            cur = queue.popleft()
+            for nbr, O_forward, direction in adj[cur]:
+                if nbr in Acc:
+                    continue
+                if direction == 'forward':   # cur=A, nbr=B
+                    Acc[nbr] = Acc[cur] @ O_forward.T
+                else:                         # cur=B, nbr=A
+                    Acc[nbr] = Acc[cur] @ O_forward
+                path_length[nbr] = path_length[cur] + 1
+                queue.append(nbr)
+
+        unreachable = [n for n in all_nodes if n not in Acc]
+
+        # ---- per-node predicted parent orientation ----
+        per_node_pred = {}
+        for node, acc in Acc.items():
+            pred_mat = acc @ self.avg_orientations[node]
+            per_node_pred[node] = pred_mat
+
+        # ---- pixel-weighted quaternion average ----
+        q_ref = mat_to_quat(per_node_pred[root_cluster_id])
+        q_sum = np.zeros(4)
+        total_px = 0
+        for node, pred_mat in per_node_pred.items():
+            q = mat_to_quat(pred_mat)
+            if q.dot(q_ref) < 0:
+                q = -q
+            w = sizes.get(node, 0)
+            q_sum += w * q
+            total_px += w
+        q_mean = q_sum / np.linalg.norm(q_sum)
+        parent_mat = quat_to_mat(q_mean)
+
+        # ---- per-node deviation from the final consensus (raw angle, no
+        #      symmetry search -- all predictions are already in the same
+        #      branch by construction, so a large raw deviation is a real
+        #      inconsistency, not a branch artifact) ----
+        per_node = {}
+        for node, pred_mat in per_node_pred.items():
+            R_rel = pred_mat @ parent_mat.T
+            trace = np.clip(np.trace(R_rel), -1.0, 3.0)
+            dev = float(np.degrees(np.arccos(np.clip((trace - 1) / 2, -1.0, 1.0))))
+            per_node[node] = {
+                'pred_mat': pred_mat,
+                'pred_quat': mat_to_quat(pred_mat),
+                'n_pixels': int(sizes.get(node, 0)),
+                'deviation_from_mean_deg': dev,
+                'path_length': path_length[node],
+            }
+
+        pixels_total = sum(sizes.get(n, 0) for n in all_nodes)
+
+        result = {
+            'parent_mat': parent_mat,
+            'parent_quat': q_mean,
+            'root_cluster_id': root_cluster_id,
+            'n_nodes_total': len(all_nodes),
+            'n_nodes_reconstructed': len(Acc),
+            'pixels_reconstructed': total_px,
+            'pixels_total': pixels_total,
+            'per_node': per_node,
+            'unreachable_clusters': unreachable,
+            'edges': edge_types,   # NEW
+        }
+
+        if print_result:
+            print(f"Parent orientation reconstruction, phase '{phase}'")
+            print(f"  Root cluster: {root_cluster_id} ({sizes.get(root_cluster_id, 0)} px)")
+            print(f"  Nodes: {len(Acc)} reconstructed / {len(all_nodes)} total "
+                f"({len(unreachable)} unreachable: {unreachable})")
+            print(f"  Pixels: {total_px} reconstructed / {pixels_total} total "
+                f"({100*total_px/pixels_total:.1f}%)")
+            print(f"\n  Parent quaternion: {q_mean}")
+            devs = [v['deviation_from_mean_deg'] for v in per_node.values()]
+            print(f"  Per-node deviation from consensus: mean={np.mean(devs):.2f} deg, "
+                f"max={np.max(devs):.2f} deg")
+            worst = sorted(per_node.items(), key=lambda kv: -kv[1]['deviation_from_mean_deg'])[:5]
+            print(f"  Largest disagreements:")
+            for node, v in worst:
+                print(f"    cluster {node}: {v['deviation_from_mean_deg']:.2f} deg "
+                    f"({v['n_pixels']} px, path length {v['path_length']})")
+
+        return result    
+
+    def _cluster_centroid(self, cluster_id):
+        """Mean (X, Y) sample-frame position of a cluster's pixels."""
+        idxs = np.where(self.labels == cluster_id)[0]
+        return np.array([self.data.X[idxs].mean(), self.data.Y[idxs].mean()])
+
+
+
+    def plot_parent_reconstruction_network(self, result, ax=None, fig=None, figsize=(9, 8),
+                                            cmap=None, node_scale=3.0, return_val=False):
+        """
+        Plot the twin/kink graph used by reconstruct_parent_orientation /
+        reconstruct_parent_orientation_directed as a network diagram: nodes
+        at each cluster's real (X,Y) centroid, node size ~ sqrt(pixel
+        count), node color = deviation from the reconstructed consensus
+        (deg), root outlined in red.
+
+        Accepts EITHER edge format:
+        - Undirected (from reconstruct_parent_orientation): 'edges' is a
+        list of (cluster_a, cluster_b, 'twin'/'kink') tuples -- drawn as
+        plain lines, solid=twin, dashed=kink.
+        - Directed (from reconstruct_parent_orientation_directed): 'edges'
+        is a list of dicts with 'cluster_a', 'cluster_b', 'type',
+        'direction' ('a_to_b'/'b_to_a'/'undirected'), 'parent_sf_positive'.
+        Directed twin edges are drawn as arrows (parent -> child); a
+        twin edge with parent_sf_positive=False is drawn in a warning
+        color (orange) to flag a weak directionality call. Undirected
+        (kink) edges are drawn as plain dashed lines.
+
+        Parameters
+        ----------
+        result : dict
+            Output of either reconstruction function.
+        ax, fig, figsize, cmap, node_scale, return_val : as before.
+
+        Returns
+        -------
+        fig, ax
+        """
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        fig = ax.figure
+
+        if cmap is None:
+            cmap = plt.cm.viridis
+
+        per_node = result['per_node']
+        root = result['root_cluster_id']
+        edges = result['edges']
+
+        devs = [v['deviation_from_mean_deg'] for v in per_node.values()]
+        vmax = max(devs) if devs and max(devs) > 0 else 1.0
+        norm = mpl.colors.Normalize(vmin=0, vmax=vmax)
+
+        pos = {node: self._cluster_centroid(node) for node in per_node.keys()}
+
+        is_directed_format = bool(edges) and isinstance(edges[0], dict)
+
+        for e in edges:
+            if is_directed_format:
+                A, B, etype = e['cluster_a'], e['cluster_b'], e['type']
+                direction = e['direction']
+            else:
+                A, B, etype = e
+                direction = 'undirected'
+
+            if A not in pos or B not in pos:
+                continue
+            xa, ya = pos[A]
+            xb, yb = pos[B]
+
+            if is_directed_format and direction != 'undirected':
+                # arrow from parent to child
+                parent, child = (A, B) if direction == 'a_to_b' else (B, A)
+                xp, yp = pos[parent]
+                xc, yc = pos[child]
+                weak = is_directed_format and e.get('parent_sf_positive') is False
+                color = 'orange' if weak else 'k'
+                ax.annotate('', xy=(xc, yc), xytext=(xp, yp),
+                            arrowprops=dict(arrowstyle='-|>', color=color, lw=1.4, alpha=0.7),
+                            zorder=1)
+            else:
+                ax.plot([xa, xb], [ya, yb], color='k', lw=1.2, ls='--', alpha=0.5, zorder=1)
+
+        for node, v in per_node.items():
+            x, y = pos[node]
+            size = (node_scale * np.sqrt(v['n_pixels'])) ** 2
+            color = cmap(norm(v['deviation_from_mean_deg']))
+            edgecolor = 'red' if node == root else 'k'
+            lw = 2.5 if node == root else 1.0
+            ax.scatter([x], [y], s=size, color=color, edgecolor=edgecolor, linewidth=lw, zorder=2)
+            ax.text(x, y, str(node), fontsize=8, ha='center', va='center', zorder=3)
+
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Deviation from consensus (deg)')
+
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_aspect('equal')
+        ax.invert_yaxis()
+        subtitle = ("arrows=directed twin (orange=weak SF), dashed=undirected/kink"
+                    if is_directed_format else "solid=twin, dashed=kink")
+        new_title = (f"Parent reconstruction network (root={root})\n"
+                    f"{subtitle}, size~pixels, red outline=root")
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
+
+        return (fig, ax) if return_val else (fig, ax)
+
+    def plot_parent_reconstruction_deviation_map(self, result, ax=None, fig=None, figsize=(9, 8),
+                                                cmap=None, s=1, return_val=False):
+        """
+        Plot the actual microstructure, with every reconstructed cluster's
+        pixels colored by that cluster's deviation from the reconstructed
+        parent consensus (deg) -- shows WHERE in the real map the
+        reconstruction is trustworthy vs. inconsistent. Root cluster marked
+        with a star.
+
+        Parameters
+        ----------
+        result : dict
+            Output of reconstruct_parent_orientation.
+        ax, fig, figsize, cmap, s, return_val : as usual.
+            cmap default plt.cm.inferno.
+
+        Returns
+        -------
+        fig, ax
+        """
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        fig = ax.figure
+
+        if cmap is None:
+            cmap = plt.cm.inferno
+
+        per_node = result['per_node']
+        devs = [v['deviation_from_mean_deg'] for v in per_node.values()]
+        vmax = max(devs) if devs and max(devs) > 0 else 1.0
+
+        xs, ys, cs = [], [], []
+        for node, v in per_node.items():
+            idxs = np.where(self.labels == node)[0]
+            xs.append(self.data.X[idxs])
+            ys.append(self.data.Y[idxs])
+            cs.append(np.full(idxs.shape[0], v['deviation_from_mean_deg']))
+        xs = np.concatenate(xs)
+        ys = np.concatenate(ys)
+        cs = np.concatenate(cs)
+
+        sc = ax.scatter(xs, ys, c=cs, cmap=cmap, vmin=0, vmax=vmax, s=s)
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Deviation from consensus (deg)')
+
+        root = result['root_cluster_id']
+        root_com = self._cluster_centroid(root)
+        ax.scatter([root_com[0]], [root_com[1]], marker='*', s=300, facecolor='none',
+                edgecolor='lime', linewidth=2, zorder=5, label=f'root (cluster {root})')
+        ax.legend(loc='upper right')
+
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_aspect('equal')
+        ax.invert_yaxis()
+        new_title = f"Reconstruction deviation map — root cluster {root}"
+        existing_title = ax.get_title()
+        ax.set_title(f"{existing_title}\n{new_title}" if existing_title else new_title)
+
+        return (fig, ax) if return_val else (fig, ax)   
+    def check_parent_twin_relationships(self, parent_mat, phase, system, modes, axial_dir=None,
+                                        tol_deg=5.0, cluster_ids=None, sort_by='size', print_result=True):
+        """
+        Check whether a HYPOTHESIZED PARENT orientation has a valid twin
+        relationship to each of a set of real clusters (parent_mat as
+        cluster_a, each real cluster as cluster_b), reusing
+        check_twin_relationship internally via a temporary sentinel id.
+
+        Optionally also computes the Schmid factor on BOTH sides of each
+        matched relationship (parent's side and the real cluster's side),
+        using the SAME formulas validated for the standalone Schmid-factor
+        script: sf_parent = (parent_mat.axial_dir).n1 * (parent_mat.axial_dir).a1
+        (untransformed n1_a/a1_a); sf_cluster = (T.(G_cluster.axial_dir)).n1 *
+        (T.(G_cluster.axial_dir)).a1 (T applied per the current T@M_fwd
+        convention, T corrects the cluster/cluster_b side). n1_a/a1_a are
+        the matched variant's tabulated K1 normal / eta1 direction, taken
+        from twin_elements regardless of which condition (K1_180/eta1_180/
+        K2_shear) actually matched best.
+
+        Parameters
+        ----------
+        parent_mat : (3,3) ndarray
+            Hypothesized parent orientation.
+        phase : str
+        system, modes : as in map_twin_relationships.
+        axial_dir : array-like (3,), optional
+            SAMPLE-frame loading direction. If given, Schmid factors are
+            computed and added to each result ('sf_parent', 'sf_cluster')
+            and printed. If None (default), Schmid factors are skipped.
+        tol_deg : float, optional
+        cluster_ids : list of int, optional
+            Default: all clusters of `phase`.
+        sort_by : {'size', 'cluster_id'}, optional
+        print_result : bool, optional
+
+        Returns
+        -------
+        results : list of dict
+            Same fields as check_twin_relationship's return, plus
+            'n_pixels', and (if axial_dir given) 'sf_parent', 'sf_cluster'.
+        """
+        if cluster_ids is None:
+            cluster_ids = list(self.labels_by_phase[phase])
+        if isinstance(modes, str):
+            modes = [modes]
+
+        if axial_dir is not None:
+            axial_dir = np.asarray(axial_dir, dtype=float)
+            axial_dir = axial_dir / np.linalg.norm(axial_dir)
+
+        sentinel = 'PARENT'
+        phase_id = self.data.phase_ids[phase]
+
+        had_avg = sentinel in self.avg_orientations
+        had_phase = sentinel in self.cluster_phases_id
+        old_avg = self.avg_orientations.get(sentinel)
+        old_phase = self.cluster_phases_id.get(sentinel)
+
+        self.avg_orientations[sentinel] = parent_mat
+        self.cluster_phases_id[sentinel] = phase_id
+
+        try:
+            results = []
+            for cid in cluster_ids:
+                if cid not in self.avg_orientations or cid == sentinel:
+                    continue
+                best = None
+                for mode in modes:
+                    r = self.check_twin_relationship(sentinel, cid, system, mode, tol_deg=tol_deg)
+                    score = r['axis_dev_deg'] + r['angle_dev_deg']
+                    if best is None or score < best[0]:
+                        best = (score, r)
+                _, r = best
+                r['n_pixels'] = int(self.cluster_sizes.get(cid, 0))
+
+                if axial_dir is not None and 'n1_a' in r['twin_elements'] and 'a1_a' in r['twin_elements']:
+                    n1 = np.asarray(r['twin_elements']['n1_a'], dtype=float)
+                    a1 = np.asarray(r['twin_elements']['a1_a'], dtype=float)
+                    n1 = n1 / np.linalg.norm(n1)
+                    a1 = a1 / np.linalg.norm(a1)
+
+                    T = r['T']
+                    G_cluster = self.avg_orientations[cid]
+
+                    axial_parent = parent_mat.dot(axial_dir)
+                    axial_cluster = T.dot(G_cluster.dot(axial_dir))
+
+                    r['sf_parent'] = float(axial_parent.dot(n1) * axial_parent.dot(a1))
+                    r['sf_cluster'] = float(axial_cluster.dot(n1) * axial_cluster.dot(a1))
+                else:
+                    r['sf_parent'] = None
+                    r['sf_cluster'] = None
+
+                results.append(r)
+        finally:
+            if had_avg:
+                self.avg_orientations[sentinel] = old_avg
+            else:
+                self.avg_orientations.pop(sentinel, None)
+            if had_phase:
+                self.cluster_phases_id[sentinel] = old_phase
+            else:
+                self.cluster_phases_id.pop(sentinel, None)
+
+        results_sorted = (sorted(results, key=lambda r: -r['n_pixels']) if sort_by == 'size'
+                        else sorted(results, key=lambda r: r['cluster_b']))
+
+        if print_result:
+            has_sf = axial_dir is not None
+            if has_sf:
+                print(f"{'Cluster':>10} {'Px':>8} {'Mode':>8} {'Conditions':>28} "
+                    f"{'Axis dev':>10} {'Angle dev':>10} {'Match':>6} "
+                    f"{'SF parent':>10} {'SF cluster':>11}")
+                print("-" * 113)
+            else:
+                print(f"{'Cluster':>10} {'Px':>8} {'Mode':>8} {'Conditions':>28} "
+                    f"{'Axis dev':>10} {'Angle dev':>10} {'Match':>6}")
+                print("-" * 90)
+
+            for r in results_sorted:
+                cond_str = '+'.join(r['matched_conditions']) if r['matched_conditions'] else r['best_condition']
+                match_str = 'yes' if r['is_match'] else 'no'
+                if has_sf:
+                    sf_p_str = f"{r['sf_parent']:>10.3f}" if r['sf_parent'] is not None else f"{'--':>10}"
+                    sf_c_str = f"{r['sf_cluster']:>11.3f}" if r['sf_cluster'] is not None else f"{'--':>11}"
+                    print(f"{r['cluster_b']:>10} {r['n_pixels']:>8} {r['mode']:>8} {cond_str:>28} "
+                        f"{r['axis_dev_deg']:>9.2f}° {r['angle_dev_deg']:>9.2f}° {match_str:>6} "
+                        f"{sf_p_str} {sf_c_str}")
+                else:
+                    print(f"{r['cluster_b']:>10} {r['n_pixels']:>8} {r['mode']:>8} {cond_str:>28} "
+                        f"{r['axis_dev_deg']:>9.2f}° {r['angle_dev_deg']:>9.2f}° {match_str:>6}")
+
+            n_match = sum(1 for r in results if r['is_match'])
+            total_px = sum(r['n_pixels'] for r in results)
+            match_px = sum(r['n_pixels'] for r in results if r['is_match'])
+            print(f"\n{n_match}/{len(results)} clusters show a twin relationship to the "
+                f"reconstructed parent ({match_px}/{total_px} px, {100*match_px/total_px:.1f}%)")
+
+            if has_sf:
+                matched_with_sf = [r for r in results if r['is_match'] and r['sf_parent'] is not None]
+                if matched_with_sf:
+                    n_favorable_parent = sum(1 for r in matched_with_sf if r['sf_parent'] > 0)
+                    print(f"Of matched pairs, parent-side Schmid factor is positive for "
+                        f"{n_favorable_parent}/{len(matched_with_sf)}")
+
+        return results
+    def check_parent_kink_relationships(self, parent_mat, phase, cluster_ids, max_miller_index=2,
+                                        tol_deg=5.0, print_result=True):
+        """
+        BLIND kink-axis search between a HYPOTHESIZED PARENT orientation
+        and a set of real clusters (parent_mat as cluster_a, each real
+        cluster as cluster_b), reusing identify_kink_axis internally via a
+        temporary sentinel id -- useful for clusters that FAILED a twin
+        check with small angle_dev but large axis_dev (i.e. genuinely
+        close to 180 deg, but not about the tested twin mode's specific
+        axis): this reveals which actual low-index direction the near-180
+        deg rotation is really about.
+
+        Parameters
+        ----------
+        parent_mat : (3,3) ndarray
+        phase : str
+        cluster_ids : list of int
+            Which real clusters to check (typically the ones that failed
+            check_parent_twin_relationships).
+        max_miller_index, tol_deg : as in identify_kink_axis.
+        print_result : bool, optional
+
+        Returns
+        -------
+        results : list of dict
+            One entry per cluster: 'cluster_b', 'n_pixels', 'best_uvw',
+            'axis_dev_deg', 'kink_angle_deg', 'near_180' (bool, True if
+            kink_angle_deg is within tol_deg of 180 -- suggests a genuine
+            twin/kink-type boundary about a low-index axis not among the
+            tested twin modes, rather than an arbitrary coincidental
+            near-180 rotation).
+        """
+        sentinel = 'PARENT'
+        phase_id = self.data.phase_ids[phase]
+
+        had_avg = sentinel in self.avg_orientations
+        had_phase = sentinel in self.cluster_phases_id
+        old_avg = self.avg_orientations.get(sentinel)
+        old_phase = self.cluster_phases_id.get(sentinel)
+
+        self.avg_orientations[sentinel] = parent_mat
+        self.cluster_phases_id[sentinel] = phase_id
+
+        try:
+            results = []
+            for cid in cluster_ids:
+                if cid not in self.avg_orientations or cid == sentinel:
+                    continue
+                r = self.identify_kink_axis(sentinel, cid, phase, max_miller_index=max_miller_index,
+                                            tol_deg=tol_deg, print_result=False)
+                r['cluster_b'] = cid
+                r['n_pixels'] = int(self.cluster_sizes.get(cid, 0))
+                r['near_180'] = bool(abs(r['kink_angle_deg'] - 180.0) < tol_deg) if r['is_match'] else False
+                results.append(r)
+        finally:
+            if had_avg:
+                self.avg_orientations[sentinel] = old_avg
+            else:
+                self.avg_orientations.pop(sentinel, None)
+            if had_phase:
+                self.cluster_phases_id[sentinel] = old_phase
+            else:
+                self.cluster_phases_id.pop(sentinel, None)
+
+        results.sort(key=lambda r: -r['n_pixels'])
+
+        if print_result:
+            print(f"{'Cluster':>10} {'Px':>8} {'Best uvw':>15} {'Axis dev':>10} "
+                f"{'Kink angle':>11} {'~180°?':>7}")
+            print("-" * 70)
+            for r in results:
+                near180 = 'yes' if r['near_180'] else 'no'
+                print(f"{r['cluster_b']:>10} {r['n_pixels']:>8} {str(r['best_uvw']):>15} "
+                    f"{r['axis_dev_deg']:>9.2f}° {r['kink_angle_deg']:>10.2f}° {near180:>7}")
+
+        return results
     # ============================================================================
     # LAMELLAR CLUSTER IDENTIFICATION METHODS
     # ============================================================================
@@ -9576,7 +12564,7 @@ class ClusteringResult:
 
 
     def print_pixel_to_average_misorientation_summary(self, cluster_ids=None, phase=None,
-                                                        sort_by='mean_deg', ascending=False):
+                                                        sort_by='mean_deg', ascending=False, printout=True):
         """
         ... (same docstring, plus:)
 
@@ -9588,11 +12576,11 @@ class ClusteringResult:
         """
         summary = self.summarize_pixel_to_average_misorientation(cluster_ids, phase)
         ordered = sorted(summary.items(), key=lambda kv: kv[1][sort_by], reverse=not ascending)
-
-        print(f"{'Cluster':>8} {'Pixels':>8} {'Mean (deg)':>11} {'Std (deg)':>10} {'Max (deg)':>10}")
-        print("-" * 52)
-        for c, s in ordered:
-            print(f"{c:>8} {s['n_pixels']:>8} {s['mean_deg']:>11.3f} {s['std_deg']:>10.3f} {s['max_deg']:>10.3f}")
+        if printout:
+            print(f"{'Cluster':>8} {'Pixels':>8} {'Mean (deg)':>11} {'Std (deg)':>10} {'Max (deg)':>10}")
+            print("-" * 52)
+            for c, s in ordered:
+                print(f"{c:>8} {s['n_pixels']:>8} {s['mean_deg']:>11.3f} {s['std_deg']:>10.3f} {s['max_deg']:>10.3f}")
 
         return dict(ordered)
 
@@ -14253,7 +17241,7 @@ class EBSDVisualizer:
                     data=None, mask=None, vmin=None, vmax=None, fig=None, ax=None,
                     show_labels=False, label_phase=None, label_clusters=None, 
                     label_fontsize=10, label_color='white', label_bbox=True,
-                    label_bbox_style='round', clusters_unique=None, labels=None, **kwargs):
+                    label_bbox_style='round', clusters_unique=None, labels=None, d_IPF=None, **kwargs):
         """
         Plot clusters with optional cluster ID labels.
         
@@ -14384,7 +17372,7 @@ class EBSDVisualizer:
                     roi = clustering_result.parameters['roi']
                 fig, ax = clustering_result.data.plot_colmap(
                     d=d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
-                    roi=roi, phase=phase, color=color, mask=mask, fig=fig, ax=ax, **kwargs
+                    roi=roi, phase=phase, color=color, mask=mask, fig=fig, ax=ax, d_IPF=d_IPF,**kwargs
                 )
             elif color_by == 'color':
                 clusters_unique = clustering_result._clusters_unique
@@ -14394,7 +17382,7 @@ class EBSDVisualizer:
                     roi = clustering_result.parameters['roi']
                 fig, ax = clustering_result.data.plot_colmap(
                     d=d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
-                    roi=roi, phase=phase, color=color, mask=mask, fig=fig, ax=ax, **kwargs
+                    roi=roi, phase=phase, color=color, mask=mask, fig=fig, ax=ax,d_IPF=d_IPF, **kwargs
                 )
             
             elif color_by == 'avgipf':
