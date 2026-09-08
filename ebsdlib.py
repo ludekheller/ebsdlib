@@ -44,7 +44,9 @@ _SIN60 = 0.5 * 3.0**0.5  # sin(60deg)
 import h5py
 from scipy.spatial.transform import Rotation as ScipyRotation
 
-
+import os
+import glob
+from PIL import Image
 
 
 # =============================================================================
@@ -99,28 +101,138 @@ def _load_blob(g, name):
  
  
 # ---- public API ------------------------------------------------------------
-def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
-                    hpa=None, recipe, or_results=None, aux=None, dataEBSD=None):
+def save_checkpoint(path, *, clustering_result, boundary_result=None, hierarchy=None,
+                    hpa=None, recipe, or_results=None, aux=None, dataEBSD=None,
+                    notmerged_new_result=None, notmerged_result=None,
+                    report=None, result_full=None, zone_axis=None,
+                    cluster1=None, axial_dir=None):
     """
-    ... (same docstring as before, plus:)
+    Write the derived pipeline state + recipe to an HDF5 checkpoint.
 
+    `hpa` (and `hierarchy`) are optional: you can checkpoint after clustering /
+    boundaries / hierarchy but before running the HP analysis. Whatever is None
+    is simply stored as None and skipped on restore.
+
+    `boundary_result` is also optional -- pass None if your pipeline doesn't
+    use boundary analysis (e.g. the parent-reconstruction/twin-correspondence
+    workflow, which has no BoundaryResult at all). When None, nothing
+    boundary-related is detached/saved/restored, and load_checkpoint's
+    `boundary_result` return value will simply be None.
+
+    Parameters
+    ----------
+    path : str
+        Output .h5 file path.
+    clustering_result : ClusteringResult
+        The primary clustering result. Its `.data` (the shared, large
+        EBSDData object) is detached before pickling and reattached
+        afterward, regardless of success/failure (try/finally).
+    boundary_result : BoundaryResult, optional
+        Boundary analysis results, if used. Its `.data` and
+        `.clustering` are detached/reattached the same way. Default
+        None (not used by this pipeline run).
+    hierarchy : optional
+        Parent-child hierarchy object, if used. Default None.
+    hpa : EbsdHPAnalyzer, optional
+        If given, its `.HP` and `.variant_analysis` attributes are
+        saved (as 'hp'/'variant_analysis' blobs) and restored into a
+        freshly-constructed EbsdHPAnalyzer on load. Default None.
+    recipe : dict
+        The recipe dict driving this analysis run. Stored natively
+        (inspectable HDF5 attrs), not pickled -- see _recipe_put.
+    or_results : optional
+        Orientation-relationship results, if used. Default None.
+    aux : dict, optional
+        Free-form extra data (e.g. {'meeting_pairs': ...}), restored
+        as-is and, if it contains 'meeting_pairs', reattached onto
+        boundary_result automatically on load. Default None (stored as
+        an empty dict).
     dataEBSD : EBSDData, optional
-        Used ONLY to save ROI polygon vertices (see _save_rois/load_rois).
-        If None (default), taken from clustering_result.data before it is
-        detached for pickling. If that's also unavailable, no ROI data is
-        saved (harmless -- just no ROI shortcut on reload).
+        Used ONLY to save ROI polygon vertices (see _save_rois/
+        load_rois). If None (default), taken from
+        clustering_result.data before it is detached for pickling. If
+        that's also unavailable, no ROI data is saved (harmless --
+        just no ROI shortcut on reload).
+    notmerged_new_result : ClusteringResult, optional
+        The merged-to-reference result from the parent-reconstruction
+        pipeline (e.g. from merge_clusters_to_reference). Its `.data`
+        is detached before pickling and reattached after, same as
+        clustering_result/boundary_result. Default None.
+    notmerged_result : dict, optional
+        Output of reconstruct_parent_orientation_directed (has
+        'parent_mat', 'root_cluster_id', 'per_node', 'edges', etc.) --
+        a plain dict of numpy arrays/scalars, pickles directly, no
+        detachment needed. Default None.
+    report : dict, optional
+        Output of check_parent_reconstruction. Plain dict, no
+        detachment needed. Default None.
+    result_full : dict, optional
+        Output of check_martensite_twin_correspondence. Plain dict, no
+        detachment needed. Default None.
+    zone_axis, cluster1, axial_dir : optional
+        Plain values (array/int) from the analysis pipeline, saved for
+        convenience so the whole grain-reconstruction session can be
+        restored without rerunning evaluate_lattice_direction_homogeneity.
+        Default None.
+    kam, GND : ndarray, optional
+        NOT function parameters -- automatically extracted from
+        dataEBSD.kam / dataEBSD.GND (if present) and saved as their own
+        blobs, since they live on dataEBSD (detached before pickling)
+        and are otherwise lost on reload. Restored onto the rebuilt
+        dataEBSD by load_checkpoint. Saves recomputing an expensive
+        KamGND pass on every reload.
+
+    Returns
+    -------
+    None (prints a confirmation message on success).
+
+    Raises
+    ------
+    RuntimeError
+        If any blob fails to pickle -- raised BEFORE the HDF5 file is
+        touched, naming the offending key, so you can add a strip-rule
+        for that attribute rather than end up with a partially-written
+        checkpoint.
+
+    Examples
+    --------
+    Save after the core clustering/boundary pipeline only:
+
+    >>> save_checkpoint('checkpoint.h5', clustering_result=clustering_result,
+    ...                 boundary_result=boundary_result, recipe=recipe)
+
+    Save a full grain-reconstruction session (no boundary analysis used):
+
+    >>> save_checkpoint(
+    ...     f'/path/to/grain_{str(roiID).zfill(4)}.h5',
+    ...     clustering_result=clustering_result, recipe=recipe,
+    ...     notmerged_new_result=notmerged_new_result, notmerged_result=notmerged_result,
+    ...     report=report, result_full=result_full, zone_axis=zone_axis,
+    ...     cluster1=cluster1, axial_dir=axial_dir
+    ... )
     """
+    
     if dataEBSD is None:
         dataEBSD = getattr(clustering_result, 'data', None)
 
-    detach = [(clustering_result, 'data'),
-              (boundary_result, 'data'),
-              (boundary_result, 'clustering')]
+    detach = [(clustering_result, 'data')]
+    if boundary_result is not None:
+        detach.append((boundary_result, 'data'))
+        detach.append((boundary_result, 'clustering'))
+    if notmerged_new_result is not None:
+        detach.append((notmerged_new_result, 'data'))
+
     saved = [(o, a, getattr(o, a, None)) for o, a in detach]
     for o, a in detach:
         if hasattr(o, a):
             setattr(o, a, None)
     try:
+        # pull kam/GND off dataEBSD BEFORE it's discarded from the blobs below --
+        # dataEBSD itself is never pickled (rebuilt from recipe on load), so
+        # anything computed onto it that should survive must be extracted here
+        kam_arr = getattr(dataEBSD, 'kam', None) if dataEBSD is not None else None
+        gnd_arr = getattr(dataEBSD, 'GND', None) if dataEBSD is not None else None
+
         blobs = {
             'clustering_result': clustering_result,
             'boundary_result':   boundary_result,
@@ -129,6 +241,15 @@ def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
             'variant_analysis':  getattr(hpa, 'variant_analysis', None) if hpa is not None else None,
             'or_results':        or_results,
             'aux':               aux or {},
+            'notmerged_new_result': notmerged_new_result,
+            'notmerged_result':     notmerged_result,
+            'report':               report,
+            'result_full':          result_full,
+            'zone_axis':            zone_axis,
+            'cluster1':             cluster1,
+            'axial_dir':            axial_dir,
+            'kam':                  kam_arr,
+            'GND':                  gnd_arr,
         }
         for k, obj in blobs.items():
             try:
@@ -151,6 +272,582 @@ def save_checkpoint(path, *, clustering_result, boundary_result, hierarchy=None,
     print(f"checkpoint saved -> {path}")
 
 
+def load_checkpoint(path, dataEBSD=None):
+    """
+    Restore the pipeline from an HDF5 checkpoint written by save_checkpoint.
+
+    If dataEBSD is None (default), it is rebuilt from the saved recipe,
+    with ROIs restored automatically from this same checkpoint file (via
+    rebuild_dataEBSD(recipe, checkpoint_path=path) -> load_rois).
+
+    boundary_result is restored only if it was actually saved (i.e. was
+    not None when save_checkpoint was called) -- otherwise the returned
+    'boundary_result' key is None, and no boundary-specific reattachment
+    (`.data`, `.clustering`, `aux['meeting_pairs']`) is attempted.
+
+    notmerged_new_result, if present, has its `.data` reattached to the
+    same dataEBSD as clustering_result.
+
+    Parameters
+    ----------
+    path : str
+        Path to a .h5 checkpoint file written by save_checkpoint.
+    dataEBSD : EBSDData, optional
+        If given, used directly instead of rebuilding from the recipe
+        (e.g. to reuse an already-loaded EBSDData object across
+        multiple grain checkpoints from the SAME scan, avoiding a
+        redundant reload). Default None (rebuilt from the recipe).
+
+    Returns
+    -------
+    result : dict
+        'dataEBSD' : EBSDData
+        'clustering_result' : ClusteringResult, .data reattached
+        'boundary_result' : BoundaryResult or None
+        'hierarchy' : as saved, or None
+        'hpa' : EbsdHPAnalyzer or None (only constructed if hierarchy
+            is not None)
+        'or_results' : as saved, or None
+        'aux' : dict (empty dict if none was saved)
+        'recipe' : dict
+        'notmerged_new_result' : ClusteringResult or None, .data
+            reattached if present
+        'notmerged_result' : dict or None
+        'report' : dict or None
+        'result_full' : dict or None
+        'zone_axis' : array or None
+        'cluster1' : int or None
+        'axial_dir' : array or None
+        'kam', 'GND' are restored directly onto the returned dataEBSD (as
+    dataEBSD.kam / dataEBSD.GND) if they were saved -- avoids
+    recomputing KamGND on every reload.
+
+    Examples
+    --------
+    Restore a core clustering/boundary checkpoint:
+
+    >>> state = load_checkpoint('checkpoint.h5')
+    >>> clustering_result = state['clustering_result']
+    >>> boundary_result = state['boundary_result']
+
+    Restore a full grain-reconstruction checkpoint, reusing an
+    already-loaded dataEBSD (e.g. inside a loop over many grains from
+    the same scan):
+
+    >>> state = load_checkpoint(f'/path/to/grain_{str(roiID).zfill(4)}.h5',
+    ...                          dataEBSD=dataEBSD)
+    >>> clustering_result = state['clustering_result']
+    >>> notmerged_new_result = state['notmerged_new_result']
+    >>> notmerged_result = state['notmerged_result']
+    >>> report = state['report']
+    >>> result_full = state['result_full']
+    >>> zone_axis = state['zone_axis']
+    >>> cluster1 = state['cluster1']
+    >>> axial_dir = state['axial_dir']
+    """
+    with h5py.File(str(path), 'r') as f:
+        if f.attrs.get('format') != _FMT:
+            raise ValueError("not an EBSD-HP checkpoint file")
+        recipe = _recipe_get(f['recipe'])
+        g = f['pickled']
+        blobs = {k: _load_blob(g, k) for k in g.keys()}
+
+    if dataEBSD is None:
+        dataEBSD = rebuild_dataEBSD(recipe, checkpoint_path=path)
+
+    if blobs.get('kam') is not None:
+        dataEBSD.kam = blobs['kam']
+    if blobs.get('GND') is not None:
+        dataEBSD.GND = blobs['GND']
+
+    cr = blobs['clustering_result']
+    cr.data = dataEBSD
+
+    br = blobs.get('boundary_result')
+    if br is not None:
+        br.data = dataEBSD
+        br.clustering = cr
+
+    aux = blobs.get('aux') or {}
+    if br is not None and aux.get('meeting_pairs') is not None:
+        br.meeting_pairs = aux['meeting_pairs']
+
+    hierarchy = blobs.get('hierarchy')
+
+    dataEBSD.set_rois2d(recipe['roiID'])
+    cr.update_grid_2d()
+
+    hpa = None
+    if hierarchy is not None:
+        hpa = EbsdHPAnalyzer(hierarchy, cr, br)
+        if blobs.get('hp') is not None:
+            hpa.HP = blobs['hp']
+        if blobs.get('variant_analysis') is not None:
+            hpa.variant_analysis = blobs['variant_analysis']
+
+    notmerged_new_result = blobs.get('notmerged_new_result')
+    if notmerged_new_result is not None:
+        notmerged_new_result.data = dataEBSD
+
+    return dict(dataEBSD=dataEBSD, clustering_result=cr, boundary_result=br,
+                hierarchy=hierarchy, hpa=hpa,
+                or_results=blobs.get('or_results'), aux=aux, recipe=recipe,
+                notmerged_new_result=notmerged_new_result,
+                notmerged_result=blobs.get('notmerged_result'),
+                report=blobs.get('report'),
+                result_full=blobs.get('result_full'),
+                zone_axis=blobs.get('zone_axis'),
+                cluster1=blobs.get('cluster1'),
+                axial_dir=blobs.get('axial_dir'))   
+
+import os
+import glob
+from PIL import Image
+
+
+def append_images_vertically(figdir, pattern, output_name):
+    """
+    Stack all PNGs matching `pattern` (within figdir) vertically (top
+    to bottom, sorted by filename), same as ImageMagick's
+    `convert -append`.
+
+    Parameters
+    ----------
+    figdir : str
+        Directory containing the input images and where output_name
+        will be saved. os.path.join handles the separator regardless
+        of whether figdir ends with a trailing slash.
+    pattern : str
+        Glob pattern for the input filenames (e.g. '*_ebsd_clustering.png'),
+        relative to figdir.
+    output_name : str
+        Output filename (e.g. 'ebsd_clustering.png'), relative to figdir.
+    """
+    search_pattern = os.path.join(figdir, pattern)
+    paths = sorted(glob.glob(search_pattern))
+    if not paths:
+        raise ValueError(f"No files matched: {search_pattern}")
+
+    images = [Image.open(p) for p in paths]
+    widths = [im.width for im in images]
+    max_width = max(widths)
+
+    padded = []
+    for im in images:
+        if im.width < max_width:
+            canvas = Image.new(im.mode, (max_width, im.height),
+                                (0, 0, 0, 0) if im.mode == 'RGBA' else 'white')
+            canvas.paste(im, (0, 0))
+            padded.append(canvas)
+        else:
+            padded.append(im)
+
+    total_height = sum(im.height for im in padded)
+    combined = Image.new(padded[0].mode, (max_width, total_height),
+                          (0, 0, 0, 0) if padded[0].mode == 'RGBA' else 'white')
+
+    y = 0
+    for im in padded:
+        combined.paste(im, (0, y))
+        y += im.height
+
+    output_path = os.path.join(figdir, output_name)
+    combined.save(output_path)
+    print(f"saved -> {output_path} ({len(paths)} images stacked)")
+
+def _nice_ceil(value, base_candidates=(1, 2, 5, 10)):
+    """Round `value` UP to the nearest 'nice' number (1/2/5 x 10^n)."""
+    if value <= 0:
+        return 1.0
+    exponent = np.floor(np.log10(value))
+    for base in base_candidates:
+        candidate = base * 10 ** exponent
+        if candidate >= value:
+            return candidate
+    return 10 * 10 ** exponent
+
+
+def format_pole_figure_pixel_colorbar(fig, ax, cs, n_ticks_target=5,
+                                       label_base='Pixel count',
+                                       cax_rect=None, fraction=0.03, pad=0.02, shrink=0.6):
+    """
+    Add a colorbar for a pole-figure pixel-count histogram, using the
+    ACTUAL color range from `cs` (cs.get_clim()) for the visible span,
+    with ROUNDED tick labels (clean multiples of an auto-chosen
+    divisor, not the exact true max).
+
+    Parameters
+    ----------
+    fig, ax : matplotlib Figure, Axes
+    cs : QuadContourSet
+    n_ticks_target : int, optional
+        Default 5.
+    label_base : str, optional
+    fraction, pad, shrink : passed to fig.colorbar.
+    cax_rect : tuple (left, bottom, width, height), optional
+    If given, places the colorbar at this EXPLICIT figure-fraction
+    rectangle via fig.add_axes(cax_rect), instead of using
+    fig.colorbar's own fraction/pad/shrink positioning relative to
+    `ax`. Use this for precise absolute placement (e.g. far to the
+    right of a multi-inset figure). Default None (use fraction/pad).
+
+
+    Returns
+    -------
+    cbar : matplotlib Colorbar
+    vmax_actual : float
+    divisor : float
+    """
+    vmin, vmax_actual = cs.get_clim()
+
+    divisor = _nice_ceil(vmax_actual / n_ticks_target)
+    if divisor <= 1:
+        divisor = 1
+        tick_vals = list(range(0, int(np.floor(vmax_actual)) + 1))
+        if len(tick_vals) > n_ticks_target + 2:
+            step = int(np.ceil(len(tick_vals) / n_ticks_target))
+            tick_vals = tick_vals[::step]
+    else:
+        n_full_steps = int(np.floor(vmax_actual / divisor))
+        tick_vals = [i * divisor for i in range(n_full_steps + 1)]
+
+    if cax_rect is not None:
+        cax = fig.add_axes(cax_rect)
+        cbar = fig.colorbar(cs, cax=cax)
+    else:
+        cbar = fig.colorbar(cs, ax=ax, fraction=fraction, pad=pad, shrink=shrink)
+
+    cbar.set_ticks(tick_vals)
+    if divisor > 1:
+        cbar.set_ticklabels([f'{t / divisor:.0f}' for t in tick_vals])
+        cbar.set_label(rf'{label_base} ($\times {divisor:.0f}$)')
+    else:
+        cbar.set_ticklabels([f'{t:.0f}' for t in tick_vals])
+        cbar.set_label(label_base)
+
+    return cbar, vmax_actual, divisor
+
+def plot_pole_figure_with_capped_colorbar(clustering_result, vmax_factor=1.0, n_ticks_target=5,
+                                           label_base='Pixel count', fraction=0.046,
+                                           pad=0.04, shrink=0.6, **pole_figure_kwargs):
+    """
+    Two-pass wrapper around plot_cluster_pole_figure: first probes the
+    ACTUAL max pixel count (results['pixel']['pooled']['hist'].max()),
+    then re-renders with pixel_hist_kwargs['vmax'] explicitly set to
+    vmax_factor * that actual max -- so REDUCING vmax_factor genuinely
+    clips/saturates the color mapping (more contrast in the mid-range),
+    not just a cosmetic colorbar-display trick.
+
+    CAVEAT: this assumes results['pixel']['pooled']['hist'] holds RAW
+    pixel counts (not scale-transformed), and that pixel_hist_kwargs's
+    'vmax' is likewise interpreted in raw-count units regardless of
+    'scale' ('sqrt' etc. only affects the CONTOUR LEVEL spacing, not
+    the vmax units) -- this has NOT been independently verified against
+    plot_cluster_pole_figure's/polefigure_plot's actual internals in
+    this conversation. If the resulting colorbar's tick labels look
+    wrong (e.g. suspiciously small, like sqrt-scale values), that
+    assumption is likely incorrect and the vmax/tick logic needs
+    adjusting to account for the scale transform explicitly.
+
+    Parameters
+    ----------
+    clustering_result : ClusteringResult
+    vmax_factor : float, optional
+        Multiplier on the true max pixel count. < 1.0 saturates colors
+        earlier (more contrast among lower/mid values, at the cost of
+        clipping the highest-density regions to a single top color).
+        Default 1.0 (no reduction).
+    n_ticks_target, label_base, fraction, pad, shrink :
+        Passed to format_pole_figure_pixel_colorbar.
+    **pole_figure_kwargs
+        Everything else passed to plot_cluster_pole_figure (ax, fig,
+        cluster_id, phase, uvw, pixel_plot, pixel_pooled,
+        pixel_hist_kwargs, equalarea, hemi, sample_transform, etc.) --
+        pixel_hist_kwargs's 'vmax' key, if present, is OVERWRITTEN on
+        the second pass; don't set it yourself.
+
+    Returns
+    -------
+    fig, ax, results, cbar, vmax_used, divisor
+    """
+    pixel_hist_kwargs = dict(pole_figure_kwargs.pop('pixel_hist_kwargs', {}))
+    ax = pole_figure_kwargs.pop('ax')
+    fig = pole_figure_kwargs.pop('fig')
+
+    # ---- pass 1: probe the actual max ----
+    fig, ax, probe_results = clustering_result.plot_cluster_pole_figure(
+        ax=ax, fig=fig, pixel_hist_kwargs=pixel_hist_kwargs, return_val=True,
+        **pole_figure_kwargs
+    )
+    hist_max = float(np.nanmax(probe_results['pixel']['pooled']['hist']))
+    vmax_used = vmax_factor * hist_max
+
+    # ---- pass 2: re-render with vmax explicitly capped ----
+    ax.cla()
+    pixel_hist_kwargs2 = dict(pixel_hist_kwargs)
+    pixel_hist_kwargs2['vmax'] = vmax_used
+    fig, ax, results = clustering_result.plot_cluster_pole_figure(
+        ax=ax, fig=fig, pixel_hist_kwargs=pixel_hist_kwargs2, return_val=True,
+        **pole_figure_kwargs
+    )
+
+    cs = results['pixel']['pooled']['contourf']
+    cbar, vmax_actual, divisor = format_pole_figure_pixel_colorbar(
+        fig, ax, cs, n_ticks_target=n_ticks_target, label_base=label_base,
+        fraction=fraction, pad=pad, shrink=shrink
+    )
+
+    return fig, ax, results, cbar, vmax_used, divisor
+
+def plot_pole_figure_table(filepath, roi_range, zone_axis_key='zone_axis',
+                            pf_half_size_um=None, vmax_factor=0.5,
+                            figsize=(10, 10), invert_yaxis=True,
+                            cmap=None, scale='sqrt', nlevels=60,
+                            linewidth=0.15, markersize=1, markeredgewidth=0.2,
+                            show_grain_outlines=True, outline_color='darkgrey',
+                            show_grain_ids=True, id_fontsize=8,
+                            title_template=None, title_fontsize=6, title_y_offset_factor=1.15,
+                            show_colorbar=True, colorbar_label='Pixel count',
+                            colorbar_cax_rect=None, colorbar_fraction=0.03, colorbar_pad=0.02,
+                            return_val=False):
+    """
+    Table of individual grains' pole figures, positioned at each
+    grain's approximate physical centroid within one shared figure.
+
+    Uses a TWO-PASS approach so every inset shares the SAME color
+    scale, letting ONE shared colorbar (outside the figure) honestly
+    represent all insets: pass 1 probes every grain's true histogram
+    max (drawn onto a throwaway, discarded axes); pass 2 renders every
+    inset with vmax = vmax_factor * (the GLOBAL max across all grains),
+    fixed for every grain -- NOT independently capped per grain.
+
+    Parameters
+    ----------
+    filepath : str
+        Directory containing grain_NNNN.h5 checkpoints.
+    roi_range : range or list
+        ROI IDs to include.
+    zone_axis_key : str, optional
+        Key into each grain's saved state for its zone axis. Default
+        'zone_axis'.
+    pf_half_size_um : float, optional
+        Half-width of each inset, in data (um) units. None (default)
+        -> auto-computed as 0.4x the median nearest-neighbor grain-
+        centroid spacing.
+    vmax_factor : float, optional
+        Multiplier on the GLOBAL true max pixel count (across all
+        grains), applied uniformly to every inset. Default 0.5.
+    figsize : tuple, optional
+    invert_yaxis : bool, optional
+        Default True.
+    cmap, scale, nlevels, linewidth, markersize, markeredgewidth :
+        Passed through to each grain's pole-figure plotting.
+    show_grain_outlines, outline_color : optional
+    show_grain_ids, id_fontsize : optional
+        Small grain-ID label placed below each inset.
+    title_template : str, optional
+        Per-inset title, formatted with .format(axis=..., n_clusters=...,
+        n_px=..., roi_id=...) -- available keys: {axis} (the zone axis,
+        e.g. '(0, -1, -1)'), {n_clusters}, {n_px}, {roi_id}. Set to None
+        or '' to omit titles entirely (recommended if insets are packed
+        tightly enough that titles would overlap -- unlike
+        plot_cluster_pole_figure's own auto-title, this one is drawn
+        BELOW each inset rather than above, specifically to reduce
+        collision with the neighboring inset above it).
+    title_fontsize : int, optional
+        Default 6.
+    title_y_offset_factor : float, optional
+        How far below each inset (as a multiple of pf_half_size_um)
+        the title text sits. Default 1.15.
+    colorbar_label, colorbar_fraction, colorbar_pad : optional
+        For the single shared colorbar.
+    show_colorbar : bool, optional
+        If False, no colorbar is drawn -- the last inset's contourf
+        artist (`cs`) is returned instead (as 'last_cs' in the return
+        dict, only when return_val=True) so you can build/position a
+        colorbar yourself afterward via
+        format_pole_figure_pixel_colorbar(fig, ax, last_cs, ...).
+        Default True.
+    colorbar_cax_rect : tuple, optional
+        Passed through to format_pole_figure_pixel_colorbar's cax_rect,
+        for explicit figure-fraction placement. Only used if
+        show_colorbar=True. Default None.
+    return_val : bool, optional
+
+    Returns
+    -------
+    fig, ax : the MAIN (background) figure/axes
+    inset_axes_by_roi : dict {roiID: inset Axes}, only if return_val=True
+    """
+    import matplotlib.patches as patches
+
+    if cmap is None:
+        cmap = get_cmap([(1, 1, 1), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+
+    fig, ax = plt.subplots(1, figsize=figsize)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    dataEBSD = None
+    grain_centers = {}
+    per_grain_state = {}
+
+    for roiID in roi_range:
+        checkpoint_path = os.path.join(filepath, f'grain_{str(roiID).zfill(4)}.h5')
+        try:
+            state = load_checkpoint(checkpoint_path, dataEBSD=dataEBSD)
+        except FileNotFoundError:
+            continue
+        dataEBSD = state['dataEBSD']
+        recipe = state['recipe']
+        roi_mask = dataEBSD.rois.masks[recipe['roiID']]
+        grain_centers[roiID] = (float(dataEBSD.X[roi_mask].mean()), float(dataEBSD.Y[roi_mask].mean()))
+        per_grain_state[roiID] = state
+
+    if not grain_centers:
+        raise ValueError("No grain checkpoints found.")
+
+    ax.set_xlim(float(dataEBSD.X.min()), float(dataEBSD.X.max()))
+    ax.set_ylim(float(dataEBSD.Y.min()), float(dataEBSD.Y.max()))
+    ax.set_aspect('equal')
+    if invert_yaxis:
+        ax.invert_yaxis()
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    if pf_half_size_um is None:
+        centers = np.array(list(grain_centers.values()))
+        if len(centers) > 1:
+            dists = []
+            for i in range(len(centers)):
+                d = np.linalg.norm(centers - centers[i], axis=1)
+                d[i] = np.inf
+                dists.append(d.min())
+            pf_half_size_um = 0.4 * np.median(dists)
+        else:
+            pf_half_size_um = 0.2 * (ax.get_xlim()[1] - ax.get_xlim()[0])
+
+    global_max = 0.0
+    for roiID, state in per_grain_state.items():
+        clustering_result = state['clustering_result']
+        cluster1 = state['cluster1']
+        zone_axis = state[zone_axis_key]
+        sample_transform = clustering_result.get_zone_axis_transform(cluster_id=cluster1, uvw=zone_axis)
+
+        fig_probe, ax_probe = plt.subplots()
+        _, _, probe_results = clustering_result.plot_cluster_pole_figure(
+            ax=ax_probe, fig=fig_probe, cluster_id='all', phase='A', uvw=zone_axis,
+            pixel_plot='histogram', pixel_pooled=True,
+            pixel_hist_kwargs={'cmap': cmap, 'scale': scale, 'nlevels': nlevels},
+            equalarea=False, hemi='upper', sample_transform=sample_transform, return_val=True,
+        )
+        hist_max = float(np.nanmax(probe_results['pixel']['pooled']['hist']))
+        global_max = max(global_max, hist_max)
+        plt.close(fig_probe)
+
+    global_vmax = vmax_factor * global_max
+
+    inset_axes_by_roi = {}
+    last_cs = None
+    for roiID, (cx, cy) in grain_centers.items():
+        state = per_grain_state[roiID]
+        clustering_result = state['clustering_result']
+        cluster1 = state['cluster1']
+        zone_axis = state[zone_axis_key]
+        dEB = state['dataEBSD']
+        recipe = state['recipe']
+
+        if show_grain_outlines:
+            patch = patches.PathPatch(dEB.selector.selPaths[recipe['roiID']],
+                                       facecolor='None', edgecolor=outline_color, lw=1, zorder=1)
+            ax.add_patch(patch)
+
+        sample_transform = clustering_result.get_zone_axis_transform(cluster_id=cluster1, uvw=zone_axis)
+
+        bounds = [cx - pf_half_size_um, cy - pf_half_size_um, 2 * pf_half_size_um, 2 * pf_half_size_um]
+        inset_ax = ax.inset_axes(bounds, transform=ax.transData, zorder=5)
+        inset_ax.set_facecolor('none')
+        inset_axes_by_roi[roiID] = inset_ax
+
+        _, _, results = clustering_result.plot_cluster_pole_figure(
+            ax=inset_ax, fig=fig, cluster_id='all', phase='A', uvw=zone_axis,
+            pixel_plot='histogram', pixel_pooled=True,
+            pixel_hist_kwargs={'cmap': cmap, 'scale': scale, 'nlevels': nlevels, 'vmax': global_vmax},
+            equalarea=False, hemi='upper', sample_transform=sample_transform,
+            linewidth=linewidth, markersize=markersize, markeredgewidth=markeredgewidth,
+            return_val=True,
+        )
+        inset_ax.set_title('')
+        last_cs = results['pixel']['pooled']['contourf']
+
+        n_clusters = len(clustering_result.labels_by_phase['A'])
+        n_px = int(np.nansum(results['pixel']['pooled']['hist']))
+        axis_str = f"({zone_axis[0]:.0f}, {zone_axis[1]:.0f}, {zone_axis[2]:.0f})"
+
+        if title_template:
+            title_text = title_template.format(axis=axis_str, n_clusters=n_clusters, n_px=n_px, roi_id=roiID)
+            ax.text(cx, cy + pf_half_size_um * title_y_offset_factor, title_text,
+                    fontsize=title_fontsize, ha='center', va='top', zorder=6,
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.7))
+
+        if show_grain_ids:
+            ax.text(cx, cy - pf_half_size_um * 1.1, str(roiID),
+                    fontsize=id_fontsize, ha='center', va='top', zorder=6,
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.7))
+
+    if show_colorbar and last_cs is not None:
+        format_pole_figure_pixel_colorbar(
+            fig, ax, last_cs, label_base=colorbar_label,
+            cax_rect=colorbar_cax_rect, fraction=colorbar_fraction, pad=colorbar_pad
+        )
+
+    if return_val:
+        return fig, ax, inset_axes_by_roi, last_cs
+    return fig, ax
+
+def append_svgs_vertically(figdir, pattern, output_name):
+    """
+    Stack all SVGs matching `pattern` (within figdir) vertically (top
+    to bottom, sorted by filename) into one combined SVG document.
+
+    Parameters
+    ----------
+    figdir : str
+        Directory containing the input SVGs and where output_name will
+        be saved.
+    pattern : str
+        Glob pattern for the input filenames (e.g. '*_ebsd_clustering.svg'),
+        relative to figdir.
+    output_name : str
+        Output filename (e.g. 'ebsd_clustering.svg'), relative to figdir.
+    """
+    import svgutils.transform as sg
+    search_pattern = os.path.join(figdir, pattern)
+    paths = sorted(glob.glob(search_pattern))
+    if not paths:
+        raise ValueError(f"No files matched: {search_pattern}")
+
+    figs = [sg.fromfile(p) for p in paths]
+    sizes = [(float(f.width.replace('pt', '').replace('px', '')),
+              float(f.height.replace('pt', '').replace('px', ''))) for f in figs]
+
+    max_width = max(w for w, h in sizes)
+    total_height = sum(h for w, h in sizes)
+
+    combined = sg.SVGFigure(f"{max_width}px", f"{total_height}px")
+
+    y_offset = 0.0
+    plots = []
+    for f, (w, h) in zip(figs, sizes):
+        root = f.getroot()
+        root.moveto(0, y_offset)
+        plots.append(root)
+        y_offset += h
+
+    combined.append(plots)
+    output_path = os.path.join(figdir, output_name)
+    combined.save(output_path)
+    print(f"saved -> {output_path} ({len(paths)} SVGs stacked)")
 def _apply_roi_verts(d, roi_verts):
     """
     (Re)build the ROI selection non-interactively from stored polygon
@@ -393,40 +1090,7 @@ def move_roi_to_position(d, current_id, target_id, recipe=None):
     order.insert(target_id - 1, current_id) # reinsert at the target spot (0-based index)
 
     return renumber_rois(d, order, recipe=recipe)
-def load_checkpoint(path, dataEBSD=None):
-    """Restore the pipeline. If dataEBSD is None it is rebuilt from the recipe,
-    with ROIs restored automatically from this same checkpoint file."""
-    with h5py.File(str(path), 'r') as f:
-        if f.attrs.get('format') != _FMT:
-            raise ValueError("not an EBSD-HP checkpoint file")
-        recipe = _recipe_get(f['recipe'])
-        g = f['pickled']
-        blobs = {k: _load_blob(g, k) for k in g.keys()}
 
-    if dataEBSD is None:
-        dataEBSD = rebuild_dataEBSD(recipe, checkpoint_path=path)
-
-    cr = blobs['clustering_result']; cr.data = dataEBSD
-    br = blobs['boundary_result'];  br.data = dataEBSD; br.clustering = cr
-    aux = blobs.get('aux') or {}
-    if aux.get('meeting_pairs') is not None:
-        br.meeting_pairs = aux['meeting_pairs']
-    hierarchy = blobs.get('hierarchy')
-
-    dataEBSD.set_rois2d(recipe['roiID'])
-    cr.update_grid_2d()
-
-    hpa = None
-    if hierarchy is not None:
-        hpa = EbsdHPAnalyzer(hierarchy, cr, br)
-        if blobs.get('hp') is not None:
-            hpa.HP = blobs['hp']
-        if blobs.get('variant_analysis') is not None:
-            hpa.variant_analysis = blobs['variant_analysis']
-
-    return dict(dataEBSD=dataEBSD, clustering_result=cr, boundary_result=br,
-                hierarchy=hierarchy, hpa=hpa,
-                or_results=blobs.get('or_results'), aux=aux, recipe=recipe)
  
 # ---- ROI storage, separate from the pickled blobs/recipe -------------------
 def _save_rois(f, dataEBSD):
@@ -10917,12 +11581,14 @@ class ClusteringResult:
         return ax
 
     def plot_deformation_ellipses(self, ax, strain_results, labels=None, CrystalRef2Spatial=None,
-                               center=None, scale=1.0, n_points=200, colors=None,
-                               line_width=2.0, alpha=0.9, fill=False, fill_alpha=0.15,
-                               show_undeformed=True, undeformed_color='black',undeformed_linestyle='--',
-                               undeformed_line_width=1.0, undeformed_alpha=0.8,
-                               undeformed_label='Undeformed',
-                               show_legend=True, legend_kwargs=None):
+                                center=None, scale=1.0, strain_scale=1.0, n_points=200, colors=None,
+                                line_width=2.0, alpha=0.9, fill=False, fill_alpha=0.15,
+                                show_undeformed=True, undeformed_color='black',
+                                undeformed_line_width=1.0, undeformed_alpha=0.8,
+                                undeformed_linestyle='--', undeformed_label='Undeformed',
+                                halo=False, halo_color='white', halo_width_factor=2.5,
+                                halo_alpha=1.0,
+                                show_legend=True, legend_kwargs=None):
         """
         Overlay MULTIPLE deformation ellipses on ax, one per entry in
         strain_results -- each a dict with 'tensor' (e.g. output of
@@ -10973,6 +11639,29 @@ class ClusteringResult:
             any existing legend on ax via add_artist (does not touch or
             replace it).
         legend_kwargs : dict, optional
+        halo : bool, optional
+            If True, draw a THICKER line in halo_color directly beneath
+            each deformed ellipse (and the undeformed reference circle, if
+            shown), creating an outline/halo effect for visibility against
+            a busy/colorful background (e.g. a cluster map). Default False.
+        halo_color : color spec, optional
+            Default 'white'.
+        halo_width_factor : float, optional
+            The halo line's width, as a multiple of that ellipse's own
+            line_width (or undeformed_line_width for the reference circle).
+            Default 2.5.
+        halo_alpha : float, optional
+            Default 1.0.
+        strain_scale : float, optional
+            Multiplier applied to the strain tensor ITSELF before computing
+            the deformed shape (F = I + strain_scale * T_spatial) -- lets
+            you EXAGGERATE (>1) or shrink (<1) how strongly the ellipse's
+            shape deviates from the undeformed circle, independent of
+            `scale` (which only sets the undeformed circle's base radius,
+            not the strain magnitude). Useful when a physically small
+            strain (e.g. a few percent) would otherwise be visually
+            indistinguishable from the undeformed circle at any reasonable
+            `scale`. Default 1.0 (true, unexaggerated strain).
 
         Returns
         -------
@@ -11003,23 +11692,30 @@ class ClusteringResult:
         if show_undeformed:
             xs0 = center[0] + circle[0, :]
             ys0 = center[1] + circle[1, :]
+            if halo:
+                ax.plot(xs0, ys0, color=halo_color, lw=undeformed_line_width * halo_width_factor,
+                        ls='-', alpha=halo_alpha, zorder=8, solid_capstyle='round')
             ax.plot(xs0, ys0, color=undeformed_color, lw=undeformed_line_width, ls=undeformed_linestyle,
                     alpha=undeformed_alpha, zorder=9)
             new_handles.append(mlines.Line2D([], [], color=undeformed_color, lw=undeformed_line_width,
-                                            ls='--', alpha=undeformed_alpha, label=undeformed_label))
+                                            ls=undeformed_linestyle, alpha=undeformed_alpha,
+                                            label=undeformed_label))
 
         for sr, label, color in zip(strain_results, labels, colors):
             T_sample = sr['tensor']
             T_spatial = CrystalRef2Spatial @ T_sample @ CrystalRef2Spatial.T
 
-            F = np.eye(3) + T_spatial
+            F = np.eye(3) + strain_scale * T_spatial
             deformed = F @ circle
             xs = center[0] + deformed[0, :]
             ys = center[1] + deformed[1, :]
 
+            if halo:
+                ax.plot(xs, ys, color=halo_color, lw=line_width * halo_width_factor,
+                        alpha=halo_alpha, zorder=10, solid_capstyle='round')
             if fill:
-                ax.fill(xs, ys, color=color, alpha=fill_alpha, zorder=9)
-            ax.plot(xs, ys, color=color, lw=line_width, alpha=alpha, zorder=10)
+                ax.fill(xs, ys, color=color, alpha=fill_alpha, zorder=11)
+            ax.plot(xs, ys, color=color, lw=line_width, alpha=alpha, zorder=12)
             new_handles.append(mlines.Line2D([], [], color=color, lw=line_width, alpha=alpha,
                                             label=label))
 
@@ -11031,7 +11727,7 @@ class ClusteringResult:
             kwargs = {'loc': default_loc, **(legend_kwargs or {})}
             ax.legend(handles=new_handles, **kwargs)
 
-        return ax        
+        return ax
 
     def plot_martensite_correspondence_map_clusters(self, report, result_full, phase, visualizer,
                                                     ax=None, fig=None, figsize=(9, 8),
