@@ -13,7 +13,13 @@ and Martensite Twin Correspondence}
 \maketitle
 
 For each region of interest (ROI), corresponding to one reconstructed
-austenite grain, the following pipeline is applied.
+austenite grain, the following pipeline is applied. ROIs are selected
+manually, by drawing a polygon around what is judged, from the
+microstructure map, to correspond to a single pre-deformation austenite
+grain; this selection is not an objective, automated segmentation and is
+therefore subject to operator error -- an ROI may in reality span more
+than one original grain, or capture only part of one, and this
+uncertainty propagates into every subsequent step of the analysis.
 
 \section{Misorientation-based sub-grain clustering}
 
