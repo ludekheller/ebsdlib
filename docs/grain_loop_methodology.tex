@@ -1,0 +1,177 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{Per-Grain Analysis Pipeline: Clustering, Parent-Grain Reconstruction,\\
+and Martensite Twin Correspondence}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+For each region of interest (ROI), corresponding to one reconstructed
+austenite grain, the following pipeline is applied.
+
+\section{Misorientation-based sub-grain clustering}
+
+Pixels within the ROI are grouped into sub-grains (``clusters'') using a
+misorientation-based region-growing algorithm: neighbouring pixels are
+merged when their disorientation is below a threshold angle
+\texttt{ang\_thr}, subject to a maximum cluster spatial diameter
+\texttt{dmax} and a minimum cluster size \texttt{minidxs}. Each resulting
+cluster's average orientation is subsequently \emph{symmetry-branch
+consistent} across the whole ROI (\texttt{symmetrize\_clusters}): since a
+measured orientation matrix is only defined up to the crystal's point-group
+symmetry, all clusters' representative orientations are resolved onto a
+single, mutually consistent symmetric branch before any further analysis.
+
+\section{Local misorientation and dislocation-density fields}
+
+Pixel-to-pixel boundary misorientations are computed within the ROI. For
+each pixel, the kernel average misorientation $\langle\theta(x)\rangle$ --
+the local disorientation averaged over the peripheral pixels at a fixed
+kernel radius $x$ -- is evaluated for a range of kernel radii (1st to
+$n$th neighbour shell), following the method of
+Kamaya~\cite{kamaya2011}, as applied to EBSD data by Moussa et
+al.~\cite{moussa2017}. Disorientation values above a threshold
+(\texttt{maxmis}) are excluded from the average to prevent grain
+boundaries from contaminating the local, sub-grain-scale signal. Assuming
+the disorientation gradient is locally constant, $\langle\theta(x)\rangle$
+varies linearly with $x$; a linear regression over the sampled kernel
+radii yields both the disorientation gradient $\mathrm{d}\langle
+\theta\rangle/\mathrm{d}x$ (the slope) and, by extrapolation to $x=0$, an
+estimate of the local EBSD measurement noise (the intercept), which would
+otherwise be conflated with genuine lattice curvature if the GND density
+were instead estimated directly from $\langle\theta\rangle/x$ at a single
+kernel radius. The GND density is then obtained from the slope,
+\begin{equation}
+  \rho_{\mathrm{GND}} = \frac{\alpha}{b}\,\frac{\mathrm{d}\langle\theta\rangle}{\mathrm{d}x},
+\end{equation}
+with $b$ the Burgers vector magnitude and $\alpha$ a constant depending on
+the dislocation character (tilt or twist), evaluated assuming a single
+slip system, $\langle100\rangle\{110\}$, in the B2 austenite phase.
+
+\section{Homogeneous lattice direction and provisional zone axis}
+
+The largest cluster in the ROI (by pixel count) is used as an anchor. For a
+small set of candidate low-index directions
+$\{\langle100\rangle,\langle110\rangle,\langle111\rangle\}$, each
+direction's full crystallographically-equivalent family is tested for how
+consistently it points along a common sample-frame direction across
+\emph{every} cluster in the ROI (not only the anchor): for each symmetric
+variant, the direction is expressed in every cluster's own crystal frame
+and its angular spread across the pooled cluster set is measured. The
+variant with the smallest spread is retained as the ROI's provisional
+common lattice direction (``zone axis''), evidence that the sub-grains
+share a crystallographic relationship inherited from a common parent.
+
+\section{Twin and kink relationship identification}
+
+Every pair of clusters in the ROI is tested against a library of tabulated
+NiTi austenite twinning modes ($\{112\}$--$\{115\}$): for each mode, the
+full space of symmetry-equivalent branch choices is searched
+(\emph{T-loop}) together with the mode's tabulated twin elements
+($K_1$/$\eta_1$/$K_2$), and a pair is accepted as a twin match if the
+axis and angle of at least one of the $K_1$-180$^\circ$,
+$\eta_1$-180$^\circ$, or $K_2$-shear conditions falls within a tolerance
+\texttt{tol\_deg} of the target. Independently, pairs are also tested for
+a \emph{kink} relationship: a blind search over low-index candidate axes
+(up to a maximum Miller index) for any axis about which the pair's
+misorientation is consistent, with no assumed target angle.
+
+\section{Directed parent-orientation reconstruction}
+
+The identified twin and kink relationships define a graph over the ROI's
+clusters. Twin edges are additionally \emph{directed}: for each twin pair,
+the Schmid factor of the tabulated twin system is evaluated on both sides
+under the given loading direction \texttt{axial\_dir}; the side with the
+higher (more mechanically favourable) Schmid factor is treated as the
+parent-like side, propagation running only parent$\to$child. Kink edges,
+for which no independent Schmid factor is defined, remain undirected. A
+breadth-first traversal from the best-supported source node (a cluster
+with no incoming directed twin edge, reachable to the largest pixel-weighted
+subtree) propagates every reachable cluster's orientation back to a common
+reference frame -- using the exact tabulated twin operation for twin edges
+(denoised relative to the noisy measured relative orientation) and the raw
+measured relative orientation for kink-only edges -- and the reconstructed
+parent orientation is the pixel-weighted quaternion mean of all these
+independent votes.
+
+\section{Verification against tabulated twin geometry}
+
+The reconstructed parent orientation is checked directly against every
+cluster in the ROI (independently of the graph used to derive it): treating
+the parent as a hypothetical reference orientation, each real cluster is
+tested for a twin relationship to it, using the same T-loop/tabulated-mode
+search as above, with a tolerance set by the recipe's grain-reconstruction
+threshold. This both confirms the internal consistency of the
+reconstruction and yields, for every matched cluster, the Schmid factor of
+its twin system evaluated on the parent side and on the cluster's own side.
+
+\section{Matrix identification by orientation merging}
+
+Clusters whose true minimum disorientation (searched over the full crystal
+symmetry group) to the reconstructed parent orientation falls below the
+same threshold are merged into a single ``matrix'' cluster, representing
+the (largely) untwinned parent austenite. The merge additionally records
+each merged fragment's original disorientation to the reference, for later
+inspection.
+
+\section{Consolidated reconstruction report}
+
+For the merged clustering result, every remaining (non-matrix) cluster is
+re-classified relative to the confirmed matrix orientation: twin
+relationships (with per-mode breakdown, pixel/cluster counts, and Schmid
+factors) and, for clusters showing no twin relationship, an additional kink
+check. This yields a single consolidated report of how the ROI's total
+pixel population partitions into matrix, twin-related, kink-related, and
+unidentified fractions.
+
+\section{Martensite correspondence and variant selection}
+
+If the matrix cluster used for merging exists, it serves as the anchor for
+a second homogeneous-direction search (restricted to matrix, twin- and
+kink-matched clusters only), refining the common $\langle110\rangle$-type
+lattice direction shared across the confirmed network; otherwise, the
+cluster closest in disorientation to the reconstructed parent is used as a
+fallback anchor. This refined direction is mapped, via the tabulated
+austenite$\to$martensite direction-correspondence matrices, into
+martensite Miller indices for each of the twelve correspondence variants;
+variants whose predicted martensite direction is not parallel to the
+expected martensite zone axis are discarded. Among the remaining candidate
+variants, the one giving the maximum (for tensile loading) transformation
+strain along \texttt{axial\_dir} is selected as the most probable
+martensite variant retained prior to reverse transformation. Finally, every
+confirmed austenite twin in the report is checked for whether its
+$K_1$ plane, mapped through the selected variant's correspondence matrix,
+is consistent with a known, named martensite twinning plane -- i.e.
+whether the austenite twin is itself inherited from a specific martensite
+twin system.
+
+\section{Checkpointing}
+
+The clustering result, the merged (matrix-identified) clustering result,
+the reconstruction report, the martensite-correspondence result, the
+common lattice direction, the anchor cluster, the loading direction, and
+the driving recipe are written to a per-grain HDF5 checkpoint, allowing the
+full downstream analysis and figure generation to be repeated without
+re-running this pipeline.
+
+\begin{thebibliography}{9}
+
+\bibitem{kamaya2011}
+M.~Kamaya,
+\emph{Assessment of local deformation using EBSD: Quantification of accuracy of measurement and definition of local gradient},
+Ultramicroscopy \textbf{111} (2011) 1189--1199.
+
+\bibitem{moussa2017}
+C.~Moussa, M.~Bernacki, R.~Besnard, N.~Bozzolo,
+\emph{Statistical analysis of dislocations and dislocation boundaries from EBSD data},
+Ultramicroscopy \textbf{179} (2017) 63--72.
+
+\end{thebibliography}
+
+\end{document}
