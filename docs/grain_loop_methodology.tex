@@ -106,6 +106,24 @@ measured relative orientation for kink-only edges -- and the reconstructed
 parent orientation is the pixel-weighted quaternion mean of all these
 independent votes.
 
+Because each edge's direction is decided independently, pairwise, from the
+two clusters' own Schmid factors, the resulting directed graph is not
+guaranteed to be acyclic: three or more mutually twin-related clusters can
+in principle form a directed cycle (each locally the more favourable side
+relative to its own neighbour, with no cluster left as an unambiguous
+overall source). When this occurs, no node qualifies as a clean starting
+point for the reconstruction; rather than abort the analysis, the node
+with the \emph{fewest} incoming directed twin edges is used as a
+best-effort root instead (tie-broken by the largest reachable pixel
+weight), and the affected grain is flagged accordingly. This fallback
+indicates that the grain's twin network does not reduce to a single
+consistent parent-child hierarchy under the Schmid-factor criterion, and
+the corresponding reconstruction should be inspected with additional care
+-- for example via the per-cluster deviation from the reconstructed
+consensus orientation -- as it may indicate that the selected ROI spans
+more than one original grain, or that the loading-direction assumption is
+not locally applicable.
+
 \section{Verification against tabulated twin geometry}
 
 The reconstructed parent orientation is checked directly against every

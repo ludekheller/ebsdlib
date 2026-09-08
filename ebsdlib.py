@@ -12150,6 +12150,16 @@ class ClusteringResult:
         node identified as someone else's twin "child" as root is a red
         flag, not necessarily wrong, but worth knowing).
 
+        If NO node qualifies as a pure source (the SF-directed twin graph
+        contains a directed cycle -- possible since each edge's direction
+        is set independently, pairwise, with no guarantee the result is
+        globally acyclic), root selection falls back to the node with the
+        FEWEST incoming directed twin edges, tie-broken by largest
+        reachable pixel weight, rather than raising -- important for
+        unattended batch processing over many grains. This fallback is
+        reported both via a printed warning and the returned
+        'used_cycle_fallback' flag, so affected grains can be reviewed.
+
         UNVALIDATED, same caveat as reconstruct_parent_orientation, with
         additional untested assumptions here: the sign/convention of your
         axial_dir and Schmid factor formula, the choice to leave kink edges
@@ -12188,6 +12198,13 @@ class ClusteringResult:
                 twin edge, and how much pixel weight it can reach. More
                 than one entry with substantial weight indicates the
                 network does not collapse to a single consistent source.
+                EMPTY if the twin graph contains a directed cycle (see
+                'used_cycle_fallback').
+            'used_cycle_fallback' : bool -- True if root selection had to
+                fall back to the least-incoming-edges node because no pure
+                source existed (directed cycle in the SF-directed twin
+                graph); False if root_cluster_id was given explicitly or a
+                genuine source was found.
             'edges' : list of dict, each {'cluster_a', 'cluster_b', 'type',
                 'direction' ('a_to_b'/'b_to_a'/'undirected'), 'sf_parent',
                 'sf_child' (twin edges only; None for kink), 'parent_sf_positive'
@@ -12297,15 +12314,33 @@ class ClusteringResult:
 
         if root_cluster_id is None:
             if not source_candidates:
-                raise ValueError("No node qualifies as a source (every node has an incoming "
-                                "directed twin edge) -- the twin network contains a directed "
-                                "cycle; cannot pick an automatic root. Pass root_cluster_id explicitly.")
-            root_cluster_id = source_candidates[0][0]
+                # No genuine source exists -- the SF-directed twin graph
+                # contains a cycle (locally-correct pairwise directions that
+                # don't reduce to a global DAG for this grain). Fall back to
+                # the node with the FEWEST incoming directed twin edges
+                # (least "child-like"), tie-broken by largest reachable
+                # pixel weight, rather than failing outright.
+                min_incoming = min(incoming_twin.get(n, 0) for n in all_nodes)
+                fallback_candidates = [n for n in all_nodes if incoming_twin.get(n, 0) == min_incoming]
+                fallback_scored = []
+                for n in fallback_candidates:
+                    _, w = _reachable_weight(n)
+                    fallback_scored.append((n, w))
+                fallback_scored.sort(key=lambda kv: -kv[1])
+                root_cluster_id = fallback_scored[0][0]
+                used_cycle_fallback = True
+                print(f"Warning: twin network contains a directed cycle (no pure source found); "
+                        f"falling back to cluster {root_cluster_id} ({min_incoming} incoming edge(s), "
+                        f"best reachable weight) as root.")
+            else:
+                root_cluster_id = source_candidates[0][0]
+                used_cycle_fallback = False
         else:
+            used_cycle_fallback = False
             if incoming_twin.get(root_cluster_id, 0) > 0:
                 print(f"Warning: root_cluster_id {root_cluster_id} has {incoming_twin[root_cluster_id]} "
-                    f"incoming directed twin edge(s) -- it is identified as the SF-unfavorable "
-                    f"(child) side of at least one twin relationship. Using it as root anyway.")
+                        f"incoming directed twin edge(s) -- it is identified as the SF-unfavorable "
+                        f"(child) side of at least one twin relationship. Using it as root anyway.")
 
         # ---- BFS from root, directed twin (forward only) + undirected kink ----
         Acc = {root_cluster_id: np.eye(3)}
@@ -12380,6 +12415,7 @@ class ClusteringResult:
             'source_candidates': source_candidates,
             'unreachable_due_to_directionality': unreachable_due_to_direction,
             'unreachable_clusters': unreachable_clusters,
+            'used_cycle_fallback': used_cycle_fallback,
         }
 
         if print_result:
@@ -12408,7 +12444,7 @@ class ClusteringResult:
                     print(f"    {e['cluster_a']}<->{e['cluster_b']}: dir={e['direction']}, "
                         f"sf_parent={e['sf_parent']:.3f}, sf_child={e['sf_child']:.3f}")
 
-        return result
+        return result    
 
     def reconstruct_parent_orientation(self, phase, matches=None, kink_results=None,
                                         root_cluster_id=None, print_result=True):
