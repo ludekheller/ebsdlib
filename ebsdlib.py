@@ -2111,7 +2111,99 @@ def reduce_to_fundzone_slow(M, symops):
     return M_reduced
 
 
+def _cubic_symops():
+    """
+    The 24 proper rotation matrices of cubic (m-3m) point-group symmetry,
+    generated as all signed-axis-permutation matrices with det = +1 --
+    i.e. computed by construction, not transcribed, so it's guaranteed
+    correct rather than relying on a hand-typed literal.
+    """
+    import itertools
+    mats = []
+    for perm in itertools.permutations(range(3)):
+        base = np.zeros((3, 3))
+        for i, j in enumerate(perm):
+            base[i, j] = 1
+        for signs in itertools.product([1, -1], repeat=3):
+            M = base * np.array(signs).reshape(-1, 1)
+            if np.isclose(np.linalg.det(M), 1.0):
+                mats.append(M)
+    return np.array(mats)
 
+
+_CUBIC_SYMOPS = _cubic_symops()   # computed once, at import time
+
+
+def compute_mackenzie_distribution(symops=None, n_samples=50000, bins=25, xlim=(0, 65),
+                                     seed=None, chunk_size=5000):
+    """
+    ... (same docstring, plus:)
+
+    symops : array-like of (3,3) rotation matrices, optional
+        Default None -> uses the 24 proper cubic (m-3m) symmetry
+        operators (_CUBIC_SYMOPS), correct for the B2 austenite phase
+        used throughout this pipeline. Pass a different symops array
+        explicitly for a lower-symmetry phase (e.g. monoclinic
+        martensite) -- the cubic default does NOT apply there.
+    """
+    if symops is None:
+        symops = _CUBIC_SYMOPS
+
+    rng = np.random.default_rng(seed)
+    symops = np.asarray(symops, dtype=float)
+
+    def _random_quats(n):
+        q = rng.normal(size=(n, 4))
+        return q / np.linalg.norm(q, axis=1, keepdims=True)
+
+    def _quat_to_mat_batch(q):
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        M = np.empty((q.shape[0], 3, 3))
+        M[:, 0, 0] = 1 - 2*(y**2 + z**2); M[:, 0, 1] = 2*(x*y - z*w); M[:, 0, 2] = 2*(x*z + y*w)
+        M[:, 1, 0] = 2*(x*y + z*w); M[:, 1, 1] = 1 - 2*(x**2 + z**2); M[:, 1, 2] = 2*(y*z - x*w)
+        M[:, 2, 0] = 2*(x*z - y*w); M[:, 2, 1] = 2*(y*z + x*w); M[:, 2, 2] = 1 - 2*(x**2 + y**2)
+        return M
+
+    angles_all = []
+    n_done = 0
+    while n_done < n_samples:
+        n_chunk = min(chunk_size, n_samples - n_done)
+        M1 = _quat_to_mat_batch(_random_quats(n_chunk))
+        M2 = _quat_to_mat_batch(_random_quats(n_chunk))
+        R = np.einsum('nij,njk->nik', M2, np.transpose(M1, (0, 2, 1)))
+
+        Rs = np.einsum('sij,njk->nsik', symops, R)
+        trace = np.einsum('nsii->ns', Rs)
+        cosang = np.clip((trace - 1) / 2, -1.0, 1.0)
+        ang = np.degrees(np.arccos(cosang))
+        angles_all.append(ang.min(axis=1))
+        n_done += n_chunk
+
+    angles_all = np.concatenate(angles_all)
+    hist, edges = np.histogram(angles_all, bins=bins, range=xlim, density=True)
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    return bin_centers, hist
+
+
+def add_mackenzie_line(ax, n_actual_samples, bins, xlim, symops=None, weight_scale=1/100,
+                        n_mc_samples=200000, color='red', linestyle='--', linewidth=1,
+                        label='Mackenzie (uniform)', seed=None):
+    """
+    ... (same docstring, plus:)
+
+    symops : array-like, optional
+        Default None -> cubic austenite (see compute_mackenzie_distribution).
+        Pass explicitly for a non-cubic phase.
+    """
+    bin_centers, density = compute_mackenzie_distribution(
+        symops=symops, n_samples=n_mc_samples, bins=bins, xlim=xlim, seed=seed
+    )
+    bin_width = (xlim[1] - xlim[0]) / bins
+    line_heights = density * bin_width * n_actual_samples * weight_scale
+
+    ax.plot(bin_centers, line_heights, color=color, linestyle=linestyle,
+            linewidth=linewidth, label=label, zorder=10)
+    return ax
 
 
 
@@ -11911,6 +12003,9 @@ class ClusteringResult:
         result : dict
             'tensor', 'eigenvalues', 'eigenvectors', 'n_clusters', 'total_pixels'
             (same structure as before).
+            Returns None instead of raising if no matched clusters with
+            'StrainTensor_a' are found (e.g. a grain with zero identified
+            twins) -- check the return value before using it.
         """
         T_sum = np.zeros((3, 3))
         w_sum = 0.0
@@ -11935,7 +12030,10 @@ class ClusteringResult:
             n_clusters += 1
 
         if w_sum == 0:
-            raise ValueError("No matched clusters with 'StrainTensor_a' and positive weight found.")
+            if print_result:
+                print("No matched clusters with 'StrainTensor_a' and positive weight found -- "
+                    "returning None (e.g. this grain has no identified twins).")
+            return None
 
         T_avg = T_sum / w_sum
         eigvals, eigvecs = np.linalg.eigh(T_avg)
@@ -11954,7 +12052,7 @@ class ClusteringResult:
             for i in range(3):
                 print(f"  ε_{i+1} = {eigvals[i]:+.4f}   direction = {eigvecs[:, i]}")
 
-        return result        
+        return result   
     def merge_clusters_by_orientation_single_linkage(self, threshold_deg=2.0, phase=None, min_size=None):
         """
         Merge clusters within the same phase whose average orientations are
@@ -17624,8 +17722,22 @@ class KamGND:
         self.nneighbors = nneighbors
         self.burgersv=burgersv
         
-    def computeGND(self, clustering_result: ClusteringResult):
+    def computeGND(self, clustering_result: ClusteringResult, clip_negative=True):
+        #print('ok')
+        """
+        GND computation based on the slope of KAM w.r.t. distance from the pixels
+        Computation of kernel average misorientations and GND
+            [1] C. Moussa, M. Bernacki, R. Besnard, N. Bozzolo, Ultramicroscopy 179 (2017) 63-72.
 
+        clip_negative : bool, optional
+            GND is a physical dislocation density and cannot be negative.
+            Small negative values can arise as regression noise from the
+            underlying slope-based estimate (a near-zero true GND can
+            produce a slightly negative fitted slope m). If True (default),
+            negative values are clipped to 0 in the final GND array, and a
+            note is printed reporting how many pixels were affected. Set to
+            False to retain the raw, unclipped (possibly negative) values.
+        """
         distance = []  # real distance in (normally um) to n-th nearest neighbor
         for d in range(1, self.nneighbors + 1):
                 distance.append(
@@ -17677,9 +17789,16 @@ class KamGND:
                 SSres = ((kam - kamfit) ** 2.0).sum(axis=1)
                 # R squared
                 Rsquared = 1.0 - SSres / SStot    
-        
+
+        if clip_negative:
+            n_negative = int((GND < 0).sum())
+            if n_negative > 0:
+                print(f"computeGND: {n_negative} pixel(s) had negative GND (regression noise), "
+                    f"clipped to 0.")
+            GND = np.clip(GND, 0.0, None)
+
         clustering_result.data.GND=GND
-        return clustering_result
+        return clustering_result    
 
 
     def computeKAM(self, clustering_result: ClusteringResult):
@@ -17967,6 +18086,7 @@ class EBSDVisualizer:
         Colors = np.zeros((labels.shape[0], 4))
         Colors = cluster_colors(renumbered_labels,cmap_name=cmap)
         return Colors.astype(int)
+
     def plotClusters(self, clustering_result: ClusteringResult, d=[1,0,0], cluster_id=None, 
                     orientations=None, color_by='cluster', cmap='jet', tiling=None, 
                     scalebar=True, globalScale=False, roi=None, phase=None, color=None, 
@@ -17982,13 +18102,26 @@ class EBSDVisualizer:
         clustering_result : ClusteringResult
             Clustering result object
         d : list, optional
-            Direction for IPF coloring. Default is [1,0,0].
+            Direction for IPF coloring, and (for 'maxtrstrain'/'maxavftrstrain')
+            the SAMPLE-frame loading direction used for the transformation
+            strain projection. Default is [1,0,0].
         cluster_id : int or list, optional
             Specific cluster(s) to plot
         orientations : array, optional
             Custom orientations
         color_by : str, optional
-            Coloring scheme: 'cluster', 'ipf', 'avgipf', 'data', 'kam', 'gnd'
+            Coloring scheme: 'cluster', 'ipf', 'avgipf', 'data', 'kam', 'gnd',
+            'maxtrstrain', 'maxavgtrstrain'.
+            - 'maxtrstrain': color EACH PIXEL by the maximum transformation
+            strain (over all martensite correspondence variants) along `d`,
+            projected through THAT PIXEL's own measured orientation.
+            - 'maxavgtrstrain': color each CLUSTER (uniformly, all its pixels)
+            by the maximum transformation strain along `d`, projected
+            through the cluster's AVERAGE orientation.
+            Both use clustering_result.data.getTrStrain internally and are
+            UNVALIDATED beyond the single-direction/single-cluster usage
+            already checked manually -- confirm the colorbar range/values
+            look physically sensible before trusting a full map.
         cmap : str, optional
             Colormap name. Default is 'jet'.
         tiling : optional
@@ -18000,7 +18133,8 @@ class EBSDVisualizer:
         roi : optional
             Region of interest
         phase : int or str, optional
-            Phase to plot
+            Phase to plot. Also used as the `phase` argument to getTrStrain
+            for 'maxtrstrain'/'maxavgtrstrain'.
         color : array, optional
             Custom colors
         data : array, optional
@@ -18053,8 +18187,17 @@ class EBSDVisualizer:
         >>> fig, ax = vis.plotClusters(clustering_result, 
         ...                           show_labels='selected', 
         ...                           label_clusters=[5, 12, 18, 23])
+        >>>
+        >>> # Color each pixel by its own max transformation strain along [0,0,1]
+        >>> fig, ax = vis.plotClusters(clustering_result, phase='A', d=[0,0,1],
+        ...                           color_by='maxtrstrain')
+        >>>
+        >>> # Color each cluster uniformly by its AVERAGE max transformation strain
+        >>> fig, ax = vis.plotClusters(clustering_result, phase='A', d=[0,0,1],
+        ...                           color_by='maxavgtrstrain')
         """        
         import matplotlib.pyplot as plt
+        import copy
         plot = True
         
         mask2, phase = clustering_result._getMask(cluster_id=cluster_id, roi=roi, phase=phase)
@@ -18066,21 +18209,44 @@ class EBSDVisualizer:
         if np.where(mask)[0].shape[0] < 2:
             print('Data with only 1 pixel or less cannot be plotted')
             plot = False
-            return None, None  # ADD THIS LINE - explicit return when not plotting
+            return None, None
         
         if plot:
-            if color_by == 'data' or color_by.lower() == 'kam' or color_by.lower() == 'gnd':
-                if color_by.lower() == 'kam':
+            color_by_lower = color_by.lower() if isinstance(color_by, str) else color_by
+
+            if (color_by == 'data' or color_by_lower in ('kam', 'gnd', 'maxtrstrain', 'maxavgtrstrain')):
+                if color_by_lower == 'kam':
                     data = clustering_result.data.kam
-                    #print(data)
-                if color_by.lower() == 'gnd':
+                if color_by_lower == 'gnd':
                     data = clustering_result.data.GND
+
+                if color_by_lower in ('maxtrstrain', 'maxavgtrstrain'):
+                    d_unit = np.asarray(d, dtype=float)
+                    d_unit = d_unit / np.linalg.norm(d_unit)
+
+                    if color_by_lower == 'maxtrstrain':
+                        # per-pixel: each pixel's OWN orientation
+                        M_for_proj = clustering_result.data.orientations
+                    else:
+                        # per-cluster: cluster AVERAGE orientation, broadcast to
+                        # every pixel of that cluster (same pattern as 'avgipf')
+                        labels_arr = clustering_result.labels
+                        avg_orientations = clustering_result.avg_orientations
+                        M_for_proj = copy.deepcopy(clustering_result.data.orientations)
+                        for label in avg_orientations.keys():
+                            M_for_proj[labels_arr == label, :, :] = avg_orientations[label]
+
+                    # ori_i = M_for_proj[i] . d_unit, for every pixel i -- vectorized
+                    oris_per_pixel = np.einsum('nij,j->ni', M_for_proj, d_unit)  # (N, 3)
+                    oris_for_getTrStrain = oris_per_pixel.T  # (3, N), per getTrStrain's expected shape
+
+                    clustering_result.data.getTrStrain(phase=phase, oris=oris_for_getTrStrain)
+                    data = np.max(clustering_result.data.trStrain[1], axis=0)  # (N,) -- max over variants
+
                 if vmin is None:
                     vmin = np.nanmin(data)
                 if vmax is None:
                     vmax = np.nanmax(data)
-                #print(data)
-                #print(vmax)
                 norm = plt.Normalize(vmin, vmax)
                 cmap_obj = plt.get_cmap(cmap)
                 Colors = cmap_obj(norm(data))
@@ -18128,7 +18294,7 @@ class EBSDVisualizer:
                         Mavg[labels == label, :, :] = avg_orientations[label]
                 if roi is None:
                     roi = clustering_result.parameters['roi']
-                fig, ax = clustering_result.data.plot_IPF(  # REMOVE any assignment if this returns None
+                fig, ax = clustering_result.data.plot_IPF(
                     d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
                     roi=roi, phase=phase, orientations=Mavg, mask=mask, fig=fig, ax=ax, **kwargs
                 )
@@ -18136,7 +18302,7 @@ class EBSDVisualizer:
             elif color_by == 'ipf':
                 if roi is None:
                     roi = clustering_result.parameters['roi']
-                fig, ax = clustering_result.data.plot_IPF(  # REMOVE any assignment if this returns None
+                fig, ax = clustering_result.data.plot_IPF(
                     d, tiling=tiling, scalebar=scalebar, globalScale=globalScale, 
                     roi=roi, phase=phase, orientations=None, mask=mask, fig=fig, ax=ax, **kwargs
                 )
@@ -18145,21 +18311,16 @@ class EBSDVisualizer:
             if show_labels:
                 import matplotlib.pyplot as plt
                 
-                # Determine which clusters to label
                 clusters_to_label = []
                 
                 if show_labels == True or show_labels == 'all':
-                    # Label all clusters
                     clusters_to_label = clustering_result._clusters_unique.tolist()
                 
                 elif show_labels == 'phase':
-                    # Label clusters in specified phase
                     if label_phase is None:
                         raise ValueError("show_labels='phase' requires label_phase parameter")
                     
-                    # Get phase ID
                     if isinstance(label_phase, str):
-                        # Find phase ID from name
                         phase_id = None
                         for pid, pname in clustering_result.data.phase_names.items():
                             if pname == label_phase:
@@ -18170,23 +18331,20 @@ class EBSDVisualizer:
                     else:
                         phase_id = label_phase
                     
-                    # Get clusters for this phase
                     if hasattr(clustering_result, 'labels_by_phase'):
                         phase_name = clustering_result.data.phase_names[phase_id]
                         if phase_name in clustering_result.labels_by_phase:
                             clusters_to_label = clustering_result.labels_by_phase[phase_name]
                     else:
-                        # Fallback: find clusters manually
                         labels = clustering_result.labels
                         phases_id = clustering_result.data.phases_id
                         for cluster_label in clustering_result._clusters_unique:
                             cluster_mask = labels == cluster_label
-                            cluster_phase = phases_id[cluster_mask][0]  # Get phase of first pixel
+                            cluster_phase = phases_id[cluster_mask][0]
                             if cluster_phase == phase_id:
                                 clusters_to_label.append(cluster_label)
                 
                 elif show_labels == 'selected':
-                    # Label specific clusters
                     if label_clusters is None:
                         raise ValueError("show_labels='selected' requires label_clusters parameter")
                     
@@ -18199,12 +18357,10 @@ class EBSDVisualizer:
                     raise ValueError(f"Invalid show_labels value: {show_labels}. "
                                 f"Use False, True, 'all', 'phase', or 'selected'")
                 
-                # Get data coordinates and labels
                 X = clustering_result.data.X
                 Y = clustering_result.data.Y
                 labels = clustering_result.labels
                 
-                # Apply mask if present
                 if mask is not None:
                     X_masked = X[mask]
                     Y_masked = Y[mask]
@@ -18214,20 +18370,15 @@ class EBSDVisualizer:
                     Y_masked = Y
                     labels_masked = labels
                 
-                # Plot labels for each cluster
                 for cluster_label in clusters_to_label:
-                    # Get pixels in this cluster
                     cluster_pixels = labels_masked == cluster_label
                     
                     if np.sum(cluster_pixels) > 0:
-                        # Calculate centroid
                         x_center = np.mean(X_masked[cluster_pixels])
                         y_center = np.mean(Y_masked[cluster_pixels])
                         
-                        # Create label text
                         label_text = f'{cluster_label}'
                         
-                        # Prepare bbox properties
                         if label_bbox:
                             bbox_props = dict(
                                 boxstyle=label_bbox_style,
@@ -18239,7 +18390,6 @@ class EBSDVisualizer:
                         else:
                             bbox_props = None
                         
-                        # Add text label
                         ax.text(
                             x_center, y_center, label_text,
                             ha='center', va='center',
@@ -18247,14 +18397,12 @@ class EBSDVisualizer:
                             color=label_color,
                             fontweight='bold',
                             bbox=bbox_props,
-                            zorder=1000  # Ensure labels are on top
+                            zorder=1000
                         )
-                
-                # REMOVE THIS PRINT - it might be causing issues
-                # print(f"Added labels for {len(clusters_to_label)} clusters")
             # ========================================
         
         return fig, ax
+
 #clustering_result.get_cluster_mask(1)
 
     def plotAvgOriIPF(self,d, tiling=None, scalebar=True,globalScale=False, roi=None, phase=None, fig=None, ax=None,  **kwargs):
