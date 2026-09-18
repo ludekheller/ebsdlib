@@ -68,7 +68,16 @@ import h5py
 
 _FMT, _VER = 'ebsd_hp_checkpoint', 1
 
- 
+def _quat_to_mat_batch(q):
+    """Vectorized quaternion-to-rotation-matrix conversion for an
+    (N, 4) array of quaternions -- replaces a per-element Python loop
+    calling quat_to_mat N times with one numpy broadcast."""
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    M = np.empty((q.shape[0], 3, 3))
+    M[:, 0, 0] = 1 - 2*(y**2 + z**2); M[:, 0, 1] = 2*(x*y - z*w); M[:, 0, 2] = 2*(x*z + y*w)
+    M[:, 1, 0] = 2*(x*y + z*w); M[:, 1, 1] = 1 - 2*(x**2 + z**2); M[:, 1, 2] = 2*(y*z - x*w)
+    M[:, 2, 0] = 2*(x*z - y*w); M[:, 2, 1] = 2*(y*z + x*w); M[:, 2, 2] = 1 - 2*(x**2 + y**2)
+    return M
  
 # ---- recipe (native, inspectable) -----------------------------------------
 def _recipe_put(group, recipe):
@@ -6927,8 +6936,7 @@ class ClusteringResult:
             new_result.avg_quats[c] = r['avg_quat']
 
         return new_result
-    
-    def evaluate_lattice_direction_homogeneity(self, anchor_cluster_id, lattice_vec, phase=None,
+    def evaluate_lattice_direction_homogeneity_ini(self, anchor_cluster_id, lattice_vec, phase=None,
                                                 cluster_ids='all', units='deg',
                                                 print_result=False, plot_result=False,
                                                 return_best=False):
@@ -7091,6 +7099,204 @@ class ClusteringResult:
             print(f"Least homogeneous: lattice_vec={worst['lattice_vec']} "
                   f"(from {worst['source_lattice_vec']}), "
                   f"mean_spread={worst['mean_spread']:.4f} {u}")
+
+        if plot_result:
+            best = results_sorted[0]
+            worst = results_sorted[-1]
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            for ax, r, label in zip(axes, [best, worst], ['most homogeneous', 'least homogeneous']):
+                stereotriangle(ax=ax, basedirs=False, equalarea=False)
+                ax.scatter(r['proj'][0, :], r['proj'][1, :], s=3, alpha=0.5, color='red')
+                ax.set_title(f"{label}\nlattice_vec={r['lattice_vec']} "
+                             f"(from {r['source_lattice_vec']})\n"
+                             f"mean_spread={r['mean_spread']:.3f} {units}")
+            fig.tight_layout()
+
+        return results_sorted[0] if return_best else results_sorted
+    
+    def evaluate_lattice_direction_homogeneity(self, anchor_cluster_id, lattice_vec, phase=None,
+                                                cluster_ids='all', units='deg',
+                                                print_result=False, plot_result=False,
+                                                return_best=False, pixel_mats_cache=None):
+        """
+        For a fixed sample-frame anchor derived from anchor_cluster_id's
+        average orientation, evaluate the orientation homogeneity of a
+        pooled pixel population (across cluster_ids) for EVERY
+        symmetrically-equivalent variant of one OR MORE Miller-index lattice
+        directions, and rank them all together.
+
+        For each equivalent variant lv of each input direction (equivalents
+        found via self.data.phases[phase]['symops']):
+        - cartesian_vec = L.dot(lv), normalized
+        - d = avg_mat.T.dot(cartesian_vec) -- a fixed SAMPLE-frame direction,
+        anchored to anchor_cluster_id's average orientation for this variant
+        - every pooled pixel's crystal-frame representation of that SAME d
+        (pixel_mats . d) is folded into the fundamental cubic triangle
+        (full proper+improper symmetry, required by
+        stereoprojection_intotriangle_fast)
+        - homogeneity is the angular spread (mean/max angle to the mean of
+        the FOLDED directions) of the pooled population, in `units`
+
+        Parameters
+        ----------
+        anchor_cluster_id : int
+            Cluster whose average orientation defines the fixed sample-
+            frame anchor d for each variant. Not necessarily included in
+            the pooled pixel population being evaluated (see cluster_ids).
+        lattice_vec : array-like (3,) OR (M, 3)
+            One Miller-index direction, or a list of candidate directions.
+            The full symmetry-equivalent set of EACH input is tested, and all
+            variants of all inputs are ranked together. Equivalents shared
+            between inputs are evaluated once (deduplicated), attributed to the
+            first input that produced them.
+        phase : str, optional
+            Phase for symops/L lookup. If None, inferred from
+            anchor_cluster_id via self.cluster_phases_id.
+        cluster_ids : int, list of int, or 'all', optional
+            Which clusters' pixels to pool for the homogeneity evaluation.
+            Default 'all' (every cluster in `phase`).
+        units : {'deg', 'rad'}, optional
+            Units for the reported/printed/plotted angular spread. Default 'deg'.
+        print_result : bool, optional
+            If True, print a table of all tested variants, sorted from most
+            to least homogeneous (ascending mean angular spread). Default False.
+        plot_result : bool, optional
+            If True, plot the folded fundamental-triangle positions for the
+            most and least homogeneous variants side by side. Default False.
+        return_best : bool, optional
+            If True, return only the single most homogeneous result dict
+            (i.e. results_sorted[0]); if False (default), return the full
+            sorted list. Backward compatible when False.
+        pixel_mats_cache : dict {cluster_id: (n, 3, 3) ndarray}, optional
+            If given, per-cluster converted pixel_mats are cached here
+            across calls -- avoids reconverting a cluster's quaternions
+            every time it appears in a new cluster_ids set (e.g. across
+            many successive calls in grow_grain_group, where cluster_ids
+            grows by one cluster per step and the rest are unchanged).
+            Pass the SAME dict object across a whole grouping run to
+            benefit from it; results are IDENTICAL to pixel_mats_cache=None
+            (order-independent aggregate statistics downstream), just
+            faster on repeated overlapping calls. Default None (no caching,
+            recomputes every call).
+
+        Returns
+        -------
+        results_sorted : list of dict, sorted ascending by 'mean_spread'
+            (most homogeneous first) -- or a single dict if return_best=True.
+            Each dict:
+            'lattice_vec' : (3,) ndarray, this variant's Miller indices
+            'source_lattice_vec' : (3,) ndarray, the input direction this
+                variant was generated from
+            'd' : (3,) ndarray, the sample-frame anchor direction used
+            'mean_spread', 'max_spread' : float, in `units`
+            'proj' : (2, N) ndarray, folded triangle coordinates for every
+                pooled pixel (always included; only used for plotting when
+                plot_result=True)
+        """
+        if units not in ('deg', 'rad'):
+            raise ValueError(f"units must be 'deg' or 'rad', got {units!r}")
+
+        if phase is None:
+            phase = self.data.phase_names[self.cluster_phases_id[anchor_cluster_id]]
+
+        if isinstance(cluster_ids, str) and cluster_ids == 'all':
+            cluster_ids = list(self.labels_by_phase[phase])
+        elif isinstance(cluster_ids, (int, np.integer)):
+            cluster_ids = [cluster_ids]
+
+        L = np.asarray(self.data.phases[phase]['L'])
+        symops_all = np.array(self.data.phases[phase]['symops'])
+        symops_full = list(symops_all) + [-s.T for s in symops_all]
+
+        avg_mat = self.avg_orientations[anchor_cluster_id]
+
+        if pixel_mats_cache is None:
+            idxs = np.where(np.isin(self.labels, cluster_ids))[0]
+            pixel_quats = self.data.quaternions[idxs]
+            pixel_mats = _quat_to_mat_batch(pixel_quats)
+        else:
+            missing = [c for c in cluster_ids if c not in pixel_mats_cache]
+            for c in missing:
+                c_idxs = np.where(self.labels == c)[0]
+                pixel_mats_cache[c] = (_quat_to_mat_batch(self.data.quaternions[c_idxs])
+                                        if c_idxs.size else np.zeros((0, 3, 3)))
+            mats_list = [pixel_mats_cache[c] for c in cluster_ids if pixel_mats_cache[c].shape[0] > 0]
+            pixel_mats = np.concatenate(mats_list, axis=0) if mats_list else np.zeros((0, 3, 3))
+
+        # --- normalize lattice_vec to a list of (3,) input directions -------
+        lattice_vec = np.asarray(lattice_vec, dtype=float)
+        if lattice_vec.ndim == 1:
+            input_vecs = lattice_vec.reshape(1, 3)
+        else:
+            input_vecs = lattice_vec.reshape(-1, 3)
+
+        results = []
+        seen = set()                       # dedup variants across all inputs
+        for src in input_vecs:
+            equiv_lattice_vecs = np.unique(np.round(np.dot(symops_all, src), 6), axis=0)
+            for lv in equiv_lattice_vecs:
+                key = tuple((np.round(lv, 6) + 0.0).tolist())   # +0.0 -> kill -0.0
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                cartesian_vec = L.dot(lv)
+                cartesian_vec = cartesian_vec / np.linalg.norm(cartesian_vec)
+                d = avg_mat.T.dot(cartesian_vec)
+
+                dirs_crystal = np.einsum('nij,j->ni', pixel_mats, d)  # (N, 3)
+
+                proj, out = stereoprojection_intotriangle_fast(
+                    dirs_crystal.T, symops=symops_full, geteqdirs=True
+                )
+                eqdirs = out['eqdirs']  # (3, N), folded
+
+                mean_dir = eqdirs.mean(axis=1)
+                mean_dir = mean_dir / np.linalg.norm(mean_dir)
+                cos_ang = np.clip(eqdirs.T @ mean_dir, -1.0, 1.0)
+                ang_rad = np.arccos(cos_ang)
+                ang = ang_rad if units == 'rad' else np.degrees(ang_rad)
+
+                results.append({
+                    'lattice_vec': lv,
+                    'source_lattice_vec': src.copy(),
+                    'd': d,
+                    'mean_spread': float(ang.mean()),
+                    'max_spread': float(ang.max()),
+                    'proj': proj,
+                })
+
+        results_sorted = sorted(results, key=lambda r: r['mean_spread'])
+
+        if print_result:
+            u = units
+            multi = len(input_vecs) > 1
+            if multi:
+                print(f"{'source':>14} {'variant':>18} "
+                    f"{'mean_spread(' + u + ')':>18} {'max_spread(' + u + ')':>18}")
+                print("-" * 72)
+            else:
+                print(f"{'lattice_vec':>18} "
+                    f"{'mean_spread(' + u + ')':>18} {'max_spread(' + u + ')':>18}")
+                print("-" * 56)
+            for r in results_sorted:
+                lv_str = np.array2string(r['lattice_vec'], precision=1, suppress_small=True)
+                if multi:
+                    src_str = np.array2string(r['source_lattice_vec'], precision=1,
+                                            suppress_small=True)
+                    print(f"{src_str:>14} {lv_str:>18} "
+                        f"{r['mean_spread']:>18.4f} {r['max_spread']:>18.4f}")
+                else:
+                    print(f"{lv_str:>18} {r['mean_spread']:>18.4f} {r['max_spread']:>18.4f}")
+
+            best = results_sorted[0]
+            worst = results_sorted[-1]
+            print(f"\nMost homogeneous: lattice_vec={best['lattice_vec']} "
+                f"(from {best['source_lattice_vec']}), "
+                f"mean_spread={best['mean_spread']:.4f} {u}")
+            print(f"Least homogeneous: lattice_vec={worst['lattice_vec']} "
+                f"(from {worst['source_lattice_vec']}), "
+                f"mean_spread={worst['mean_spread']:.4f} {u}")
 
         if plot_result:
             best = results_sorted[0]
