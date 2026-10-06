@@ -8790,8 +8790,10 @@ class ClusteringResult:
         return (max(abs(v) for v in uvw), angle_deg)
 
 
-    def identify_kink_axis(self, cluster_a, cluster_b, phase, max_miller_index=2, tol_deg=5.0,
-                            print_result=False, print_top_n=10):
+    def identify_kink_axis(self, cluster_a, cluster_b, phase, max_miller_index=2, axes=None,
+                           expand_symmetric=True, tol_deg=5.0,
+                           sample_axis=None, sample_tol_deg=None,
+                           print_result=False, print_top_n=10):
         """
         BLIND rotation-axis indexing. See prior docstring for the T-loop +
         family-search methodology and the spurious-single-best-match
@@ -8807,18 +8809,42 @@ class ClusteringResult:
         cluster_a, cluster_b : int
         phase : str
         max_miller_index : int, optional
-            Default 2.
+            Default 2. Ignored when `axes` is given.
+        axes : list of array-like (3,), optional
+            If given, restrict the search to this explicit set of candidate
+            Miller-index directions (uvw) instead of auto-generating every
+            low-index uvw up to max_miller_index.
+        expand_symmetric : bool, optional
+            Default True: each axis in `axes` is expanded to its full
+            symmetrically-equivalent family. Set False to test ONLY the
+            exact direction(s) in `axes`, no family expansion. Ignored
+            when axes is None. NOTE: with False, the result depends on the
+            symmetry branch (labelling) of cluster_a; prefer True together
+            with `sample_axis` for a branch-independent, axis-specific test.
         tol_deg : float, optional
-            Default 5.0.
+            Default 5.0. Tolerance on the crystal-frame axis deviation from
+            the candidate family member.
+        sample_axis : array-like (3,), optional
+            If given, a candidate representative T is accepted only if its
+            rotation axis, expressed in the SAMPLE frame, is within
+            sample_tol_deg of this direction (sign-independent). The
+            sample-frame axis is G1.T @ m_axis, where m_axis is the axis of
+            T @ G2 @ G1.T in cluster_a's crystal frame (G maps sample ->
+            crystal). Typical use: sample_axis = d_s, the grain's common
+            <110> in the sample frame, d_s = G_anchor.T @ (L @ zone_axis)/|.|,
+            which makes the test both axis-specific and independent of the
+            symmetry branch of either cluster. Default None (no filter).
+        sample_tol_deg : float, optional
+            Tolerance for the sample-axis filter. Default None -> tol_deg.
         print_result : bool, optional
             If True, print the top print_top_n candidates (across ALL
             matches of ALL families, not just each family's best), ranked
             by _kink_metric. Default False.
         print_top_n : int or 'all', optional
-        Number of top-ranked candidates to print/return in
-        'top_candidates'. Pass 'all' to include every match found
-        (across all families), not just a fixed-size top slice.
-        Default 10.
+            Number of top-ranked candidates to print/return in
+            'top_candidates'. Pass 'all' to include every match found
+            (across all families), not just a fixed-size top slice.
+            Default 10.
 
         Returns
         -------
@@ -8826,13 +8852,14 @@ class ClusteringResult:
             'cluster_a', 'cluster_b', 'phase'
             'is_match' : bool
             'best_uvw', 'axis_dev_deg', 'kink_angle_deg', 'best_T_idx',
-                'variant_cartesian' : the METRIC-selected best candidate
-                (Miller-index simplicity, then angle) among all matches --
-                NOT the smallest axis_dev.
+                'variant_cartesian', 'sample_axis_dev_deg' : the
+                METRIC-selected best candidate (Miller-index simplicity,
+                then angle) among all matches -- NOT the smallest axis_dev.
+                'sample_axis_dev_deg' is None when sample_axis is None.
             'top_candidates' : list of dict, the print_top_n best matches
                 by metric, across all families, each {'uvw', 'axis_dev_deg',
-                'kink_angle_deg', 'T_idx'}
-            'all_matches_by_family' : dict {uvw_tuple: list of dict}, as before
+                'kink_angle_deg', 'T_idx', 'sample_axis_dev_deg'}
+            'all_matches_by_family' : dict {uvw_tuple: list of dict}
             'n_families_tested' : int
         """
         from scipy.spatial.transform import Rotation as _R
@@ -8849,14 +8876,32 @@ class ClusteringResult:
         symops_proper = symops_all[dets > 0]
         L = np.asarray(self.data.phases[phase]['L'])
 
-        raw_candidates = _generate_low_index_uvw_directions(max_miller_index)
+        # ---- optional sample-frame axis filter ------------------------------
+        if sample_axis is not None:
+            sa = np.asarray(sample_axis, dtype=float).ravel()
+            sa_norm = np.linalg.norm(sa)
+            if sa_norm < 1e-12:
+                raise ValueError("sample_axis must be a non-zero vector")
+            sa = sa / sa_norm
+            s_tol = tol_deg if sample_tol_deg is None else sample_tol_deg
+        else:
+            sa = None
+            s_tol = None
+
+        raw_candidates = (
+            [tuple(a) for a in axes] if axes is not None
+            else _generate_low_index_uvw_directions(max_miller_index)
+        )
 
         seen_members = set()
         families = []
         for uvw in raw_candidates:
             v = L.dot(np.array(uvw, dtype=float))
             v = v / np.linalg.norm(v)
-            family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
+            if axes is not None and not expand_symmetric:
+                family = v[None, :]
+            else:
+                family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
             key = frozenset(tuple(row) for row in family)
             if key in seen_members:
                 continue
@@ -8866,7 +8911,6 @@ class ClusteringResult:
         all_matches = [[] for _ in families]
 
         for t_idx, T in enumerate(symops_proper):
-            #M_T = M_fwd @ T
             M_T = T @ M_fwd
             q = _R.from_matrix(M_T).as_quat()
             if q[3] < 0:
@@ -8874,7 +8918,23 @@ class ClusteringResult:
             w = np.clip(q[3], -1.0, 1.0)
             angle = 2.0 * np.degrees(np.arccos(w))
             s = np.sqrt(max(1.0 - w * w, 0.0))
-            m_axis = q[:3] / s if s > 1e-8 else np.array([0.0, 0.0, 1.0])
+
+            if s > 1e-8:
+                m_axis = q[:3] / s
+            else:
+                # (near-)identity representative: rotation axis undefined
+                if sa is not None:
+                    continue          # cannot satisfy an axis-specific test
+                m_axis = np.array([0.0, 0.0, 1.0])
+
+            # sample-frame axis filter (branch-independent)
+            s_dev = None
+            if sa is not None:
+                ax_s = G1.T @ m_axis
+                ax_s = ax_s / np.linalg.norm(ax_s)
+                s_dev = float(np.degrees(np.arccos(np.clip(abs(ax_s @ sa), 0.0, 1.0))))
+                if s_dev >= s_tol:
+                    continue
 
             for f_idx, (uvw, family) in enumerate(families):
                 Fn = family / np.linalg.norm(family, axis=1, keepdims=True)
@@ -8884,7 +8944,7 @@ class ClusteringResult:
                 axis_dev = float(devs[v_idx])
 
                 if axis_dev < tol_deg:
-                    all_matches[f_idx].append((axis_dev, t_idx, v_idx, angle))
+                    all_matches[f_idx].append((axis_dev, t_idx, v_idx, angle, s_dev))
 
         all_matches_by_family = {}
         flat_candidates = []
@@ -8892,8 +8952,8 @@ class ClusteringResult:
             if all_matches[f_idx]:
                 entries = sorted(
                     [{'axis_dev_deg': ad, 'kink_angle_deg': ang, 'T_idx': ti,
-                    'variant_cartesian': family[vi]}
-                    for ad, ti, vi, ang in all_matches[f_idx]],
+                      'variant_cartesian': family[vi], 'sample_axis_dev_deg': sd}
+                     for ad, ti, vi, ang, sd in all_matches[f_idx]],
                     key=lambda d: d['axis_dev_deg']
                 )
                 all_matches_by_family[uvw] = entries
@@ -8905,6 +8965,7 @@ class ClusteringResult:
                 'cluster_a': cluster_a, 'cluster_b': cluster_b, 'phase': phase,
                 'is_match': False, 'best_uvw': None, 'axis_dev_deg': None,
                 'kink_angle_deg': None, 'best_T_idx': None, 'variant_cartesian': None,
+                'sample_axis_dev_deg': None,
                 'top_candidates': [], 'all_matches_by_family': {}, 'n_families_tested': len(families),
             }
 
@@ -8914,15 +8975,18 @@ class ClusteringResult:
 
         if print_result:
             print(f"Cluster {cluster_a} <-> {cluster_b}, phase {phase}: "
-                f"{len(flat_candidates)} total match(es) across {len(all_matches_by_family)} "
-                f"distinct famil{'y' if len(all_matches_by_family)==1 else 'ies'}, "
-                f"ranked by (max Miller index, angle)")
-            print(f"{'#':>3} {'uvw':>12} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} {'T_idx':>6}")
-            print("-" * 58)
+                  f"{len(flat_candidates)} total match(es) across {len(all_matches_by_family)} "
+                  f"distinct famil{'y' if len(all_matches_by_family)==1 else 'ies'}, "
+                  f"ranked by (max Miller index, angle)"
+                  + (f", sample-axis filter {s_tol:.1f} deg" if sa is not None else ""))
+            print(f"{'#':>3} {'uvw':>12} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} "
+                  f"{'S-axis dev':>11} {'T_idx':>6}")
+            print("-" * 70)
             for i, c in enumerate(top_candidates):
                 max_idx = max(abs(v) for v in c['uvw'])
+                sd = f"{c['sample_axis_dev_deg']:>10.2f}°" if c['sample_axis_dev_deg'] is not None else f"{'--':>11}"
                 print(f"{i:>3} {str(c['uvw']):>12} {max_idx:>9} {c['axis_dev_deg']:>9.2f}° "
-                    f"{c['kink_angle_deg']:>10.2f}° {c['T_idx']:>6}")
+                      f"{c['kink_angle_deg']:>10.2f}° {sd} {c['T_idx']:>6}")
 
         return {
             'cluster_a': cluster_a,
@@ -8934,15 +8998,16 @@ class ClusteringResult:
             'kink_angle_deg': best['kink_angle_deg'],
             'best_T_idx': best['T_idx'],
             'variant_cartesian': best['variant_cartesian'],
+            'sample_axis_dev_deg': best['sample_axis_dev_deg'],
             'top_candidates': top_candidates,
             'all_matches_by_family': all_matches_by_family,
             'n_families_tested': len(families),
-        }    
+        }
 
-
-    def map_kink_axes(self, phase, max_miller_index=2, tol_deg=5.0, min_size='recipe',
-                    cluster_ids=None, print_result=False, print_top_n_per_pair=3,
-                    sort_by='size'):
+    def map_kink_axes(self, phase, max_miller_index=2, axes=None, expand_symmetric=True,
+                      tol_deg=5.0, sample_axis=None, sample_tol_deg=None, min_size='recipe',
+                      cluster_ids=None, print_result=False, print_top_n_per_pair=3,
+                      sort_by='size'):
         """
         BLIND rotation-axis indexing for EVERY pair of clusters (within one
         phase): same methodology as identify_kink_axis (auto-generated,
@@ -8951,27 +9016,49 @@ class ClusteringResult:
         pairwise and vectorized.
 
         PREREQUISITE: self.avg_orientations must already be resolved to a
-        mutually consistent branch.
+        mutually consistent branch (only relevant when expand_symmetric=False;
+        the family test and the sample_axis filter are branch-independent).
 
         Parameters
         ----------
         phase : str
         max_miller_index : int, optional
-            Default 2.
+            Default 2. Ignored when `axes` is given.
+        axes : list of array-like (3,), optional
+            If given, restrict the search to this explicit set of candidate
+            Miller-index directions (uvw) instead of auto-generating every
+            low-index uvw up to max_miller_index. E.g. axes=[(1, 1, 0)]
+            tests only the <110> family (or, with expand_symmetric=False,
+            only that one direction).
+        expand_symmetric : bool, optional
+            Default True: each axis in `axes` is expanded to its full
+            symmetrically-equivalent family. Set False to test ONLY the
+            exact direction(s) in `axes` (depends on the symmetry branch of
+            cluster_a -- prefer True together with sample_axis). Ignored when
+            axes is None.
         tol_deg : float, optional
-            Default 5.0.
-        min_size : int, optional
+            Default 5.0. Tolerance on the crystal-frame axis deviation.
+        sample_axis : array-like (3,), optional
+            If given, a candidate representative T of a pair (a, b) is
+            accepted only if its rotation axis in the SAMPLE frame,
+            G_a.T @ m_axis, is within sample_tol_deg of this direction
+            (sign-independent). Typical use: sample_axis = d_s, the grain's
+            common <110> in the sample frame. Makes the test axis-specific
+            and independent of the symmetry branch of either cluster.
+            Default None (no filter).
+        sample_tol_deg : float, optional
+            Tolerance for the sample-axis filter. Default None -> tol_deg.
+        min_size : int, 'recipe' or None, optional
         cluster_ids : list of int, optional
         print_result : bool, optional
             If True, print a table with print_top_n_per_pair metric-ranked
             candidates per pair (pairs with no match are skipped). Default False.
         print_top_n_per_pair : int or 'all', optional
-        Number of top-ranked candidates to print per pair. Pass 'all'
-        to print every match found for that pair. Default 3.
-        Also controls how many candidates are retained in each pair's
-        'top_candidates' list in the returned pairs_results (at least
-        5 are always kept there regardless, unless 'all' is given, in
-        which case every match is kept).
+            Number of top-ranked candidates to print per pair. Pass 'all'
+            to print every match found for that pair. Default 3.
+            Also controls how many candidates are retained in each pair's
+            'top_candidates' list (at least 5 are always kept, unless 'all'
+            is given, in which case every match is kept).
         sort_by : {'size', 'cluster_id'}, optional
             Order pairs are printed in. Default 'size' (largest first).
 
@@ -8980,7 +9067,8 @@ class ClusteringResult:
         pairs_results : list of dict
             One entry per cluster pair WITH at least one match:
             'cluster_a', 'cluster_b', 'size_a', 'size_b'
-            'best_uvw', 'axis_dev_deg', 'kink_angle_deg', 'best_T_idx'
+            'best_uvw', 'axis_dev_deg', 'kink_angle_deg', 'best_T_idx',
+            'sample_axis_dev_deg' (None if sample_axis is None)
                 (metric-selected, per identify_kink_axis)
             'top_candidates' : list of dict, metric-ranked matches for this pair
             'n_matches' : int, total match count across all families
@@ -8995,7 +9083,7 @@ class ClusteringResult:
         cluster_ids = [c for c in cluster_ids if c in self.avg_orientations]
 
         if min_size == 'recipe':
-            min_size = self.get_recipe_min_size(phase)        
+            min_size = self.get_recipe_min_size(phase)
 
         if min_size is not None:
             sizes = self.cluster_sizes
@@ -9015,13 +9103,31 @@ class ClusteringResult:
         Ns = symops_proper.shape[0]
         L = np.asarray(self.data.phases[phase]['L'])
 
-        raw_candidates = _generate_low_index_uvw_directions(max_miller_index)
+        # ---- optional sample-frame axis filter ------------------------------
+        if sample_axis is not None:
+            sa = np.asarray(sample_axis, dtype=float).ravel()
+            sa_norm = np.linalg.norm(sa)
+            if sa_norm < 1e-12:
+                raise ValueError("sample_axis must be a non-zero vector")
+            sa = sa / sa_norm
+            s_tol = tol_deg if sample_tol_deg is None else sample_tol_deg
+        else:
+            sa = None
+            s_tol = None
+
+        raw_candidates = (
+            [tuple(a) for a in axes] if axes is not None
+            else _generate_low_index_uvw_directions(max_miller_index)
+        )
         seen_members = set()
         families = []
         for uvw in raw_candidates:
             v = L.dot(np.array(uvw, dtype=float))
             v = v / np.linalg.norm(v)
-            family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
+            if axes is not None and not expand_symmetric:
+                family = v[None, :]
+            else:
+                family = np.unique(np.round(np.dot(symops_proper, v), 6), axis=0)
             key = frozenset(tuple(row) for row in family)
             if key in seen_members:
                 continue
@@ -9034,27 +9140,37 @@ class ClusteringResult:
         ii = np.array([i for i, _ in pair_idx])
         jj = np.array([j for _, j in pair_idx])
 
-        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])
-        #M_T = np.einsum('pij,tjk->ptik', M_fwd, symops_proper)  # (P,Ns,3,3)
-        M_T = np.einsum('tij,pjk->ptik', symops_proper, M_fwd)  # (P,Ns,3,3)
+        M_fwd = np.einsum('pij,pkj->pik', G[jj], G[ii])           # G_b @ G_a.T, (P,3,3)
+        M_T = np.einsum('tij,pjk->ptik', symops_proper, M_fwd)    # T @ M_fwd, (P,Ns,3,3)
         q = _R.from_matrix(M_T.reshape(-1, 3, 3)).as_quat().reshape(P, Ns, 4)
         flip = q[..., 3] < 0
         q[flip] = -q[flip]
         w = np.clip(q[..., 3], -1.0, 1.0)
-        angle = 2.0 * np.degrees(np.arccos(w))  # (P, Ns)
-        s = np.sqrt(np.clip(1.0 - w * w, 0.0, None))
-        axis = np.divide(q[..., :3], s[..., None], out=np.zeros((P, Ns, 3)), where=s[..., None] > 1e-8)
-        axis[s <= 1e-8] = np.array([0.0, 0.0, 1.0])  # (P, Ns, 3)
+        angle = 2.0 * np.degrees(np.arccos(w))                    # (P, Ns)
+        s = np.sqrt(np.clip(1.0 - w * w, 0.0, None))              # (P, Ns)
+        axis_defined = s > 1e-8                                    # (P, Ns)
+        axis = np.divide(q[..., :3], s[..., None], out=np.zeros((P, Ns, 3)),
+                         where=axis_defined[..., None])
+        axis[~axis_defined] = np.array([0.0, 0.0, 1.0])            # (P, Ns, 3)
+
+        # sample-frame filter: axis_s = G_a.T @ m_axis for each pair and each T
+        if sa is not None:
+            ax_s = np.einsum('pji,ptj->pti', G[ii], axis)          # (P, Ns, 3)
+            ax_s /= np.clip(np.linalg.norm(ax_s, axis=-1, keepdims=True), 1e-12, None)
+            s_dev_all = np.degrees(np.arccos(np.clip(np.abs(ax_s @ sa), 0.0, 1.0)))  # (P, Ns)
+            s_ok = (s_dev_all < s_tol) & axis_defined                                  # (P, Ns)
+        else:
+            s_dev_all = None
+            s_ok = np.ones((P, Ns), dtype=bool)
 
         pair_candidates = [[] for _ in range(P)]
 
         for uvw, family in families:
-            n_var = family.shape[0]
             Fn = family / np.linalg.norm(family, axis=1, keepdims=True)
             cosang = np.clip(np.einsum('pnk,vk->pnv', axis, Fn), -1.0, 1.0)  # (P,Ns,n_var)
             devs_all = np.degrees(np.arccos(cosang))
 
-            mask = devs_all < tol_deg  # (P, Ns, n_var)
+            mask = (devs_all < tol_deg) & s_ok[..., None]          # (P, Ns, n_var)
             p_idx, t_idx, v_idx = np.where(mask)
             for p, t, v in zip(p_idx, t_idx, v_idx):
                 pair_candidates[p].append({
@@ -9062,6 +9178,7 @@ class ClusteringResult:
                     'axis_dev_deg': float(devs_all[p, t, v]),
                     'kink_angle_deg': float(angle[p, t]),
                     'T_idx': int(t),
+                    'sample_axis_dev_deg': (float(s_dev_all[p, t]) if s_dev_all is not None else None),
                 })
 
         keep_n = None if print_top_n_per_pair == 'all' else max(
@@ -9086,6 +9203,7 @@ class ClusteringResult:
                 'axis_dev_deg': best['axis_dev_deg'],
                 'kink_angle_deg': best['kink_angle_deg'],
                 'best_T_idx': best['T_idx'],
+                'sample_axis_dev_deg': best['sample_axis_dev_deg'],
                 'top_candidates': cands if keep_n is None else cands[:keep_n],
                 'n_matches': len(cands),
             })
@@ -9096,20 +9214,27 @@ class ClusteringResult:
             pairs_results.sort(key=lambda r: (r['cluster_a'], r['cluster_b']))
 
         if print_result:
-            print(f"{len(pairs_results)} pair(s) with at least one kink-axis match "
-                f"(tol_deg={tol_deg}, max_miller_index={max_miller_index})\n")
+            hdr = (f"{len(pairs_results)} pair(s) with at least one kink-axis match "
+                   f"(tol_deg={tol_deg}, max_miller_index={max_miller_index}"
+                   + (f", sample-axis filter {s_tol:.1f} deg" if sa is not None else "") + ")\n")
+            print(hdr)
             for r in pairs_results:
                 print(f"Cluster {r['cluster_a']} ({r['size_a']} px) <-> "
-                    f"{r['cluster_b']} ({r['size_b']} px): {r['n_matches']} match(es)")
-                print(f"  {'uvw':>10} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} {'T_idx':>6}")
-                to_show = r['top_candidates'] if print_top_n_per_pair == 'all' else r['top_candidates'][:print_top_n_per_pair]
+                      f"{r['cluster_b']} ({r['size_b']} px): {r['n_matches']} match(es)")
+                print(f"  {'uvw':>10} {'max|idx|':>9} {'Axis dev':>10} {'Kink angle':>11} "
+                      f"{'S-axis dev':>11} {'T_idx':>6}")
+                to_show = (r['top_candidates'] if print_top_n_per_pair == 'all'
+                           else r['top_candidates'][:print_top_n_per_pair])
                 for c in to_show:
                     max_idx = max(abs(v) for v in c['uvw'])
+                    sd = (f"{c['sample_axis_dev_deg']:>10.2f}°" if c['sample_axis_dev_deg'] is not None
+                          else f"{'--':>11}")
                     print(f"  {str(c['uvw']):>10} {max_idx:>9} {c['axis_dev_deg']:>9.2f}° "
-                        f"{c['kink_angle_deg']:>10.2f}° {c['T_idx']:>6}")
+                          f"{c['kink_angle_deg']:>10.2f}° {sd} {c['T_idx']:>6}")
                 print()
 
-        return pairs_results        
+        return pairs_results
+           
 
     def check_twin_relationship(self, cluster_a, cluster_b, system, mode,
                                 tol_deg=5.0):
@@ -9753,7 +9878,8 @@ class ClusteringResult:
                                             loading_sense='tension',
                                             mode_to_martensite_plane=None,
                                             system='NiTi', phase_A='A', phase_M='M',
-                                            tol_deg=5.0, print_result=True):
+                                            tol_deg=5.0, exact_lattice_vec=False,
+                                            print_result=True):
         """
         Select the most likely martensite correspondence variant and check
         every matched austenite twin against it, ALL IN ONE CALL.
@@ -9817,6 +9943,14 @@ class ClusteringResult:
         tol_deg : float, optional
             Angular tolerance (degrees) for the plane-parallelism check.
             Default 5.0.
+        exact_lattice_vec : bool, optional
+            If True, `lattice_vec` is used AS GIVEN (Miller indices in the
+            labelling of report['parent_mat']) to derive the candidate
+            variants, and the internal homogeneity search is skipped.
+            Use this to pass the parent's <110> lying along the grain's
+            common axis (h_parent). Default False (previous behaviour:
+            `lattice_vec` only names the family; the most homogeneous member
+            is searched anchored on merged_root).
         print_result : bool, optional
 
         Returns
@@ -9873,12 +10007,17 @@ class ClusteringResult:
                     print(f"Warning: report['merged_root'] is None; falling back to closest "
                         f"matched cluster {anchor_cluster_id} as homogeneity anchor.")
 
-            homog_results = self.evaluate_lattice_direction_homogeneity(
-                anchor_cluster_id=anchor_cluster_id, lattice_vec=list(lattice_vec), phase=phase_A,
-                cluster_ids=matched_cluster_ids, units='deg', print_result=False
-            )
-            best = homog_results[0]
-            homogeneous_lattice_vec = best['lattice_vec']
+            if exact_lattice_vec:
+                # use the given direction as is (labelling of parent_mat); no homogeneity search
+                best = None
+                homogeneous_lattice_vec = np.asarray(lattice_vec, dtype=float)
+            else:
+                homog_results = self.evaluate_lattice_direction_homogeneity(
+                    anchor_cluster_id=anchor_cluster_id, lattice_vec=list(lattice_vec), phase=phase_A,
+                    cluster_ids=matched_cluster_ids, units='deg', print_result=False
+                )
+                best = homog_results[0]
+                homogeneous_lattice_vec = best['lattice_vec']
 
             CId = self.data.OR[system]['CId']
             target = np.asarray(target_M_uvw, dtype=float)
@@ -9897,10 +10036,14 @@ class ClusteringResult:
                     candidate_variants.append(i)
 
             if print_result:
-                print(f"Most homogeneous direction: {homogeneous_lattice_vec} "
-                    f"(mean spread {best['mean_spread']:.2f}°)")
+                if best is not None:
+                    print(f"Most homogeneous direction: {homogeneous_lattice_vec} "
+                          f"(mean spread {best['mean_spread']:.2f}°)")
+                else:
+                    print(f"Lattice direction used as given (exact_lattice_vec=True): "
+                          f"{homogeneous_lattice_vec}")
                 print(f"Candidate variants (maps onto <{'{},{},{}'.format(*[int(x) for x in target])}>_M "
-                    f"within tol={candidate_off_target_tol}): {candidate_variants}\n")
+                      f"within tol={candidate_off_target_tol}): {candidate_variants}\n")
 
         if not candidate_variants:
             raise ValueError("candidate_variants is empty -- nothing to select from "
@@ -10259,7 +10402,7 @@ class ClusteringResult:
         return pairs_results, matches
 
     def find_boundary_sharing_kinks(self, boundary_result, merge_groups_all=None, phase=None,
-                                    max_miller_index=2, tol_deg=5.0, min_size=None,
+                                    max_miller_index=2, axes=None, expand_symmetric=True,tol_deg=5.0, min_size=None,
                                     cluster_ids=None, boundary_only=False,
                                     print_result=False, print_top_n=None,
                                     print_top_n_per_pair=3, sort_by='size'):
@@ -10311,7 +10454,7 @@ class ClusteringResult:
             merge_groups_all[phase] = {}
 
         pairs_results = self.map_kink_axes(
-            phase=phase, max_miller_index=max_miller_index, tol_deg=tol_deg,
+            phase=phase, max_miller_index=max_miller_index, axes=axes, expand_symmetric=expand_symmetric, tol_deg=tol_deg,
             min_size=min_size, cluster_ids=cluster_ids, sort_by=sort_by
         )
 
@@ -10737,25 +10880,35 @@ class ClusteringResult:
             return new_result, merge_groups_all, disor_values
         return new_result, merge_groups_all
 
-
     def check_parent_reconstruction(self, parent_mat, merge_groups_all, phase, system, modes,
-                                    axial_dir=None, tol_deg=5.0, disor_values=None,pre_merge_sizes=None,
-                                    sort_by='size',include_kink=True, max_miller_index=2, kink_tol_deg=5.0,
+                                    axial_dir=None, tol_deg=5.0, disor_values=None, pre_merge_sizes=None,
+                                    sort_by='size', include_kink=True, max_miller_index=2,
+                                    kink_axes=None, kink_expand_symmetric=True, kink_tol_deg=5.0,
+                                    kink_sample_axis=None, kink_sample_tol_deg=None,
                                     print_result=True):
         """
-        Combined report for a reconstructed-parent workflow: prints which
-        clusters were merged into the reference orientation (via
-        merge_clusters_to_reference), then runs check_parent_twin_relationships
-        against every REMAINING (non-merged) cluster of the phase --
-        automatically excluding the merged root, since testing whether the
-        parent's own now-merged orientation has a twin relationship to
-        ITSELF is not meaningful (the T-loop can find a spurious
-        small-angle-deviation/large-axis-deviation "near match" there
-        purely by chance -- see check_parent_twin_relationships's notes).
+        Combined report for a reconstructed-parent workflow: identifies the
+        clusters that form the MATRIX (orientation within tol_deg of the
+        reference parent orientation), then runs check_parent_twin_relationships
+        against every REMAINING (non-matrix) cluster of the phase, and -- for
+        clusters without a twin relationship -- check_parent_kink_relationships.
+        Categories are mutually exclusive: Matrix / Twin / Kink / No OR.
 
-        Call this on the ClusteringResult RETURNED BY
-        merge_clusters_to_reference (i.e. self already has the merge
-        applied), passing that same call's merge_groups_all.
+        Call this on the ClusteringResult RETURNED BY merge_clusters_to_reference
+        (i.e. self already has the merge applied), passing that same call's
+        merge_groups_all and (recommended) disor_values.
+
+        Matrix identification:
+          1. Normal case: the merged group from merge_clusters_to_reference with
+             more than one cluster.
+          2. Fallback (UPDATED): if no multi-cluster group exists but one or more
+             clusters lie within tol_deg of parent_mat according to disor_values
+             (true minimum disorientation, full symmetry), these clusters form the
+             matrix group; the largest of them is the matrix root. This covers a
+             single-cluster matrix, which merge_clusters_to_reference does not
+             record as a merged group. Without this fallback such a cluster is
+             tested against the parent (i.e. against itself) and misclassified
+             (typically as a 180 deg "kink").
 
         Parameters
         ----------
@@ -10766,41 +10919,54 @@ class ClusteringResult:
             merge_clusters_to_reference (or merge_clusters_by_orientation).
         phase : str
         system, modes, tol_deg, sort_by : passed to check_parent_twin_relationships.
+            tol_deg is also the matrix threshold used by the fallback.
         axial_dir : array-like (3,), optional
-            If given, Schmid factors are computed and printed (see
-            check_parent_twin_relationships).
+            If given, Schmid factors are computed (see check_parent_twin_relationships).
         disor_values : dict {cluster_id: disorientation_deg}, optional
-            From merge_clusters_to_reference's return_disor_values=True --
-            if given, each merged fragment's disorientation to parent_mat
-            is shown in the merge report. If None, that column is omitted.
+            From merge_clusters_to_reference(..., return_disor_values=True).
+            Shown in the merge report and REQUIRED for the single-cluster
+            matrix fallback.
+        pre_merge_sizes : dict {cluster_id: n_pixels}, optional
+            Pixel counts from the PRE-MERGE ClusteringResult. Needed to report
+            each merged fragment's own pixel count correctly (in self, every
+            fragment's pixels are already relabeled to the merged root). If
+            None, falls back to self.cluster_sizes (fragments other than the
+            root then show 0 px, with a warning).
         include_kink : bool, optional
-        If True (default), run check_parent_kink_relationships ONLY
-        against clusters that did NOT show a twin relationship in
-        twin_results (i.e. cluster categories are mutually exclusive:
-        Matrix / Twin / Kink-only / No match).
-        max_miller_index, kink_tol_deg : passed to check_parent_kink_relationships.
+            If True (default), run check_parent_kink_relationships ONLY on
+            clusters without a twin relationship.
+        max_miller_index : int, optional
+            Passed to check_parent_kink_relationships. Ignored when kink_axes
+            is given.
+        kink_axes : list of array-like (3,), optional
+            Restrict the kink search to these Miller-index directions (uvw),
+            e.g. [(1, 1, 0)].
+        kink_expand_symmetric : bool, optional
+            Default True: each axis in kink_axes is expanded to its full
+            symmetrically-equivalent family. Ignored when kink_axes is None.
+        kink_tol_deg : float, optional
+            Crystal-frame axis tolerance for the kink test.
+        kink_sample_axis : array-like (3,), optional
+            Sample-frame direction (e.g. the grain's common <110>, d_s). If
+            given, a kink is accepted only if its rotation axis lies within
+            kink_sample_tol_deg of this direction in the SAMPLE frame.
+        kink_sample_tol_deg : float, optional
+            Tolerance for the sample-frame kink filter. Default None -> kink_tol_deg.
         print_result : bool, optional
             Default True.
-        pre_merge_sizes : dict {cluster_id: n_pixels}, optional
-        Pixel counts from the PRE-MERGE ClusteringResult (e.g.
-        original_result.cluster_sizes, where original_result is the
-        object merge_clusters_to_reference was called ON, before
-        merging). Needed to correctly report each individual merged
-        FRAGMENT's own pixel count -- self (this method's own object)
-        is the POST-merge result, where every fragment's pixels have
-        already been relabeled to the merged root, so self.cluster_sizes
-        would incorrectly show 0 px for every fragment except the root
-        itself. If None, falls back to self.cluster_sizes (will show
-        0 px for non-root fragments, with a warning).
 
         Returns
         -------
         result : dict
-            'merged_root' : int or None (None if no group was actually merged)
-            'merged_fragments' : list of int
+            'merged_root' : int or None (None if no matrix cluster was found)
+            'merged_fragments' : list of int (clusters forming the matrix)
             'merged_pixels' : int
+            'matrix_source' : 'merged_group' | 'disor_fallback' | None
             'twin_results' : list of dict, from check_parent_twin_relationships,
                 run against every cluster EXCEPT merged_root
+            'kink_results' : list of dict, from check_parent_kink_relationships,
+                run against clusters without a twin relationship
+            'parent_mat' : (3,3) ndarray
         """
         if pre_merge_sizes is not None:
             sizes = pre_merge_sizes
@@ -10809,22 +10975,40 @@ class ClusteringResult:
             merged_groups_check = {r: f for r, f in merge_groups_all[phase].items() if len(f) > 1}
             if merged_groups_check and print_result:
                 print("Warning: no pre_merge_sizes given -- fragment pixel counts below will show "
-                    "0 for every merged fragment except the root (their pixels were already "
-                    "relabeled onto the root in self). Pass pre_merge_sizes=<original_result>."
-                    "cluster_sizes for correct per-fragment counts.\n")
+                      "0 for every merged fragment except the root (their pixels were already "
+                      "relabeled onto the root in self). Pass pre_merge_sizes=<original_result>."
+                      "cluster_sizes for correct per-fragment counts.\n")
 
-        merged_groups = {r: frags for r, frags in merge_groups_all[phase].items() if len(frags) > 1}
+        # ---- matrix group -----------------------------------------------------
+        # 1) normal case: a merged group with more than one cluster
+        merged_groups = {r: frags for r, frags in merge_groups_all.get(phase, {}).items()
+                         if len(frags) > 1}
+        matrix_source = 'merged_group' if merged_groups else None
+
+        # 2) fallback: no multi-cluster group, but clusters within tol_deg of the parent
+        #    (e.g. a single-cluster matrix) -- built directly from disor_values
+        if not merged_groups and disor_values is not None:
+            within = [c for c, d in disor_values.items()
+                      if d is not None and np.isfinite(d) and d < tol_deg
+                      and c in self.avg_orientations]
+            if within:
+                root = max(within, key=lambda c: sizes.get(c, 0))
+                merged_groups = {root: sorted(within, key=lambda c: -sizes.get(c, 0))}
+                matrix_source = 'disor_fallback'
 
         merged_root = None
         merged_fragments = []
         if merged_groups:
             if len(merged_groups) > 1:
                 print(f"Warning: expected at most one merged group, found {len(merged_groups)}: "
-                    f"{merged_groups}. Using the first.")
+                      f"{merged_groups}. Using the first.")
             merged_root, merged_fragments = next(iter(merged_groups.items()))
+            merged_fragments = list(merged_fragments)
 
             if print_result:
-                print(f"Clusters merged with reference parent orientation (root cluster {merged_root}):")
+                src = " (single-cluster/fallback matrix)" if matrix_source == 'disor_fallback' else ""
+                print(f"Clusters forming the matrix with the reference parent orientation "
+                      f"(root cluster {merged_root}){src}:")
                 if disor_values is not None:
                     print(f"{'Cluster':>10} {'Px':>8} {'Disorientation to parent_mat':>30}")
                     print("-" * 50)
@@ -10841,19 +11025,21 @@ class ClusteringResult:
 
                 total_merged_px = sum(sizes.get(c, 0) for c in merged_fragments)
                 print(f"\nTotal: {len(merged_fragments)} clusters, {total_merged_px} px "
-                    f"merged into cluster {merged_root}\n")
+                      f"in the matrix (root cluster {merged_root})\n")
         elif print_result:
-            print("No clusters were merged with the reference orientation.\n")
+            print("No cluster lies within tol_deg of the reference orientation -- no matrix.\n")
 
-        remaining_candidates = None
-        if merged_root is not None:
-            remaining_candidates = [c for c in self.labels_by_phase[phase] if c != merged_root]
+        # ---- clusters to classify: everything except the matrix ------------------
+        matrix_set = set(merged_fragments) | ({merged_root} if merged_root is not None else set())
+        remaining_candidates = [c for c in self.labels_by_phase[phase]
+                                if c not in matrix_set and c in self.avg_orientations]
 
         twin_results = self.check_parent_twin_relationships(
             parent_mat=parent_mat, phase=phase, system=system, modes=modes,
             axial_dir=axial_dir, tol_deg=tol_deg, sort_by=sort_by,
             cluster_ids=remaining_candidates, print_result=print_result
         )
+
         kink_results = []
         if include_kink:
             no_twin_match = [r['cluster_b'] for r in twin_results if not r['is_match']]
@@ -10862,16 +11048,20 @@ class ClusteringResult:
                     print()  # spacer before the kink table
                 kink_results = self.check_parent_kink_relationships(
                     parent_mat=parent_mat, phase=phase, cluster_ids=no_twin_match,
-                    max_miller_index=max_miller_index, tol_deg=kink_tol_deg, print_result=print_result
+                    max_miller_index=max_miller_index, axes=kink_axes,
+                    expand_symmetric=kink_expand_symmetric, tol_deg=kink_tol_deg,
+                    sample_axis=kink_sample_axis, sample_tol_deg=kink_sample_tol_deg,
+                    print_result=print_result
                 )
 
         return {
             'merged_root': merged_root,
             'merged_fragments': merged_fragments,
             'merged_pixels': sum(sizes.get(c, 0) for c in merged_fragments) if merged_fragments else 0,
+            'matrix_source': matrix_source,
             'twin_results': twin_results,
             'kink_results': kink_results,
-            'parent_mat': parent_mat,   # <-- ADD
+            'parent_mat': parent_mat,
         }
 
     def plot_parent_reconstruction_summary(self, check_result, phase, result_full=None,
@@ -12425,101 +12615,133 @@ class ClusteringResult:
     # ============================================================================
     # RECONSTRUCTION OF PARENT GRAIN ORIENTATION FROM SUBGRAINS
     # ============================================================================
+    def axis_deviation_deg(self, orientation, sample_axis, phase, lattice_vec=(1, 1, 0)):
+        """
+        Angle [deg] between a SAMPLE-frame direction and the nearest member of
+        the <lattice_vec> family of a crystal orientation.
+
+        Branch-independent: the whole symmetric family is tested and the sign
+        is ignored. 0 deg = the crystal has a <lattice_vec> exactly along
+        sample_axis.
+
+        Parameters
+        ----------
+        orientation : int or (3,3) ndarray
+            Cluster id (its average orientation is used) or an orientation
+            matrix G (sample -> crystal), e.g. a reconstructed parent.
+        sample_axis : array-like (3,)
+            Direction in the sample frame (e.g. the grain's common axis d_s).
+        phase : str
+        lattice_vec : array-like (3,), optional
+            Miller indices of the direction family. Default (1, 1, 0).
+
+        Returns
+        -------
+        float
+        """
+        if isinstance(orientation, (int, np.integer)):
+            G = self.avg_orientations[orientation]
+        else:
+            G = np.asarray(orientation, dtype=float)
+
+        key = (phase, tuple(np.round(np.asarray(lattice_vec, float), 6)))
+        cache = self.__dict__.setdefault('_family_cache', {})
+        fam = cache.get(key)
+        if fam is None:
+            symops = np.array(self.data.phases[phase]['symops'])
+            sp = symops[np.array([np.linalg.det(s) for s in symops]) > 0]
+            L = np.asarray(self.data.phases[phase]['L'])
+            v = L @ np.asarray(lattice_vec, dtype=float)
+            v = v / np.linalg.norm(v)
+            fam = np.unique(np.round(sp @ v, 6), axis=0)
+            fam = fam / np.linalg.norm(fam, axis=1, keepdims=True)
+            cache[key] = fam
+
+        d = np.asarray(sample_axis, dtype=float).ravel()
+        d = d / np.linalg.norm(d)
+        cos_max = np.abs(fam @ (G @ d)).max()
+        return float(np.degrees(np.arccos(np.clip(cos_max, -1.0, 1.0))))
     def reconstruct_parent_orientation_directed(self, phase, axial_dir, matches=None, kink_results=None,
-                                                root_cluster_id=None, sf_epsilon=1e-9, print_result=True):
+                                                root_cluster_id=None, sf_epsilon=1e-9,
+                                                reach_rel_tol=0.05, sample_axis=None,
+                                                sample_axis_tol_deg=10.0, min_sf_for_direction=None,
+                                                print_result=True):
         """
         Directed version of reconstruct_parent_orientation: TWIN edges are
         oriented parent -> child using each edge's OWN Schmid factor sign
         (the side with the HIGHER Schmid factor, under the given axial_dir,
         is treated as the mechanically-favored, twin-nucleating "parent"
         side for that specific event; propagation is only allowed in that
-        direction). KINK edges remain UNDIRECTED (bidirectional) -- a
-        proper Schmid factor needs a plane normal AND a shear direction,
-        but map_kink_axes only ever identifies a rotation axis, not a full
-        slip-system pair, so kink edges provide connectivity only, no
-        parent/child claim.
+        direction). KINK edges remain UNDIRECTED (bidirectional) -- kink
+        edges provide connectivity only, no parent/child claim.
 
-        This can leave nodes UNREACHABLE that reconstruct_parent_orientation
-        (undirected) would have reached, if the only path to them requires
-        walking against a directed twin edge -- this is a meaningful
-        diagnostic (a genuine directionality conflict or an incomplete
-        network), not a bug.
+        Root selection (UPDATED):
+          1. Source candidates = nodes with NO incoming directed twin edge,
+             each scored by the pixel weight reachable from it (directed
+             twin + undirected kink edges).
+          2. All sources whose reachable weight is within reach_rel_tol
+             (relative) of the best one are treated as TIED. This prevents
+             a tiny source that is disconnected from the kink network (e.g.
+             an off-axis cluster with only outgoing twin edges) from winning
+             merely by adding its own few pixels to an otherwise identical
+             reachable set.
+          3. Among tied sources, preference is given to clusters that share
+             the grain's common <110> axis (if sample_axis is given: some
+             <110> of the cluster within sample_axis_tol_deg of sample_axis
+             in the SAMPLE frame), then to the LARGEST own pixel count.
+          If no pure source exists (directed cycle), the same ranking is
+          applied to the nodes with the fewest incoming twin edges.
+          root_cluster_id, if given, overrides all of the above.
 
-        Root selection: among nodes with NO incoming directed twin edge
-        (i.e. never the SF-unfavorable side of any twin relationship --
-        "source" candidates), the one whose reachable subtree (via directed
-        twin + undirected kink edges) covers the most total pixel weight is
-        chosen, unless root_cluster_id is given explicitly (in which case,
-        if it is NOT itself a source, a warning is printed -- using a
-        node identified as someone else's twin "child" as root is a red
-        flag, not necessarily wrong, but worth knowing).
-
-        If NO node qualifies as a pure source (the SF-directed twin graph
-        contains a directed cycle -- possible since each edge's direction
-        is set independently, pairwise, with no guarantee the result is
-        globally acyclic), root selection falls back to the node with the
-        FEWEST incoming directed twin edges, tie-broken by largest
-        reachable pixel weight, rather than raising -- important for
-        unattended batch processing over many grains. This fallback is
-        reported both via a printed warning and the returned
-        'used_cycle_fallback' flag, so affected grains can be reviewed.
-
-        UNVALIDATED, same caveat as reconstruct_parent_orientation, with
-        additional untested assumptions here: the sign/convention of your
-        axial_dir and Schmid factor formula, the choice to leave kink edges
-        undirected, and the tie-break/negative-negative handling below.
+        Weak-directionality twin edges (optional): if min_sf_for_direction
+        is given and max(|sf_A|, |sf_B|) < min_sf_for_direction for a twin
+        edge, the Schmid-factor comparison is considered noise-dominated and
+        the edge is treated as UNDIRECTED (ideal twin operator still used
+        for propagation, but it does not make either side a "child").
 
         Parameters
         ----------
         phase : str
         axial_dir : array-like (3,)
-            SAMPLE-frame loading direction (e.g. [0,0,1]), used to compute
-            each twin edge's Schmid factor on both sides via the SAME
-            formulas validated earlier: sf_A = (G_A.axial_dir).n1 *
-            (G_A.axial_dir).a1 (cluster_a, untransformed n1/a1); sf_B =
-            (T.(G_B.axial_dir)).n1 * (T.(G_B.axial_dir)).a1 (cluster_b, T
-            applied to axial_dir per the current T@M_fwd convention).
+            SAMPLE-frame loading direction (e.g. [0,0,1]). Schmid factors:
+            sf_A = (G_A.axial_dir).n1 * (G_A.axial_dir).a1;
+            sf_B = (T.(G_B.axial_dir)).n1 * (T.(G_B.axial_dir)).a1.
         matches : list of dict, optional
-            From map_twin_relationships. Must have 'cluster_a', 'cluster_b',
-            'T', 'twin_elements' (with 'n1_a'/'a1_a').
+            From map_twin_relationships ('cluster_a', 'cluster_b', 'T',
+            'best_condition', 'shear_angle_deg', 'twin_elements').
         kink_results : list of dict, optional
             From map_kink_axes. Only 'cluster_a'/'cluster_b' needed.
         root_cluster_id : int, optional
-            Override automatic source selection.
+            Override automatic root selection.
         sf_epsilon : float, optional
-            If |sf_A - sf_B| < sf_epsilon for a twin edge (near-exact tie,
-            essentially never happens with real float data but guarded
-            anyway), falls back to the larger-pixel-count cluster as the
-            parent side for that edge, and flags it in 'edges'.
+            Near-exact SF tie on an edge -> larger cluster is the parent side.
+        reach_rel_tol : float, optional
+            Relative tolerance for treating source reachable weights as tied.
+            Default 0.05 (5 %). Set 0.0 to recover the previous behaviour
+            (strict maximum reachable weight).
+        sample_axis : array-like (3,), optional
+            Common <110> of the grain in the SAMPLE frame (d_s). If given,
+            tied sources lying on this axis are preferred. Default None.
+        sample_axis_tol_deg : float, optional
+            Tolerance for the on-axis test. Default 10.0.
+        min_sf_for_direction : float, optional
+            If given, twin edges with max(|sf_A|, |sf_B|) below this value
+            are treated as undirected. Default None (all twin edges directed).
         print_result : bool, optional
 
         Returns
         -------
         result : dict
-            Same fields as reconstruct_parent_orientation, plus:
+            'parent_mat', 'parent_quat', 'root_cluster_id',
+            'n_nodes_total', 'n_nodes_reconstructed',
+            'pixels_reconstructed', 'pixels_total', 'per_node', 'edges',
             'source_candidates' : list of (cluster_id, reachable_pixel_weight),
-                sorted descending -- every node with no incoming directed
-                twin edge, and how much pixel weight it can reach. More
-                than one entry with substantial weight indicates the
-                network does not collapse to a single consistent source.
-                EMPTY if the twin graph contains a directed cycle (see
-                'used_cycle_fallback').
-            'used_cycle_fallback' : bool -- True if root selection had to
-                fall back to the least-incoming-edges node because no pure
-                source existed (directed cycle in the SF-directed twin
-                graph); False if root_cluster_id was given explicitly or a
-                genuine source was found.
-            'edges' : list of dict, each {'cluster_a', 'cluster_b', 'type',
-                'direction' ('a_to_b'/'b_to_a'/'undirected'), 'sf_parent',
-                'sf_child' (twin edges only; None for kink), 'parent_sf_positive'
-                (bool, twin edges only -- False flags a weak/questionable
-                directionality call, both sides mechanically unfavorable),
-                'tie_broken_by_size' (bool)}
-            'unreachable_due_to_directionality' : list of int, nodes in the
-                SAME connected component as root (reachable if edges were
-                undirected) but unreachable given the direction constraints
-            'unreachable_clusters' : list of int, nodes not in root's
-                connected component at all (same meaning as before)
+                sorted by the root-selection ranking (best first),
+            'root_selection' : dict with 'n_tied', 'tied' (list of dict:
+                cluster_id, reach, size, on_axis), 'reach_rel_tol',
+                'sample_axis_used' (bool), 'root_on_axis' (bool or None),
+            'unreachable_due_to_directionality', 'unreachable_clusters',
+            'used_cycle_fallback' : bool
         """
         from scipy.spatial.transform import Rotation as _R
         import collections
@@ -12528,11 +12750,33 @@ class ClusteringResult:
         axial_dir = np.asarray(axial_dir, dtype=float)
         axial_dir = axial_dir / np.linalg.norm(axial_dir)
 
+        # ---- on-axis test (sample frame, branch-independent) -----------------
+        if sample_axis is not None:
+            _sa = np.asarray(sample_axis, dtype=float).ravel()
+            _sa = _sa / np.linalg.norm(_sa)
+            _symops = np.array(self.data.phases[phase]['symops'])
+            _sp = _symops[np.array([np.linalg.det(s) for s in _symops]) > 0]
+            _L = np.asarray(self.data.phases[phase]['L'])
+            _v = _L @ np.array([1.0, 1.0, 0.0]); _v = _v / np.linalg.norm(_v)
+            _fam110 = np.unique(np.round(_sp @ _v, 6), axis=0)
+            _cos_tol = np.cos(np.radians(sample_axis_tol_deg))
+
+            def _on_axis(cid):
+                return sample_axis is None or self.axis_deviation_deg(cid, sample_axis, phase) < sample_axis_tol_deg
+            #def _on_axis(cid):
+            #    G = self.avg_orientations.get(cid)
+            #    if G is None:
+            #        return False
+            #    return bool(np.abs(_fam110 @ (G @ _sa)).max() > _cos_tol)
+        else:
+            def _on_axis(cid):
+                return True
+
         edges_info = []   # for reporting
-        directed_adj = collections.defaultdict(list)   # parent -> [(child, O_forward, edge_info)]
+        directed_adj = collections.defaultdict(list)    # parent -> [(child, O_parent_to_child)]
         undirected_adj = collections.defaultdict(list)  # both directions -> [(other, O_forward, 'forward'/'backward')]
         all_nodes = set()
-        incoming_twin = collections.defaultdict(int)  # cluster_id -> count of incoming directed twin edges
+        incoming_twin = collections.defaultdict(int)    # cluster_id -> count of incoming directed twin edges
 
         for m in (matches or []):
             A, B = m['cluster_a'], m['cluster_b']
@@ -12556,6 +12800,18 @@ class ClusteringResult:
             sf_A = axial_A.dot(n1) * axial_A.dot(a1)
             sf_B = axial_B.dot(n1) * axial_B.dot(a1)
 
+            # weak directionality -> undirected twin edge (optional)
+            if min_sf_for_direction is not None and max(abs(sf_A), abs(sf_B)) < min_sf_for_direction:
+                undirected_adj[A].append((B, O_forward, 'forward'))
+                undirected_adj[B].append((A, O_forward, 'backward'))
+                edges_info.append({
+                    'cluster_a': A, 'cluster_b': B, 'type': 'twin',
+                    'direction': 'undirected', 'sf_parent': sf_A, 'sf_child': sf_B,
+                    'parent_sf_positive': None, 'tie_broken_by_size': False,
+                    'weak_sf_undirected': True,
+                })
+                continue
+
             tie_broken = False
             if abs(sf_A - sf_B) < sf_epsilon:
                 tie_broken = True
@@ -12575,6 +12831,7 @@ class ClusteringResult:
                 'cluster_a': A, 'cluster_b': B, 'type': 'twin',
                 'direction': direction, 'sf_parent': sf_parent, 'sf_child': sf_child,
                 'parent_sf_positive': bool(sf_parent > 0), 'tie_broken_by_size': tie_broken,
+                'weak_sf_undirected': False,
             })
 
         for m in (kink_results or []):
@@ -12589,13 +12846,14 @@ class ClusteringResult:
                 'cluster_a': A, 'cluster_b': B, 'type': 'kink',
                 'direction': 'undirected', 'sf_parent': None, 'sf_child': None,
                 'parent_sf_positive': None, 'tie_broken_by_size': False,
+                'weak_sf_undirected': False,
             })
 
         if not all_nodes:
             raise ValueError("No edges: matches and kink_results are both empty/None.")
 
         # ---- combined adjacency for traversal: directed twin (one way only)
-        #      + undirected kink (both ways) ----
+        #      + undirected kink / weak-twin (both ways) ----
         def _reachable_weight(start):
             seen = {start}
             queue = collections.deque([start])
@@ -12609,44 +12867,74 @@ class ClusteringResult:
                         seen.add(nbr); queue.append(nbr)
             return seen, sum(sizes.get(n, 0) for n in seen)
 
+        def _rank_ini(candidates):
+            """candidates: list of (node, reach). Returns (ranked list, tied info list)."""
+            if not candidates:
+                return [], []
+            w_max = max(w for _, w in candidates)
+            thr = (1.0 - reach_rel_tol) * w_max
+            tied = [(n, w) for n, w in candidates if w >= thr]
+            rest = [(n, w) for n, w in candidates if w < thr]
+            tied.sort(key=lambda nw: (not _on_axis(nw[0]), -sizes.get(nw[0], 0), -nw[1]))
+            rest.sort(key=lambda nw: -nw[1])
+            info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)),
+                     'on_axis': (_on_axis(n) if sample_axis is not None else None)} for n, w in tied]
+            return tied + rest, info
+        def _rank(candidates):
+            if not candidates:
+                return [], []
+            w_max = max(w for _, w in candidates)
+            thr = (1.0 - reach_rel_tol) * w_max
+            tied = [(n, w) for n, w in candidates if w >= thr]
+            if sample_axis is not None and not any(_on_axis(n) for n, _ in tied):
+                on = [(n, w) for n, w in candidates if _on_axis(n)]           # any on-axis source
+                if not on:                                                    # none: largest on-axis node
+                    on = [(n, _reachable_weight(n)[1]) for n in all_nodes if _on_axis(n)]
+                if on:
+                    tied = on
+            rest = [(n, w) for n, w in candidates if (n, w) not in tied]
+            tied.sort(key=lambda nw: (not _on_axis(nw[0]), -sizes.get(nw[0], 0), -nw[1]))
+            rest.sort(key=lambda nw: -nw[1])
+            info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)),
+                     'on_axis': (_on_axis(n) if sample_axis is not None else None)} for n, w in tied]
+            return tied + rest, info
+        
         sources = [n for n in all_nodes if incoming_twin.get(n, 0) == 0]
-        source_candidates = []
-        for s in sources:
-            _, w = _reachable_weight(s)
-            source_candidates.append((s, w))
-        source_candidates.sort(key=lambda kv: -kv[1])
+        source_candidates = [(s, _reachable_weight(s)[1]) for s in sources]
+        source_candidates, tied_info = _rank(source_candidates)
+        
 
+        used_cycle_fallback = False
         if root_cluster_id is None:
             if not source_candidates:
-                # No genuine source exists -- the SF-directed twin graph
-                # contains a cycle (locally-correct pairwise directions that
-                # don't reduce to a global DAG for this grain). Fall back to
-                # the node with the FEWEST incoming directed twin edges
-                # (least "child-like"), tie-broken by largest reachable
-                # pixel weight, rather than failing outright.
+                # No genuine source (directed cycle). Fall back to the nodes with
+                # the FEWEST incoming twin edges, ranked the same way.
                 min_incoming = min(incoming_twin.get(n, 0) for n in all_nodes)
                 fallback_candidates = [n for n in all_nodes if incoming_twin.get(n, 0) == min_incoming]
-                fallback_scored = []
-                for n in fallback_candidates:
-                    _, w = _reachable_weight(n)
-                    fallback_scored.append((n, w))
-                fallback_scored.sort(key=lambda kv: -kv[1])
+                fallback_scored = [(n, _reachable_weight(n)[1]) for n in fallback_candidates]
+                fallback_scored, tied_info = _rank(fallback_scored)
                 root_cluster_id = fallback_scored[0][0]
                 used_cycle_fallback = True
                 print(f"Warning: twin network contains a directed cycle (no pure source found); "
-                        f"falling back to cluster {root_cluster_id} ({min_incoming} incoming edge(s), "
-                        f"best reachable weight) as root.")
+                      f"falling back to cluster {root_cluster_id} ({min_incoming} incoming edge(s)) as root.")
             else:
                 root_cluster_id = source_candidates[0][0]
-                used_cycle_fallback = False
         else:
-            used_cycle_fallback = False
             if incoming_twin.get(root_cluster_id, 0) > 0:
                 print(f"Warning: root_cluster_id {root_cluster_id} has {incoming_twin[root_cluster_id]} "
-                        f"incoming directed twin edge(s) -- it is identified as the SF-unfavorable "
-                        f"(child) side of at least one twin relationship. Using it as root anyway.")
+                      f"incoming directed twin edge(s) -- it is identified as the SF-unfavorable "
+                      f"(child) side of at least one twin relationship. Using it as root anyway.")
 
-        # ---- BFS from root, directed twin (forward only) + undirected kink ----
+        root_selection = {
+            'n_tied': len(tied_info), 'tied': tied_info, 'reach_rel_tol': reach_rel_tol,
+            'sample_axis_used': sample_axis is not None,
+            'root_on_axis': (_on_axis(root_cluster_id) if sample_axis is not None else None),
+        }
+        if sample_axis is not None and not root_selection['root_on_axis'] and print_result:
+            print(f"Warning: root cluster {root_cluster_id} does not lie on the common axis "
+                  f"(no on-axis source among the tied candidates).")
+
+        # ---- BFS from root, directed twin (forward only) + undirected edges ----
         Acc = {root_cluster_id: np.eye(3)}
         path_length = {root_cluster_id: 0}
         queue = collections.deque([root_cluster_id])
@@ -12665,10 +12953,8 @@ class ClusteringResult:
                 path_length[nbr] = path_length[cur] + 1
                 queue.append(nbr)
 
-        full_reach, _ = _reachable_weight(root_cluster_id)  # same set as Acc.keys(), sanity
-        all_reachable_undirected = set()  # nodes reachable if ALL edges were undirected
+        all_reachable_undirected = {root_cluster_id}
         queue = collections.deque([root_cluster_id])
-        all_reachable_undirected.add(root_cluster_id)
         full_undirected_adj = collections.defaultdict(set)
         for e in edges_info:
             full_undirected_adj[e['cluster_a']].add(e['cluster_b'])
@@ -12717,6 +13003,7 @@ class ClusteringResult:
             'pixels_reconstructed': total_px, 'pixels_total': pixels_total,
             'per_node': per_node, 'edges': edges_info,
             'source_candidates': source_candidates,
+            'root_selection': root_selection,
             'unreachable_due_to_directionality': unreachable_due_to_direction,
             'unreachable_clusters': unreachable_clusters,
             'used_cycle_fallback': used_cycle_fallback,
@@ -12724,31 +13011,38 @@ class ClusteringResult:
 
         if print_result:
             print(f"Directed parent orientation reconstruction, phase '{phase}'")
-            print(f"  Source candidates (no incoming twin edge): "
-                + ", ".join(f"{c} (w={w})" for c, w in source_candidates[:5])
-                + (" ..." if len(source_candidates) > 5 else ""))
-            print(f"  Root cluster: {root_cluster_id} ({sizes.get(root_cluster_id, 0)} px)")
+            print(f"  Source candidates (ranked): "
+                  + ", ".join(f"{c} (w={w})" for c, w in source_candidates[:5])
+                  + (" ..." if len(source_candidates) > 5 else ""))
+            print(f"  {root_selection['n_tied']} source(s) tied within {100*reach_rel_tol:.0f} % of best reach")
+            print(f"  Root cluster: {root_cluster_id} ({sizes.get(root_cluster_id, 0)} px"
+                  + (f", on common axis: {root_selection['root_on_axis']}" if sample_axis is not None else "")
+                  + ")")
             print(f"  Nodes: {len(Acc)} reconstructed / {len(all_nodes)} total")
             if unreachable_due_to_direction:
                 print(f"  {len(unreachable_due_to_direction)} node(s) unreachable due to "
-                    f"DIRECTIONALITY constraints: {unreachable_due_to_direction}")
+                      f"DIRECTIONALITY constraints: {unreachable_due_to_direction}")
             if unreachable_clusters:
                 print(f"  {len(unreachable_clusters)} node(s) unreachable (disconnected): {unreachable_clusters}")
             print(f"  Pixels: {total_px} reconstructed / {pixels_total} total "
-                f"({100*total_px/pixels_total:.1f}%)")
+                  f"({100*total_px/pixels_total:.1f}%)")
             print(f"\n  Parent quaternion: {q_mean}")
             devs = [v['deviation_from_mean_deg'] for v in per_node.values()]
             print(f"  Per-node deviation from consensus: mean={np.mean(devs):.2f} deg, "
-                f"max={np.max(devs):.2f} deg")
+                  f"max={np.max(devs):.2f} deg")
             weak = [e for e in edges_info if e['type'] == 'twin' and e['parent_sf_positive'] is False]
             if weak:
                 print(f"\n  {len(weak)} twin edge(s) with a NEGATIVE parent-side Schmid factor "
-                    f"(both sides mechanically unfavorable under axial_dir -- weak directionality):")
+                      f"(both sides mechanically unfavorable under axial_dir -- weak directionality):")
                 for e in weak:
                     print(f"    {e['cluster_a']}<->{e['cluster_b']}: dir={e['direction']}, "
-                        f"sf_parent={e['sf_parent']:.3f}, sf_child={e['sf_child']:.3f}")
+                          f"sf_parent={e['sf_parent']:.3f}, sf_child={e['sf_child']:.3f}")
+            n_weak_und = sum(1 for e in edges_info if e.get('weak_sf_undirected'))
+            if n_weak_und:
+                print(f"  {n_weak_und} twin edge(s) treated as UNDIRECTED "
+                      f"(max |SF| < {min_sf_for_direction}).")
 
-        return result    
+        return result
 
     def reconstruct_parent_orientation(self, phase, matches=None, kink_results=None,
                                         root_cluster_id=None, print_result=True):
@@ -12982,7 +13276,118 @@ class ClusteringResult:
         return np.array([self.data.X[idxs].mean(), self.data.Y[idxs].mean()])
 
 
+    def refine_parent_orientation(self, parent_mat, phase, threshold_deg=5.0, min_size='recipe',
+                                  max_iter=20, print_result=False):
+        """
+        Move a reconstructed parent orientation to the centre of the dominant
+        orientation group ("matrix mode"): iteratively take all clusters whose
+        true minimum disorientation to the current parent is < threshold_deg,
+        replace the parent by their pixel-weighted mean orientation (each
+        cluster brought to the symmetric equivalent closest to the parent),
+        and repeat until the member set no longer changes.
 
+        Makes the matrix definition independent of which single cluster was
+        chosen as root by reconstruct_parent_orientation_directed, in grains
+        whose matrix is internally rotated by several degrees.
+
+        Parameters
+        ----------
+        parent_mat : (3,3) ndarray
+            Starting parent orientation (sample -> crystal), e.g.
+            reconstruct_parent_orientation_directed(...)['parent_mat'].
+        phase : str
+        threshold_deg : float, optional
+            Membership threshold (same as the merge threshold). Default 5.0.
+        min_size : int, 'recipe' or None, optional
+            Minimum cluster size considered. Default 'recipe'.
+        max_iter : int, optional
+        print_result : bool, optional
+
+        Returns
+        -------
+        result : dict
+            'parent_mat' : refined parent (3,3)
+            'parent_mat_initial' : input parent (3,3)
+            'members' : list of cluster ids in the final matrix group
+            'member_pixels' : int
+            'shift_deg' : disorientation between initial and refined parent
+            'n_iter' : int
+            'converged' : bool
+            'history' : list of (n_members, member_pixels, step_deg) per iteration
+        """
+        if min_size == 'recipe':
+            min_size = self.get_recipe_min_size(phase)
+
+        symops = np.array(self.data.phases[phase]['symops'])
+        sp = symops[np.array([np.linalg.det(s) for s in symops]) > 0]
+        sizes = self.cluster_sizes
+
+        ids = [c for c in self.labels_by_phase[phase]
+               if c in self.avg_orientations and (min_size is None or sizes.get(c, 0) >= min_size)]
+
+        def _closest_equivalent(G, P):
+            cand = np.einsum('sij,jk->sik', sp, G)                          # S @ G
+            tr = np.einsum('sij,ij->s', cand, P)                             # trace(S G P^T)
+            ang = np.degrees(np.arccos(np.clip((tr - 1.0) / 2.0, -1.0, 1.0)))
+            k = int(np.argmin(ang))
+            return cand[k], float(ang[k])
+
+        def _disor(A, B):
+            return _closest_equivalent(A, B)[1]
+
+        P0 = np.asarray(parent_mat, dtype=float)
+        P = P0.copy()
+        prev_members = None
+        history = []
+        converged = False
+        n_iter = 0
+
+        for n_iter in range(1, max_iter + 1):
+            members, quats, weights = [], [], []
+            for cid in ids:
+                Gc, ang = _closest_equivalent(self.avg_orientations[cid], P)
+                if ang < threshold_deg:
+                    members.append(cid)
+                    quats.append(mat_to_quat(Gc))
+                    weights.append(sizes.get(cid, 0))
+            if not members:
+                history.append((0, 0, 0.0))
+                break
+
+            q_ref = mat_to_quat(P)
+            quats = np.array([q if q.dot(q_ref) >= 0 else -q for q in quats])
+            q_mean = (np.asarray(weights, float)[:, None] * quats).sum(axis=0)
+            q_mean /= np.linalg.norm(q_mean)
+            P_new = quat_to_mat(q_mean)
+
+            step = _disor(P_new, P)
+            history.append((len(members), int(sum(weights)), step))
+            P = P_new
+
+            if prev_members is not None and set(members) == set(prev_members):
+                converged = True
+                break
+            prev_members = members
+
+        # final membership with the final parent
+        final_members = [cid for cid in ids
+                         if _closest_equivalent(self.avg_orientations[cid], P)[1] < threshold_deg]
+
+        result = {
+            'parent_mat': P,
+            'parent_mat_initial': P0,
+            'members': sorted(final_members),
+            'member_pixels': int(sum(sizes.get(c, 0) for c in final_members)),
+            'shift_deg': _disor(P, P0),
+            'n_iter': n_iter,
+            'converged': converged,
+            'history': history,
+        }
+        if print_result:
+            print(f"refine_parent_orientation: {len(final_members)} matrix clusters, "
+                  f"{result['member_pixels']} px, shift {result['shift_deg']:.2f} deg, "
+                  f"{n_iter} iter, converged={converged}")
+        return result
     def plot_parent_reconstruction_network(self, result, ax=None, fig=None, figsize=(9, 8),
                                             cmap=None, node_scale=3.0, return_val=False):
         """
@@ -13292,7 +13697,8 @@ class ClusteringResult:
 
         return results
     def check_parent_kink_relationships(self, parent_mat, phase, cluster_ids, max_miller_index=2,
-                                        tol_deg=5.0, print_result=True):
+                                        axes=None, expand_symmetric=True,
+                                        tol_deg=5.0, sample_axis=None, sample_tol_deg=None,print_result=True):
         """
         BLIND kink-axis search between a HYPOTHESIZED PARENT orientation
         and a set of real clusters (parent_mat as cluster_a, each real
@@ -13310,7 +13716,7 @@ class ClusteringResult:
         cluster_ids : list of int
             Which real clusters to check (typically the ones that failed
             check_parent_twin_relationships).
-        max_miller_index, tol_deg : as in identify_kink_axis.
+        max_miller_index, axes, expand_symmetric, tol_deg : as in identify_kink_axis.
         print_result : bool, optional
 
         Returns
@@ -13340,6 +13746,8 @@ class ClusteringResult:
                 if cid not in self.avg_orientations or cid == sentinel:
                     continue
                 r = self.identify_kink_axis(sentinel, cid, phase, max_miller_index=max_miller_index,
+                                            axes=axes, expand_symmetric=expand_symmetric,
+                                            sample_axis=sample_axis, sample_tol_deg=sample_tol_deg,
                                             tol_deg=tol_deg, print_result=False)
                 r['cluster_b'] = cid
                 r['n_pixels'] = int(self.cluster_sizes.get(cid, 0))
