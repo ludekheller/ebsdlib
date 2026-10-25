@@ -281,6 +281,28 @@ def save_checkpoint(path, *, clustering_result, boundary_result=None, hierarchy=
     print(f"checkpoint saved -> {path}")
 
 
+def _remap_renamed_scan(recipe):
+    """If recipe['filename'] no longer exists (scan renamed, old file moved to _old/),
+    replace it by the new name listed in <scan folder>/rename_map.csv (columns old,new)."""
+    import csv
+    fn = recipe.get('filename') if isinstance(recipe, dict) else None
+    if not fn or os.path.exists(fn):
+        return recipe
+    d, base = os.path.split(fn)
+    mp = os.path.join(d, 'rename_map.csv')
+    if os.path.exists(mp):
+        with open(mp, newline='') as fh:
+            for row in csv.DictReader(fh):
+                if row.get('old') == base and os.path.exists(os.path.join(d, row['new'])):
+                    recipe['filename'] = os.path.join(d, row['new'])
+                    print(f"load_checkpoint: scan renamed, using {row['new']} (was {base})")
+                    return recipe
+    if os.path.exists(os.path.join(d, '_old', base)):
+        recipe['filename'] = os.path.join(d, '_old', base)
+        print(f"load_checkpoint: using {os.path.join('_old', base)}")
+    return recipe
+
+
 def load_checkpoint(path, dataEBSD=None):
     """
     Restore the pipeline from an HDF5 checkpoint written by save_checkpoint.
@@ -358,6 +380,7 @@ def load_checkpoint(path, dataEBSD=None):
         if f.attrs.get('format') != _FMT:
             raise ValueError("not an EBSD-HP checkpoint file")
         recipe = _recipe_get(f['recipe'])
+        _remap_renamed_scan(recipe)
         g = f['pickled']
         blobs = {k: _load_blob(g, k) for k in g.keys()}
 
@@ -8388,7 +8411,7 @@ class ClusteringResult:
         a crystallographically MEANINGLESS coincidence that happens to beat
         a real, physically meaningful match on raw axis-alignment tightness
         alone -- confirmed on real data: for one grain pair with a known
-        genuine ~42 deg K2_shear twin relationship (axis_dev~2.9 deg), the
+        genuine ~42 deg shearplane_rot twin relationship (axis_dev~2.9 deg), the
         single-best search instead returned an unrelated match at
         axis_dev~1.1 deg but angle~138 deg, silently burying the real one.
         For this reason, ALL (T, variant) combinations satisfying tol_deg
@@ -9280,7 +9303,7 @@ class ClusteringResult:
         result : dict
             'cluster_a', 'cluster_b', 'system', 'mode'
             'is_match' : bool, True if any condition matched
-            'best_condition' : 'K1_180', 'eta1_180', or 'K2_shear'
+            'best_condition' : 'K1_180', 'eta1_180', or 'shearplane_rot'
             'best_T_idx' : int, index into symops_proper
             'T' : (3,3) ndarray
                 The symmetry operation such that T @ (G2 @ G1.T) has the
@@ -9322,7 +9345,7 @@ class ClusteringResult:
         target_families = {
             'K1_180': (n1_a, 180.0),
             'eta1_180': (a1_a, 180.0),
-            'K2_shear': (n2_a, shear_angle),
+            'shearplane_rot': (n2_a, shear_angle),   # rotation about the shear-plane normal (twinSys 'n2_a') by shear_angle; formerly 'K2_shear'
         }
 
         best_overall = None
@@ -9415,13 +9438,13 @@ class ClusteringResult:
 
         For each pair, M_fwd = G_j @ G_i.T, and for every T in the phase's
         proper symops, M_T = M_fwd @ T is tested against all tabulated
-        variants of three target families (K1_180, eta1_180, K2_shear).
+        variants of three target families (K1_180, eta1_180, shearplane_rot).
         This T-loop is REQUIRED, not optional: confirmed empirically (and
         cross-checked against true brute-force S2 @ M @ S1.T search over
         two independent cluster pairs, exact agreement both times) that
         K1_180/eta1_180 matches can ONLY be found via a non-identity T --
         the minimum-disorientation representative alone (T fixed) only
-        ever reveals K2_shear-type matches, since conjugation alone
+        ever reveals shearplane_rot-type matches, since conjugation alone
         preserves rotation angle and the minimum angle is generally far
         from 180 deg. Does NOT use C_a -- see check_twin_relationship's
         docstring for why (C_a as tabulated does not represent the correct
@@ -9470,7 +9493,7 @@ class ClusteringResult:
             'cluster_a', 'cluster_b' : IDs
             'size_a', 'size_b' : pixel counts
             'best_mode' : str
-            'best_condition' : 'K1_180', 'eta1_180', or 'K2_shear'
+            'best_condition' : 'K1_180', 'eta1_180', or 'shearplane_rot'
             'matched_conditions' : list of str, ALL conditions that
                 independently satisfied tol_deg for best_mode (more than
                 one entry indicates a compound twin)
@@ -9482,7 +9505,7 @@ class ClusteringResult:
                 for best_condition
             'twin_elements' : dict, Miller/Cartesian twin elements for the
                 SPECIFIC operating variant (variant_idx) of best_condition
-            'shear_angle_deg' : float, the mode's K2_shear target angle
+            'shear_angle_deg' : float, the mode's shearplane_rot target angle
             'angle_deg' : float, combined (axis_dev + angle_dev) score
             'axis_dev_deg', 'angle_dev_deg' : float
             'is_match' : bool
@@ -9580,7 +9603,7 @@ class ClusteringResult:
             conditions = {
                 'K1_180': _condition_batch(n1_a, 180.0),
                 'eta1_180': _condition_batch(a1_a, 180.0),
-                'K2_shear': _condition_batch(n2_a, shear_angle),
+                'shearplane_rot': _condition_batch(n2_a, shear_angle),   # formerly 'K2_shear'
             }
             checks_by_mode_all[mode] = conditions
 
@@ -12661,11 +12684,44 @@ class ClusteringResult:
         d = d / np.linalg.norm(d)
         cos_max = np.abs(fam @ (G @ d)).max()
         return float(np.degrees(np.arccos(np.clip(cos_max, -1.0, 1.0))))
+    def selected_variant_strain(self, orientation, axial_dir, sample_axis, phase='A', system='NiTi', tol=1e-2):
+        """
+        Axial transformation strain of the B19' variant that would be selected for a parent of the given
+        orientation (crystal <- sample matrix, as avg_orientations): the two lattice correspondence variants
+        whose [010]_M is parallel to the <110> of the orientation closest to sample_axis (d_s) -- the candidate
+        criterion of check_martensite_twin_correspondence (off-target component of CId.h relative to [010]_M
+        below tol) -- and the larger of their strains along axial_dir (getTrStrain). self.data.trStrain is
+        restored afterwards.
+
+        Returns
+        -------
+        (strain, strains) : float, dict {variant index: strain}
+        """
+        G = np.asarray(orientation, dtype=float)
+        ax = np.asarray(axial_dir, dtype=float); ax = ax / np.linalg.norm(ax)
+        sa = np.asarray(sample_axis, dtype=float).ravel(); sa = sa / np.linalg.norm(sa)
+        fam = np.array([[1, 1, 0], [1, -1, 0], [1, 0, 1], [1, 0, -1], [0, 1, 1], [0, 1, -1]], dtype=float)
+        h = fam[np.argmax(np.abs(fam @ (G @ sa)))]
+        CId = self.data.OR[system]['CId']
+        target = np.array([0.0, 1.0, 0.0])
+        pair = []
+        for i in range(CId.shape[2]):
+            v = CId[:, :, i].dot(h); nv = np.linalg.norm(v)
+            if nv > 1e-8 and np.linalg.norm(v - np.dot(v, target) * target) / nv < tol:
+                pair.append(i)
+        prev = getattr(self.data, 'trStrain', None)
+        self.data.getTrStrain(phase=phase, oris=G.dot(ax))
+        strains = {int(i): float(np.ravel(self.data.trStrain[1][i])[0]) for i in pair}
+        if prev is not None:
+            self.data.trStrain = prev
+        return (max(strains.values()) if strains else float('nan')), strains
+
     def reconstruct_parent_orientation_directed(self, phase, axial_dir, matches=None, kink_results=None,
                                                 root_cluster_id=None, sf_epsilon=1e-9,
                                                 reach_rel_tol=0.05, sample_axis=None,
                                                 sample_axis_tol_deg=10.0, min_sf_for_direction=None,
-                                                print_result=True):
+                                                root_strain=False, root_size_ratio=0.5, root_min_gain=0.01,
+                                                system='NiTi', print_result=True):
         """
         Directed version of reconstruct_parent_orientation: TWIN edges are
         oriented parent -> child using each edge's OWN Schmid factor sign
@@ -12689,6 +12745,14 @@ class ClusteringResult:
              the grain's common <110> axis (if sample_axis is given: some
              <110> of the cluster within sample_axis_tol_deg of sample_axis
              in the SAMPLE frame), then to the LARGEST own pixel count.
+          4. Optional transformation-strain criterion (root_strain=True,
+             needs sample_axis): among the on-axis sources whose reach is
+             at least root_size_ratio of the best reach AND whose own size
+             is at least root_size_ratio of the root chosen by 1-3, the one
+             whose selected B19' variant (selected_variant_strain: larger
+             strain of the two variants with [010]_M along the <110> closest
+             to sample_axis) gives the largest strain along axial_dir becomes
+             the root, if it gains more than root_min_gain over that root.
           If no pure source exists (directed cycle), the same ranking is
           applied to the nodes with the fewest incoming twin edges.
           root_cluster_id, if given, overrides all of the above.
@@ -12727,6 +12791,18 @@ class ClusteringResult:
         min_sf_for_direction : float, optional
             If given, twin edges with max(|sf_A|, |sf_B|) below this value
             are treated as undirected. Default None (all twin edges directed).
+        root_strain : bool, optional
+            Transformation-strain criterion for the root (step 4 above).
+            Default False (previous behaviour).
+        root_size_ratio : float, optional
+            Candidate sources for root_strain: reach >= root_size_ratio x best
+            reach and own size >= root_size_ratio x size of the default root.
+            Default 0.5.
+        root_min_gain : float, optional
+            Minimum strain gain (absolute, e.g. 0.01 = 1 %) for root_strain to
+            replace the default root. Default 0.01.
+        system : str, optional
+            Lattice correspondence used by root_strain. Default 'NiTi'.
         print_result : bool, optional
 
         Returns
@@ -12740,6 +12816,9 @@ class ClusteringResult:
             'root_selection' : dict with 'n_tied', 'tied' (list of dict:
                 cluster_id, reach, size, on_axis), 'reach_rel_tol',
                 'sample_axis_used' (bool), 'root_on_axis' (bool or None),
+                'root_strain' (None if not used, else dict: 'default_root',
+                'chosen_root', 'decided_by_strain', 'size_ratio', 'min_gain',
+                'candidates' = list of dict cluster_id, reach, size, strain),
             'unreachable_due_to_directionality', 'unreachable_clusters',
             'used_cycle_fallback' : bool
         """
@@ -12783,7 +12862,7 @@ class ClusteringResult:
             all_nodes.add(A); all_nodes.add(B)
 
             cond = m['best_condition']
-            key = {'K1_180': 'n1_a', 'eta1_180': 'a1_a', 'K2_shear': 'n2_a'}[cond]
+            key = {'K1_180': 'n1_a', 'eta1_180': 'a1_a', 'shearplane_rot': 'n2_a', 'K2_shear': 'n2_a'}[cond]   # 'K2_shear' = old name (checkpoints before 2026-10-12)
             angle = 180.0 if cond in ('K1_180', 'eta1_180') else m['shear_angle_deg']
             axis = np.asarray(m['twin_elements'][key], dtype=float)
             M_ideal = _rotation_about_axis(axis, angle)
@@ -12880,6 +12959,39 @@ class ClusteringResult:
             info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)),
                      'on_axis': (_on_axis(n) if sample_axis is not None else None)} for n, w in tied]
             return tied + rest, info
+        root_strain_record = {}
+
+        def _strain_rerank(ranked):
+            """step 4 (root_strain): move the strain-favoured candidate to the front."""
+            if sample_axis is None:
+                if print_result:
+                    print('Warning: root_strain needs sample_axis -- criterion not applied.')
+                return ranked
+            default = ranked[0][0]
+            w_max = max(w for _, w in ranked)
+            s_def = sizes.get(default, 0)
+            cands = [(n, w) for n, w in ranked
+                     if n in self.avg_orientations and _on_axis(n)
+                     and (n == default or (w >= root_size_ratio * w_max and sizes.get(n, 0) >= root_size_ratio * s_def))]
+            if default not in [n for n, _ in cands] and default in self.avg_orientations:
+                cands.insert(0, ranked[0])
+            score = {n: self.selected_variant_strain(self.avg_orientations[n], axial_dir, sample_axis,
+                                                     phase=phase, system=system)[0] for n, _ in cands}
+            best = max(score, key=score.get) if score else default
+            decided = (best != default and default in score and score[best] - score[default] > root_min_gain)
+            root_strain_record.clear()
+            root_strain_record.update({
+                'default_root': int(default), 'chosen_root': int(best if decided else default),
+                'decided_by_strain': bool(decided), 'size_ratio': root_size_ratio, 'min_gain': root_min_gain,
+                'candidates': [{'cluster_id': int(n), 'reach': int(w), 'size': int(sizes.get(n, 0)),
+                                'strain': float(score[n])} for n, w in cands]})
+            if decided:
+                ranked = [nw for nw in ranked if nw[0] == best] + [nw for nw in ranked if nw[0] != best]
+                if print_result:
+                    print(f"root_strain: root {best} (strain {score[best]:+.4f}) instead of {default} "
+                          f"(strain {score[default]:+.4f})")
+            return ranked
+
         def _rank(candidates):
             if not candidates:
                 return [], []
@@ -12897,7 +13009,10 @@ class ClusteringResult:
             rest.sort(key=lambda nw: -nw[1])
             info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)),
                      'on_axis': (_on_axis(n) if sample_axis is not None else None)} for n, w in tied]
-            return tied + rest, info
+            ranked = tied + rest
+            if root_strain and ranked:
+                ranked = _strain_rerank(ranked)
+            return ranked, info
         
         sources = [n for n in all_nodes if incoming_twin.get(n, 0) == 0]
         source_candidates = [(s, _reachable_weight(s)[1]) for s in sources]
@@ -12929,6 +13044,7 @@ class ClusteringResult:
             'n_tied': len(tied_info), 'tied': tied_info, 'reach_rel_tol': reach_rel_tol,
             'sample_axis_used': sample_axis is not None,
             'root_on_axis': (_on_axis(root_cluster_id) if sample_axis is not None else None),
+            'root_strain': (dict(root_strain_record) if root_strain_record else None),
         }
         if sample_axis is not None and not root_selection['root_on_axis'] and print_result:
             print(f"Warning: root cluster {root_cluster_id} does not lie on the common axis "
@@ -13060,7 +13176,7 @@ class ClusteringResult:
 
         For TWIN edges, the DENOISED, EXACT ideal operator is used (built
         from the matched condition's tabulated axis and IDEAL angle -- 180
-        deg for K1_180/eta1_180, the mode's shear_angle for K2_shear) --
+        deg for K1_180/eta1_180, the mode's shear_angle for shearplane_rot) --
         NOT the noisy measured relative orientation. For KINK-only edges
         (no independently known ideal angle exists), the raw measured
         relation is used; this adds graph CONNECTIVITY but no denoising by
@@ -13126,7 +13242,7 @@ class ClusteringResult:
         for m in (matches or []):
             A, B = m['cluster_a'], m['cluster_b']
             cond = m['best_condition']
-            key = {'K1_180': 'n1_a', 'eta1_180': 'a1_a', 'K2_shear': 'n2_a'}[cond]
+            key = {'K1_180': 'n1_a', 'eta1_180': 'a1_a', 'shearplane_rot': 'n2_a', 'K2_shear': 'n2_a'}[cond]   # 'K2_shear' = old name (checkpoints before 2026-10-12)
             angle = 180.0 if cond in ('K1_180', 'eta1_180') else m['shear_angle_deg']
             axis = np.asarray(m['twin_elements'][key], dtype=float)
             M_ideal = _rotation_about_axis(axis, angle)
@@ -13567,7 +13683,7 @@ class ClusteringResult:
         convention, T corrects the cluster/cluster_b side). n1_a/a1_a are
         the matched variant's tabulated K1 normal / eta1 direction, taken
         from twin_elements regardless of which condition (K1_180/eta1_180/
-        K2_shear) actually matched best.
+        shearplane_rot) actually matched best.
 
         Parameters
         ----------
@@ -25741,3 +25857,228 @@ class EbsdInterfaceAnalyzer(getPhases):
             return N_guess2ndphase,N_guess2ndphase_allvars
         else:
             return N_guess2ndphase
+
+
+# =============================================================================
+#  PHYSICAL-UNIT RECIPE PARAMETERS, CLUSTER / GRAIN SIZE, CSL BOUNDARIES
+#  (added 2026-10-08)
+# =============================================================================
+#  - read_ang_grid(filename)             : grid type and step sizes from an .ang header
+#  - pixel_area_um2(dx, dy, grid)        : area of one pixel [um^2]
+#  - resolve_physical_recipe(recipe, ...) : converts the 'physical' block of a recipe
+#                                          (um, um^2) into pixel values for this scan
+#  - cluster_size_table(...)             : per-cluster area, circle-equivalent diameter,
+#                                          edge flag -> number- and area-weighted means
+#  - csl_boundary_fractions(...)         : Sigma 3, 9, 11, 27a, 27b ... boundaries with the
+#                                          Brandon criterion, as length fractions
+# -----------------------------------------------------------------------------
+
+def read_ang_grid(filename):
+    """Return dict(grid, dx, dy) from the header of a TSL .ang file."""
+    out = dict(grid=None, dx=None, dy=None)
+    with open(filename, errors='ignore') as fh:
+        for line in fh:
+            if not line.startswith('#'):
+                break
+            if line.startswith('# GRID:'):
+                out['grid'] = line.split(':', 1)[1].strip()
+            elif line.startswith('# XSTEP:'):
+                out['dx'] = float(line.split(':', 1)[1])
+            elif line.startswith('# YSTEP:'):
+                out['dy'] = float(line.split(':', 1)[1])
+    return out
+
+
+def pixel_area_um2(dx, dy=None, grid='HexGrid'):
+    """Area represented by one pixel [um^2]: sqrt(3)/2*dx^2 on a hexagonal grid, dx*dy on a square grid."""
+    if grid is not None and 'hex' in str(grid).lower():
+        return np.sqrt(3.0) / 2.0 * dx ** 2
+    return dx * (dy if dy is not None else dx)
+
+
+def resolve_physical_recipe(recipe, filename=None, verbose=True):
+    """
+    Convert the physical-unit settings in recipe['physical'] into pixel values for the
+    scan in `filename` (default recipe['filename']) and write them into the recipe:
+
+        recipe['physical'] = dict(
+            min_cluster_area_um2 = {'A': 0.15, 'M': 0.15},  # -> recipe['clustering']['minidxs'] [px]
+            cluster_dmax_um      = 3.0,                     # -> recipe['clustering']['dmax'] [um], >= 1.5*distance*step
+            gnd_max_radius_um    = 0.30,                    # -> recipe['kamgnd']['nneighbors'] [shells], >= 2
+        )
+
+    Any key may be omitted (the pixel value already in the recipe is then kept).
+    The resolved values and the step size are stored in recipe['physical']['resolved']
+    so that they end up in the checkpoint.
+    """
+    ph = recipe.get('physical')
+    if not ph:
+        return recipe
+    g = read_ang_grid(filename or recipe['filename'])
+    dx, dy, grid = g['dx'], g['dy'], g['grid']
+    a_px = pixel_area_um2(dx, dy, grid)
+    res = dict(dx_um=dx, dy_um=dy, grid=grid, pixel_area_um2=a_px)
+    if 'min_cluster_area_um2' in ph:
+        floor = ph.get('min_cluster_px', {}) or {}             # optional lower bound [px] (coarse steps)
+        mins = {k: max(int(np.ceil(v / a_px)), int(floor.get(k, 1))) for k, v in ph['min_cluster_area_um2'].items()}
+        recipe['clustering']['minidxs'] = mins
+        res['minidxs_px'] = mins
+    if 'cluster_dmax_um' in ph:
+        # NB: the clustering compares dmax with pixel COORDINATES, i.e. dmax is a distance in um;
+        # it must exceed the neighbour distance (distance * step) or neighbours are dropped
+        dist = recipe['clustering'].get('distance', 1)
+        dmax = max(float(ph['cluster_dmax_um']), 1.5 * dist * dx)
+        recipe['clustering']['dmax'] = dmax
+        res['dmax_um'] = dmax
+    if 'gnd_max_radius_um' in ph:
+        nn = max(2, int(round(ph['gnd_max_radius_um'] / dx)))
+        recipe['kamgnd']['nneighbors'] = nn
+        res['gnd_nneighbors'] = nn
+    ph['resolved'] = res
+    if verbose:
+        print('physical recipe -> step {:.3f} um ({}), pixel area {:.4f} um^2: {}'.format(
+            dx, grid, a_px, {k: v for k, v in res.items() if k not in ('dx_um', 'dy_um', 'grid', 'pixel_area_um2')}))
+    return recipe
+
+
+def cluster_size_table(clustering_result, phase='A', min_area_um2=None, roi=0,
+                       distance_convention='OIM'):
+    """
+    Per-cluster size table of `phase`.
+
+    Returns (df, summary):
+      df      : one row per cluster: label, n_px, area_um2, ecd_um (circle-equivalent diameter),
+                touches_edge (True if any pixel of the cluster lies on the map border or ROI border)
+      summary : dict with N, number-weighted mean / median ECD, area-weighted mean ECD,
+                each for all clusters and for clusters not touching the edge
+    """
+    import pandas as pd
+    data = clustering_result.data
+    eb = data._ebsdData
+    a_px = pixel_area_um2(eb.dx, getattr(eb, 'dy', None), getattr(eb, 'grid', 'HexGrid'))
+    labels = np.asarray(clustering_result.labels)
+    sel = data.rois.masks[roi] & (data.phases_id == data.phase_ids[phase])
+    ids = [c for c in clustering_result.labels_by_phase[phase] if c > 0]
+    # edge pixels: any first-shell neighbour missing or outside the ROI
+    nb = data.compute_neighbors(distance=1, perimeteronly=False, distance_convention=distance_convention)
+    roi_mask = data.rois.masks[roi]
+    missing = (nb < 0) | ~roi_mask[np.clip(nb, 0, None)]
+    edge_px = roi_mask & missing.any(axis=1)
+    lab_sel = labels[sel]
+    n_px = pd.Series(lab_sel).value_counts()
+    edge_labels = set(np.unique(labels[sel & edge_px]).tolist())
+    rows = []
+    for c in ids:
+        n = int(n_px.get(c, 0))
+        if n == 0:
+            continue
+        area = n * a_px
+        rows.append(dict(label=int(c), n_px=n, area_um2=area, ecd_um=2.0 * np.sqrt(area / np.pi),
+                         touches_edge=c in edge_labels))
+    df = pd.DataFrame(rows)
+    if min_area_um2 is not None and len(df):
+        df = df[df.area_um2 >= min_area_um2].reset_index(drop=True)
+
+    def _stats(d):
+        if len(d) == 0:
+            return dict(N=0, ecd_mean_um=np.nan, ecd_median_um=np.nan, ecd_areaweighted_um=np.nan)
+        return dict(N=int(len(d)), ecd_mean_um=float(d.ecd_um.mean()), ecd_median_um=float(d.ecd_um.median()),
+                    ecd_areaweighted_um=float((d.ecd_um * d.area_um2).sum() / d.area_um2.sum()))
+    summary = dict(pixel_area_um2=a_px, min_area_um2=min_area_um2,
+                   all=_stats(df), interior=_stats(df[~df.touches_edge]) if len(df) else _stats(df))
+    return df, summary
+
+
+# --- CSL ---------------------------------------------------------------------
+#  Coincidence-site-lattice misorientations of the cubic lattice (angle [deg], axis)
+CSL_CUBIC = {
+    '3':   (60.00,  [1, 1, 1]),
+    '5':   (36.87,  [1, 0, 0]),
+    '7':   (38.21,  [1, 1, 1]),
+    '9':   (38.94,  [1, 1, 0]),
+    '11':  (50.48,  [1, 1, 0]),
+    '27a': (31.59,  [1, 1, 0]),
+    '27b': (35.43,  [2, 1, 0]),
+}
+
+
+def _axis_angle_matrix(axis, angle_deg):
+    a = np.asarray(axis, float); a = a / np.linalg.norm(a)
+    t = np.radians(angle_deg); K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    return np.eye(3) + np.sin(t) * K + (1 - np.cos(t)) * K @ K
+
+
+def _equivalents(R, symops):
+    """All S1 R S2 and their inverses (unique), for proper rotations symops."""
+    E = np.einsum('aij,jk,bkl->abil', symops, R, symops).reshape(-1, 3, 3)
+    E = np.concatenate([E, np.transpose(E, (0, 2, 1))])
+    _, idx = np.unique(np.round(E.reshape(len(E), 9), 6), axis=0, return_index=True)
+    return E[np.sort(idx)]
+
+
+def csl_boundary_fractions(clustering_result, phase='A', sigmas=('3', '9', '11', '27a', '27b'),
+                           brandon_k=15.0, min_mis_deg=(2.5, 15.0), roi=0,
+                           distance_convention='OIM', return_pairs=False):
+    """
+    CSL boundary fractions from first-neighbour pixel pairs of `phase` (both pixels in the
+    phase and in ROI `roi`). On a hexagonal grid every neighbour pair corresponds to one pixel
+    edge of equal length, so pair counts are length fractions.
+
+    A boundary is assigned to Sigma if its deviation from the CSL misorientation satisfies the
+    Brandon criterion  dev <= brandon_k * Sigma^(-1/2)  (deviation = smallest rotation angle
+    between the misorientation and any symmetry-equivalent CSL rotation); if several Sigmas
+    match, the one with the smallest dev/tolerance is taken.
+
+    Returns dict:
+      n_pairs, and for every threshold t in min_mis_deg:
+        {t: dict(n_boundaries=..., fractions={Sigma: fraction of boundaries > t}, counts={...})}
+      (+ 'pairs': (i, j, disorientation, sigma) arrays if return_pairs)
+    """
+    data = clustering_result.data
+    eb = data._ebsdData
+    M = np.asarray(eb.M)                                    # pyebsd: sample -> crystal frame
+    sym = np.array(data.phases[phase]['symops'])
+    sym = sym[np.array([round(np.linalg.det(s)) == 1 for s in sym])]
+    sel = data.rois.masks[roi] & (data.phases_id == data.phase_ids[phase])
+    nb = data.compute_neighbors(distance=1, perimeteronly=False, distance_convention=distance_convention)
+    I, J = [], []
+    for k in range(nb.shape[1]):
+        j = nb[:, k]
+        ok = sel & (j >= 0)
+        ok[ok] &= sel[j[ok]]
+        i = np.where(ok)[0]; jj = j[i]
+        keep = i < jj                                          # every physical pair once
+        I.append(i[keep]); J.append(jj[keep])
+    I = np.concatenate(I); J = np.concatenate(J)
+    # processed in chunks of pairs (large maps: millions of pairs)
+    E_all = {}
+    for s in sigmas:
+        ang, ax = CSL_CUBIC[s]
+        E = _equivalents(_axis_angle_matrix(ax, ang), sym)
+        E_all[s] = (E.reshape(len(E), 9).T, brandon_k / np.sqrt(float(''.join(ch for ch in s if ch.isdigit()))))
+    symT = sym.reshape(len(sym), 9).T
+    npairs = len(I)
+    disor = np.empty(npairs)
+    best = np.full(npairs, '', dtype=object)
+    chunk = 500000
+    for a in range(0, npairs, chunk):
+        b = min(a + chunk, npairs)
+        Df = np.einsum('pij,pkj->pik', M[J[a:b]], M[I[a:b]]).reshape(b - a, 9)   # crystal-frame misorientation
+        disor[a:b] = np.degrees(np.arccos(np.clip(((Df @ symT).max(axis=1) - 1) / 2, -1, 1)))
+        bb = np.full(b - a, '', dtype=object); bs = np.full(b - a, np.inf)
+        for s, (ET, tol) in E_all.items():
+            dev = np.degrees(np.arccos(np.clip(((Df @ ET).max(axis=1) - 1) / 2, -1, 1)))
+            score = dev / tol
+            hit = (score <= 1.0) & (score < bs)
+            bb[hit] = s; bs[hit] = score[hit]
+        best[a:b] = bb
+    out = dict(n_pairs=int(npairs), brandon_k=brandon_k, sigmas=list(sigmas))
+    for t in np.atleast_1d(min_mis_deg):
+        b = disor > t
+        nB = int(b.sum())
+        counts = {s: int((b & (best == s)).sum()) for s in sigmas}
+        out[float(t)] = dict(n_boundaries=nB, counts=counts,
+                             fractions={s: (counts[s] / nB if nB else np.nan) for s in sigmas})
+    if return_pairs:
+        out['pairs'] = dict(i=I, j=J, disorientation=disor, sigma=best)
+    return out
