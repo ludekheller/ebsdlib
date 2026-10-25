@@ -30,7 +30,7 @@ This report describes the trace-analysis method implemented in the \texttt{EbsdH
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.78\linewidth]{./figs/figA.png}
+\includegraphics[width=0.78\linewidth]{../figs/figA.png}
 \caption{Selection of a region of interest (ROI) on the EBSD orientation map. Austenite grains are coloured by their inverse pole figure (cubic $m\bar{3}m$ key) and the lamellar martensite by the monoclinic $2/m$ key; the lamellae appear as fine parallel traces inside the parent grains. A single lamella (black rectangle) together with its two interface sides defines the ROI on which the habit-plane analysis is performed.}
 \label{fig:roi}
 \end{figure}
@@ -94,14 +94,14 @@ with defaults $\delta_{90}=4^\circ$ (\texttt{maxdevfrom90deg}) and $h_{\max}=4$ 
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.92\linewidth]{./figs/fig_trace.png}
+\includegraphics[width=0.92\linewidth]{../figs/fig_trace.png}
 \caption{Identification of the orientation relationship and of the habit-plane trace on the ROI (view onto the scan surface). The interface boundary pixels $(X_i,Y_i)$ of the austenite and martensite sides are fitted by a straight line $y=kx+q$, giving the trace $\vc t$ and its in-plane normal $\vc m$, Eqs.~\eqref{eq:trace}--\eqref{eq:crystal_trace}. The mean side orientations $\mat G^{\mathrm A}$ and $\mat G^{\mathrm M}$ define the experimental orientation relationship $\mathrm{OR}^{A\to M}=\mat G^{\mathrm M}(\mat G^{\mathrm A})^{\mathsf T}$ (the symmetry-reduced average used in Eq.~\eqref{eq:expOR}). A single section reveals only the trace, so its normal is constrained merely to the plane perpendicular to $\vc t$, leaving one free rotation angle.}
 \label{fig:trace}
 \end{figure}
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.92\linewidth]{./figs/fig_cand_par.png}
+\includegraphics[width=0.92\linewidth]{../figs/fig_cand_par.png}
 \caption{Trace-containment test of Eq.~\eqref{eq:accept}, viewed onto the scan surface (plane parallel to the trace). For each phase the candidate plane normals $\vc\nu^{\mathrm A}_i$ (red) and $\vc\nu^{\mathrm M}_j$ (blue) are projected at points along the trace. A candidate is accepted ($\checkmark$) when its normal is perpendicular to the trace within tolerance, $|\theta^{\varphi}-90^\circ|\le\delta_{90}$ (default $4^\circ$), with $\theta^{\varphi}=\arccos|\vc\nu^{\varphi}\cdot\vc t^{\,\varphi}|$, and rejected ($\times$) otherwise. The test is applied independently in austenite ($\varphi=\mathrm A$) and martensite ($\varphi=\mathrm M$).}
 \label{fig:cand_par}
 \end{figure}
@@ -134,12 +134,12 @@ where $\vc\nu^{\mathrm A,s}_{i}$ and $\vc\nu^{\mathrm M,s}_{j}$ are the sample-f
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.86\linewidth]{./figs/fig_cand_perp.png}
+\includegraphics[width=0.86\linewidth]{../figs/fig_cand_perp.png}
 \caption{Cross-phase matching in the fictitious cross-section perpendicular to the trace, in which the trace $\vc t$ points out of the plane and every admissible candidate plane appears edge-on as a line through the centre. Low-index candidates of austenite (red, planes $hkl^{\mathrm A}_i$ with normals $\vc\nu^{\mathrm A}_i$) and martensite (blue, planes $hkl^{\mathrm M}_j$ with normals $\vc\nu^{\mathrm M}_j$) are drawn at their respective angles. A pair $(i,j)$ is accepted ($\checkmark$) when the two indexed normals coincide in the sample frame within $\Delta^{\mathrm{HP}}_{i,j}\le\Delta_{\max}$ (default $2^\circ$), Eq.~\eqref{eq:hpmatch}; candidates of one phase without a matching partner in the other ($\times$) are discarded.}
 \label{fig:cand_perp}
 \end{figure}
 
-For each surviving pair, corresponding \emph{in-plane lattice directions} are sought. Within each phase, the same rotational sampling of Eq.~\eqref{eq:family} is reused with the roles exchanged: the rotation axis is now the candidate plane normal $\vc\nu^{\varphi}(\vc h^{\varphi})$, the direct structure matrices $\mat L^{\varphi}$, $(\mat L^{\varphi})^{-1}$ replace the reciprocal ones, and the perpendicularity tolerance is set to zero, which yields the low-index lattice directions $\vc u^{\varphi}$ lying exactly in the candidate plane ($\vc u^{\varphi}\perp\vc\nu^{\varphi}$). Direction pairs $(\vc u^{\mathrm A},\vc u^{\mathrm M})$ are accepted when their sample-frame misalignment is below $\delta_d=2^\circ$ (\texttt{maxdirdev}), keeping for each austenite direction only the best-matching martensite partner. A plane pair is retained only if at least one corresponding direction pair exists.
+For each surviving pair, corresponding \emph{in-plane lattice directions} are sought. Within each phase, the same rotational sampling of Eq.~\eqref{eq:family} is reused with the roles exchanged: the rotation axis is now the candidate plane normal $\vc\nu^{\varphi}(\vc h^{\varphi})$, the direct structure matrices $\mat L^{\varphi}$, $(\mat L^{\varphi})^{-1}$ replace the reciprocal ones, and the perpendicularity tolerance is set to zero, which yields the low-index lattice directions $\vc u^{\varphi}$ lying exactly in the candidate plane ($\vc u^{\varphi}\perp\vc\nu^{\varphi}$). Direction pairs $(\vc u^{\mathrm A},\vc u^{\mathrm M})$ are accepted when their sample-frame misalignment is below $\delta_d=2^\circ$ (\texttt{maxdirdev}), keeping for each austenite direction only the best-matching martensite partner. A plane pair is retained only if at least one corresponding direction pair exists. The number of accepted direction pairs of a plane pair is denoted $N_d$ (stored as \texttt{number of corresponding directions}, i.e.\ \texttt{len(dpmatch)}, in \texttt{getHBmatches}): it is the count of distinct low-index in-plane austenite directions $\vc u^{\mathrm A}$ that possess a coincident martensite counterpart $\vc u^{\mathrm M}$ within $\delta_d$ for the single plane pair $(i,j)$ under test. Because only the closest martensite partner is kept per austenite direction, each austenite direction contributes at most one pair, so $N_d$ equals the number of matched direction pairs. It is worth stressing that $N_d$ is \emph{not} a count of shared planes: each accepted plane pair $(i,j)$ yields exactly one scored entry, and $N_d$ measures how many coincident in-plane \emph{directions} lie within that one shared plane.
 
 Finally, the retained pair is tested for consistency with the lattice correspondence of the identified variant. With the martensite symmetry operation $\mat S_{i^\ast}$ from Eq.~\eqref{eq:expOR}, the correspondence predicts
 \begin{equation}
@@ -164,7 +164,7 @@ S_{i,j} \;=\; \frac{\sum_k |h^{\mathrm A}_{i,k}| + \sum_k |h^{\mathrm M}_{j,k}|}
 +\Delta^{\mathrm{HP}}_{i,j}\Big),
 \label{eq:score}
 \end{equation}
-where $i$ and $j$ index the austenite and martensite candidate of the pair, $h^{\mathrm A}_{i,k}$ ($k=1,2,3$) are the Miller components of austenite candidate $i$ (and likewise $h^{\mathrm M}_{j,k}$), $N_d$ is the number of matched direction pairs, $\delta_l$ their misalignments, $\theta^{\mathrm A}_i$ and $\theta^{\mathrm M}_j$ the trace-containment angles of Eq.~\eqref{eq:accept} and $\Delta^{\mathrm{HP}}_{i,j}$ the normal misalignment of Eq.~\eqref{eq:hpmatch}. Lower scores are better: the first term penalizes high Miller indices and rewards a rich set of corresponding directions, the second penalizes geometric misfit. All result arrays are sorted by ascending $S_{i,j}$, and \texttt{printHBmatches} reports, per candidate, the indexed plane in both phases with their families, the misalignments, the score, the correspondence-consistency flag, and the transformation strain of the closest variant from Eq.~\eqref{eq:strain}.
+where $i$ and $j$ index the austenite and martensite candidate of the pair, $h^{\mathrm A}_{i,k}$ ($k=1,2,3$) are the Miller components of austenite candidate $i$ (and likewise $h^{\mathrm M}_{j,k}$), $N_d$ is the number of matched in-plane direction pairs defined above, $\delta_l$ their misalignments, $\theta^{\mathrm A}_i$ and $\theta^{\mathrm M}_j$ the trace-containment angles of Eq.~\eqref{eq:accept} and $\Delta^{\mathrm{HP}}_{i,j}$ the normal misalignment of Eq.~\eqref{eq:hpmatch}. Lower scores are better: the first term penalizes high Miller indices and rewards a rich set of corresponding directions, the second penalizes geometric misfit. All result arrays are sorted by ascending $S_{i,j}$, and \texttt{printHBmatches} reports, per candidate, the indexed plane in both phases with their families, the misalignments, the score, the correspondence-consistency flag, and the transformation strain of the closest variant from Eq.~\eqref{eq:strain}.
 
 \section{Variant-resolved propagation between phases}
 
