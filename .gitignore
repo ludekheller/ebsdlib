@@ -3,3 +3,24 @@
 /__pycache__
 *.pyc
 /__pycache__
+/notebooks/data
+notebooks/data/2026-02-04_NiTi30def_1000C_2026-02-04_NiTi30def_anneal_Area 1_OIM Map 1_Rescan.ang
+notebooks/data/2026-02-04_NiTi30def_1000C_2026-02-04_NiTi30def_anneal_Area 1_OIM Map 1_Rescan_my_rois.h5
+notebooks/data/2026-02-04_NiTi30def_2026-02-04_NiTi30def_anneal_Area 1_OIM Map 1_Rescan.ang
+notebooks/data/2026-02-04_NiTi30def_2026-02-04_NiTi30def_anneal_Area 1_OIM Map 1_Rescan_my_rois.h5
+notebooks/data/2026-02-04_NiTi30def_2026-05-21-50def700C_Area 2_OIM Map 1_Rescan_cropped.ang
+notebooks/data/2026-02-04_NiTi30def_2026-05-21-50def700C_Area 2_OIM Map 1_Rescan_cropped_my_rois.h5
+notebooks/data/2026-02-04_NiTi30def_2026-05-21-50def700C_Area 2_OIM Map 1_Rescan_cropped_my_rois_rm.h5
+notebooks/data/NiTi-S1-annealing-Area2_Rescan.ang
+notebooks/data/NiTi-S1-annealing-Area2_Rescan2.ang
+notebooks/data/NiTi-S1-annealing-Area2_Rescan2.oh5
+notebooks/data/NiTi-S1-annealing-Area2_Rescan2_my_rois.h5
+notebooks/data/NiTi-S1-annealing-Area2_Rescan_my_rois.h5
+notebooks/data/R17SA-50def-500CEpulse-center-Area2_Rescan1_Rescan.ang
+notebooks/data/R17SA-50def-500CEpulse-center-Area2_Rescan1_Rescan_my_rois.h5
+notebooks/data/R17SA-50def-center-Area4_Rescan.ang
+notebooks/data/R17SA-50def-center-Area4_Rescan_my_rois.h5
+notebooks/data/R18SA-30def-500CEpulse-center-Area1_Rescan.ang
+notebooks/data/R18SA-30def-500CEpulse-center-Area1_Rescan_my_rois.h5
+notebooks/data/R18SA-30def-center-Area3_Rescan.ang
+notebooks/data/R18SA-30def-center-Area3_Rescan_my_rois.h5
