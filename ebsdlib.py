@@ -5191,6 +5191,42 @@ class ClusteringResult:
     @property
     def n_clusters(self):
         return len(self.get_unique_clusters())
+
+    def detect_former_grains(self, phase='A', step=None, verbose=True, **params):
+        """
+        Former austenite grains of a whole-scan clustering by axis-consistent region growing (detect_former_grains):
+        neighbouring clusters join a grain if their misorientation is a rotation about the grain's common <110> axis
+        d_s (or a low-angle boundary); second pass across gaps, off-axis twins and proximity merges; automatic
+        clean-up; export as ROI polygons tiling the map (format of auto_rois.h5).
+
+        Parameters
+        ----------
+        phase : str, int or list - B2 phase(s) (names or ids of data.phases_id) whose unclustered pixels are filled
+                (Step 1); give all B2 entries of the .ang (e.g. [1, 2] for def30_500C, as B2_PHASES of the notebook)
+        step : scan step (um); default from the scan header, else from the coordinates
+        params : overrides of FORMER_GRAINS_DEFAULTS (res_tol, axis_tol, low_mis, gap_um, min_contact_um,
+                 min_twin_um, prox_um, surround_share, min_roi_um2, fill_map, ...)
+
+        Returns
+        -------
+        dict (see detect_former_grains): polygons, table, grain_of_cluster, axis (d_s per grain,
+        sample frame), labels (after filling), pixel_grain, log, params. Write the ROIs with
+        write_rois(path, res['polygons']).
+        """
+        d = self.data
+        XY = np.c_[np.asarray(d.X, float), np.asarray(d.Y, float)]
+        if step is None:
+            step = getattr(getattr(d, '_ebsdData', None), 'dx', None)
+        if not step:
+            row = XY[np.isclose(XY[:, 1], XY[:, 1].min())][:, 0]
+            step = float(np.min(np.diff(np.unique(np.round(row, 6)))))
+        ids = [d.getPhaseID(p) if isinstance(p, str) else int(p) for p in np.atleast_1d(phase)]
+        is_b2 = np.isin(np.asarray(d.phases_id), ids)
+        if getattr(self, 'avg_orientations', None) is None:
+            self.getAvgOri()
+        G, cph = self.avg_orientations, self._cluster_phases_id
+        return detect_former_grains(XY, np.asarray(d.orientations, float), is_b2, np.asarray(self.labels), G,
+                                        float(step), cluster_phase=cph, verbose=verbose, **params)
     def get_recipe_min_size(self, phase):
         """
         Return the minidxs (minimum cluster pixel count) value used by the
@@ -7494,12 +7530,14 @@ class ClusteringResult:
                     eligible.append(c)
             if eligible:
                 anchor_id = max(eligible, key=lambda c: sizes.get(c, 0))
-            else:
+            elif cluster_ids:
                 anchor_id = cluster_ids[0]
                 print(f"Warning: no cluster exceeds anchor_disorientation_threshold_deg="
                     f"{anchor_disorientation_threshold_deg} deg from the reference; "
                     f"falling back to largest cluster {anchor_id} as anchor.")
-            cluster_ids = [anchor_id] + [c for c in cluster_ids if c != anchor_id]
+            # else: the reference is the only cluster (single-cluster grain) -> nothing to align
+            if anchor_id is not None:
+                cluster_ids = [anchor_id] + [c for c in cluster_ids if c != anchor_id]
 
         result = {}
         best_sym_ref = None
@@ -12716,13 +12754,81 @@ class ClusteringResult:
             self.data.trStrain = prev
         return (max(strains.values()) if strains else float('nan')), strains
 
+    def root_ambiguity(self, root_selection, root_cluster_id, phase='A', ratio=0.6, max_deg=20.0, group_deg=3.0):
+        """
+        Is the matrix root of reconstruct_parent_orientation_directed ambiguous? The root is flagged when a tied
+        source that is NOT a fragment of the root (disorientation >= group_deg) but lies within max_deg of it (a kink
+        of the root, +-beta*, +-2 beta*) has a ranking size of at least `ratio` x that of the root. Ranking size:
+        'family_size' of the tied entries if present (root_family), else 'group_size', else 'size'. With an
+        intragranular orientation spread of the order of beta* and kink bands larger than the matrix fragments,
+        the matrix and its +-beta* kinks cannot be told apart from the orientations alone (ebsdlib.synthetic);
+        flagged grains are to be checked on the IPF map.
+
+        Parameters
+        ----------
+        root_selection : dict
+            'root_selection' of the result (or aux['root_selection'] of a pipeline checkpoint).
+        root_cluster_id : int
+        phase : str, optional
+        ratio : float, optional
+            Default 0.6: catches the wrong root of the synthetic gradient map (rival matrix fragment at 69 %
+            of the root kink); the flag is a screening (it also flags correct roots), the margin is in 'rival_ratio'.
+        max_deg, group_deg : float, optional
+            Disorientation window of a rival. Defaults 20.0 and 3.0.
+
+        Returns
+        -------
+        dict: 'ambiguous' (bool or None if not evaluable), 'rival' (cluster id or None), 'rival_ratio',
+              'rival_deg', 'root_measure', 'rival_measure', 'measure' (key used)
+        """
+        out = dict(ambiguous=None, rival=None, rival_ratio=float('nan'), rival_deg=float('nan'),
+                   root_measure=float('nan'), rival_measure=float('nan'), measure=None)
+        tied = list((root_selection or {}).get('tied') or [])
+        if root_cluster_id is None or not tied or root_cluster_id not in self.avg_orientations:
+            return out
+        key = ('family_size' if any(t.get('family_size') is not None for t in tied)
+               else 'group_size' if any(t.get('group_size') is not None for t in tied) else 'size')
+        meas = {t['cluster_id']: float(t.get(key) if t.get(key) is not None else t.get('size', 0)) for t in tied}
+        if root_cluster_id not in meas:
+            meas[root_cluster_id] = float(self.cluster_sizes.get(root_cluster_id, 0))
+        sy = np.array(self.data.phases[phase]['symops'])
+        sy = sy[np.array([np.linalg.det(x) for x in sy]) > 0]
+        G0 = np.asarray(self.avg_orientations[root_cluster_id], float)
+        best = None
+        for c, w in meas.items():
+            if c == root_cluster_id or c not in self.avg_orientations:
+                continue
+            tr = np.einsum('sij,ji->s', sy, np.asarray(self.avg_orientations[c], float) @ G0.T)
+            ang = float(np.degrees(np.arccos(np.clip((tr.max() - 1) / 2, -1, 1))))
+            if group_deg <= ang <= max_deg and (best is None or w > best[1]):
+                best = (c, w, ang)
+        out.update(measure=key, root_measure=meas[root_cluster_id], ambiguous=False)
+        if best is not None:
+            r = best[1] / meas[root_cluster_id] if meas[root_cluster_id] > 0 else float('inf')
+            out.update(rival=int(best[0]), rival_measure=best[1], rival_deg=best[2], rival_ratio=float(r),
+                       ambiguous=bool(r >= ratio))
+        return out
+
     def reconstruct_parent_orientation_directed(self, phase, axial_dir, matches=None, kink_results=None,
                                                 root_cluster_id=None, sf_epsilon=1e-9,
                                                 reach_rel_tol=0.05, sample_axis=None,
                                                 sample_axis_tol_deg=10.0, min_sf_for_direction=None,
                                                 root_strain=False, root_size_ratio=0.5, root_min_gain=0.01,
-                                                system='NiTi', print_result=True):
+                                                system='NiTi', directed_modes=('114', '113c', '115c'), root_group_deg=3.0,
+                                                root_family=True, root_strain_min_deg=20.0, closure_kink_max_deg=20.0,
+                                                closure_veto_modes=None, print_result=True):
         """
+        DEFAULT RULES ('cfs', since 2026-11-02): only {114}B2 = (20-1)B19' twin
+        links, the true host-twin interfaces, are directed by the Schmid factor;
+        {113}/{115} links (kink + {114} twin) are directed by triangle closure,
+        all other twin links (Sigma3, ...) and kinks are undirected; tied sources
+        are ranked by their family (3 deg orientation group + hosted {114}
+        twins); root_strain never switches to a candidate within 20 deg of the
+        default root (one of its kinks). Previous rules (manuscript r95):
+        directed_modes=None, root_group_deg=None, root_family=False,
+        root_strain_min_deg=None. Matrix and +-beta* kink may be interchangeable
+        (see root_ambiguity, stored in root_selection['ambiguity']).
+
         Directed version of reconstruct_parent_orientation: TWIN edges are
         oriented parent -> child using each edge's OWN Schmid factor sign
         (the side with the HIGHER Schmid factor, under the given axial_dir,
@@ -12791,6 +12897,73 @@ class ClusteringResult:
         min_sf_for_direction : float, optional
             If given, twin edges with max(|sf_A|, |sf_B|) below this value
             are treated as undirected. Default None (all twin edges directed).
+        directed_modes : iterable of str, optional
+            Twin modes whose edges are directed by the Schmid factor, e.g.
+            ('114',): only the {114}B2 = (20-1)B19' twins, the true twins of
+            their host in the inherited architecture. Edges of the other modes
+            ({113}, {115}, {112}, ...) are kept for connectivity but treated as
+            UNDIRECTED, like kinks: e.g. the (20-1) twins of kinked martensite
+            are rotated by phi114 + 2 beta* = 52.5 deg from the matrix, within
+            the tolerance of a {113} twin (50.5 deg), and their Schmid-factor
+            comparison with the matrix has no physical meaning (found with
+            ebsdlib.synthetic: such an edge pointing INTO the matrix makes it
+            no source, and the matrix is lost). Default ('114', '113c', '115c')
+            ('cfs'); None: all twin modes directed by the Schmid factor (r95).
+            A mode with the suffix 'c' (e.g. ('114', '113c', '115c')) is directed
+            by TRIANGLE CLOSURE instead of the Schmid factor: a {113}/{115} relation
+            is the composite of a kink and a {114} twin (phi = phi114 +- kappa: the
+            (20-1) twin of the kinked host relative to the other host, i.e. matrix
+            - twin of the kink, or kink - twin of the matrix). The edge A-B is
+            directed A -> B if a cluster C exists with a directed (Schmid) {114}
+            edge C -> B and a kink relation A-C (B is the twin, C its host);
+            likewise B -> A. Without such a triangle, or with triangles in both
+            directions, the edge stays undirected. Only Schmid-directed edges of
+            the {114} mode are used as the twin side of a triangle.
+            The mode of a match is read from 'mode' or, as written by
+            map_twin_relationships, 'best_mode' (before 2026-10-30 only 'mode'
+            was read: with directed_modes, ALL twin edges were undirected).
+        root_group_deg : float, optional
+            If given, the size used to rank tied sources (and the size limit of
+            root_strain) is that of the ORIENTATION GROUP of a candidate: the
+            summed pixels of all clusters within root_group_deg (disorientation)
+            of it, e.g. 5.0 = the threshold of the matrix refinement. The matrix
+            is often cut into several fragments by its twin lamellae, each
+            smaller than a contiguous kink band, so that the largest single
+            cluster may be a kink (found with ebsdlib.synthetic). Default None:
+            own pixel count of the cluster (r95). Default 3.0.
+        root_family : bool, optional
+            If True, the ranking size of a candidate (own pixels, or its
+            orientation group with root_group_deg) is increased by the pixels of
+            its direct twin children: clusters reached by a Schmid-directed edge
+            (not by triangle closure) from the candidate or from its orientation
+            group, not belonging to the group. The matrix is then ranked with the
+            {114} twins it hosts, so that a kink band larger than the bare matrix
+            does not win (found with ebsdlib.synthetic). Default True (r95: False).
+        root_strain_min_deg : float, optional
+            If given, root_strain only considers candidates disoriented from the
+            default root by at least root_strain_min_deg, e.g. 20: the strain
+            differences between the matrix and its kinks (+-beta*, +-2 beta*) are
+            small and do not identify the matrix. Default 20.0 (r95: None, all
+            candidates).
+        closure_veto_modes : iterable of str, optional
+            Twin modes, e.g. ('113', '115'), whose Schmid-factor direction is
+            VETOED by a contradicting triangle: an edge A-B of such a mode keeps
+            its Schmid direction unless a closed triangle (a cluster C with a
+            Schmid-directed {114} edge C -> B and a kink relation A-C, i.e. B is
+            the {114} twin of C and A-B = kink + {114}) says A -> B while the
+            Schmid factor says B -> A (or the reverse); the edge is then made
+            UNDIRECTED (connectivity only). Without a triangle, or with triangles
+            in both directions, the Schmid direction is kept. Removes accidental
+            {113}/{115} links (the (20-1) twin of a +-2 beta* kink is rotated by
+            phi114 + 2 beta* = 52.5 deg from the matrix, within the tolerance of a
+            {113} twin) that point INTO the matrix, while leaving the rest of the
+            Schmid-directed network unchanged (found with ebsdlib.synthetic).
+            Ignored for modes listed in directed_modes with the suffix 'c' or
+            treated as undirected. Default None (no veto).
+        closure_kink_max_deg : float, optional
+            Largest disorientation of A and C accepted as the kink of a triangle
+            (kink_results of the common-axis mode contain all pairs on d_s,
+            twins included). Default 20.0 (the upper end of the +-2 beta* window).
         root_strain : bool, optional
             Transformation-strain criterion for the root (step 4 above).
             Default False (previous behaviour).
@@ -12816,6 +12989,7 @@ class ClusteringResult:
             'root_selection' : dict with 'n_tied', 'tied' (list of dict:
                 cluster_id, reach, size, on_axis), 'reach_rel_tol',
                 'sample_axis_used' (bool), 'root_on_axis' (bool or None),
+                'ambiguity' (dict of root_ambiguity: 'ambiguous', 'rival', ...),
                 'root_strain' (None if not used, else dict: 'default_root',
                 'chosen_root', 'decided_by_strain', 'size_ratio', 'min_gain',
                 'candidates' = list of dict cluster_id, reach, size, strain),
@@ -12856,6 +13030,8 @@ class ClusteringResult:
         undirected_adj = collections.defaultdict(list)  # both directions -> [(other, O_forward, 'forward'/'backward')]
         all_nodes = set()
         incoming_twin = collections.defaultdict(int)    # cluster_id -> count of incoming directed twin edges
+        closure_edges = []                              # (A, B, O_forward, mode, sf_A, sf_B): modes '<mode>c'
+        veto_edges = []                                 # (A, B, O_forward, mode, sf_A, sf_B): closure_veto_modes
 
         for m in (matches or []):
             A, B = m['cluster_a'], m['cluster_b']
@@ -12880,14 +13056,26 @@ class ClusteringResult:
             sf_B = axial_B.dot(n1) * axial_B.dot(a1)
 
             # weak directionality -> undirected twin edge (optional)
-            if min_sf_for_direction is not None and max(abs(sf_A), abs(sf_B)) < min_sf_for_direction:
+            weak = min_sf_for_direction is not None and max(abs(sf_A), abs(sf_B)) < min_sf_for_direction
+            # twin modes not in directed_modes -> undirected (connectivity only, optional)
+            _mode = str(m.get('mode', m.get('best_mode')))       # map_twin_relationships: 'best_mode'
+            _dm = None if directed_modes is None else {str(x) for x in directed_modes}
+            mode_undir = _dm is not None and _mode not in _dm
+            if _dm is not None and _mode + 'c' in _dm:                       # direction by triangle closure (later)
+                closure_edges.append((A, B, O_forward, _mode, sf_A, sf_B))
+                continue
+            if (closure_veto_modes is not None and _mode in {str(x) for x in closure_veto_modes}
+                    and not (weak or mode_undir)):                            # Schmid direction, veto checked later
+                veto_edges.append((A, B, O_forward, _mode, sf_A, sf_B))
+                continue
+            if weak or mode_undir:
                 undirected_adj[A].append((B, O_forward, 'forward'))
                 undirected_adj[B].append((A, O_forward, 'backward'))
                 edges_info.append({
-                    'cluster_a': A, 'cluster_b': B, 'type': 'twin',
+                    'cluster_a': A, 'cluster_b': B, 'type': 'twin', 'mode': _mode,
                     'direction': 'undirected', 'sf_parent': sf_A, 'sf_child': sf_B,
                     'parent_sf_positive': None, 'tie_broken_by_size': False,
-                    'weak_sf_undirected': True,
+                    'weak_sf_undirected': bool(weak), 'mode_undirected': bool(mode_undir),
                 })
                 continue
 
@@ -12907,10 +13095,10 @@ class ClusteringResult:
             incoming_twin[child] += 1
 
             edges_info.append({
-                'cluster_a': A, 'cluster_b': B, 'type': 'twin',
+                'cluster_a': A, 'cluster_b': B, 'type': 'twin', 'mode': _mode,
                 'direction': direction, 'sf_parent': sf_parent, 'sf_child': sf_child,
                 'parent_sf_positive': bool(sf_parent > 0), 'tie_broken_by_size': tie_broken,
-                'weak_sf_undirected': False,
+                'weak_sf_undirected': False, 'mode_undirected': False,
             })
 
         for m in (kink_results or []):
@@ -12926,6 +13114,89 @@ class ClusteringResult:
                 'direction': 'undirected', 'sf_parent': None, 'sf_child': None,
                 'parent_sf_positive': None, 'tie_broken_by_size': False,
                 'weak_sf_undirected': False,
+            })
+
+        # ---- triangle closure: {113}/{115} = kink + {114} twin (directed_modes '<mode>c') ----
+        schmid_children = collections.defaultdict(set)   # host -> children by Schmid-directed edges
+        schmid_parents = collections.defaultdict(set)    # child -> hosts by Schmid-directed {114} edges (triangles)
+        for e in edges_info:
+            if e['type'] == 'twin' and e['direction'] in ('a_to_b', 'b_to_a'):
+                pa, ch = ((e['cluster_a'], e['cluster_b']) if e['direction'] == 'a_to_b'
+                          else (e['cluster_b'], e['cluster_a']))
+                schmid_children[pa].add(ch)
+                if str(e.get('mode')) == '114':
+                    schmid_parents[ch].add(pa)
+        kink_nb = collections.defaultdict(set)
+        if closure_edges or veto_edges:
+            _syc = np.array(self.data.phases[phase]['symops'])
+            _syc = _syc[np.array([np.linalg.det(x) for x in _syc]) > 0]
+            for m in (kink_results or []):          # all pairs on the common axis: keep rotations <= closure_kink_max_deg
+                a_, b_ = m['cluster_a'], m['cluster_b']
+                if a_ in self.avg_orientations and b_ in self.avg_orientations:
+                    D = np.asarray(self.avg_orientations[b_], float) @ np.asarray(self.avg_orientations[a_], float).T
+                    tr = np.einsum('sij,ji->s', _syc, D)
+                    if np.degrees(np.arccos(np.clip((tr.max() - 1) / 2, -1, 1))) <= closure_kink_max_deg:
+                        kink_nb[a_].add(b_); kink_nb[b_].add(a_)
+        for A, B, O_forward, mode, sf_A, sf_B in closure_edges:
+            hosts_B = sorted(c for c in schmid_parents[B] if c in kink_nb[A])    # A -> B: B twin of C, A-C kink
+            hosts_A = sorted(c for c in schmid_parents[A] if c in kink_nb[B])    # B -> A
+            if hosts_B and not hosts_A:
+                parent, child, O_pc, direction, via = A, B, O_forward, 'a_to_b', hosts_B
+            elif hosts_A and not hosts_B:
+                parent, child, O_pc, direction, via = B, A, O_forward.T, 'b_to_a', hosts_A
+            else:
+                parent = None
+            if parent is None:
+                undirected_adj[A].append((B, O_forward, 'forward'))
+                undirected_adj[B].append((A, O_forward, 'backward'))
+                edges_info.append({
+                    'cluster_a': A, 'cluster_b': B, 'type': 'twin', 'mode': mode,
+                    'direction': 'undirected', 'sf_parent': sf_A, 'sf_child': sf_B,
+                    'parent_sf_positive': None, 'tie_broken_by_size': False,
+                    'weak_sf_undirected': False, 'mode_undirected': True,
+                    'closure': ('conflict' if (hosts_A and hosts_B) else 'open'),
+                    'closure_hosts': {'a_to_b': hosts_B, 'b_to_a': hosts_A},
+                })
+                continue
+            directed_adj[parent].append((child, O_pc))
+            incoming_twin[child] += 1
+            edges_info.append({
+                'cluster_a': A, 'cluster_b': B, 'type': 'twin', 'mode': mode,
+                'direction': direction, 'sf_parent': (sf_A if parent == A else sf_B),
+                'sf_child': (sf_B if parent == A else sf_A),
+                'parent_sf_positive': None, 'tie_broken_by_size': False,
+                'weak_sf_undirected': False, 'mode_undirected': False,
+                'closure': 'closed', 'closure_hosts': {direction: via},
+            })
+
+        for A, B, O_forward, mode, sf_A, sf_B in veto_edges:
+            hosts_B = sorted(c for c in schmid_parents[B] if c in kink_nb[A])    # triangle says A -> B
+            hosts_A = sorted(c for c in schmid_parents[A] if c in kink_nb[B])    # triangle says B -> A
+            tie_broken = abs(sf_A - sf_B) < sf_epsilon
+            schmid_ab = (sizes.get(A, 0) >= sizes.get(B, 0)) if tie_broken else (sf_A > sf_B)
+            vetoed = (hosts_B and not hosts_A and not schmid_ab) or (hosts_A and not hosts_B and schmid_ab)
+            if vetoed:
+                undirected_adj[A].append((B, O_forward, 'forward'))
+                undirected_adj[B].append((A, O_forward, 'backward'))
+                edges_info.append({
+                    'cluster_a': A, 'cluster_b': B, 'type': 'twin', 'mode': mode,
+                    'direction': 'undirected', 'sf_parent': sf_A, 'sf_child': sf_B,
+                    'parent_sf_positive': None, 'tie_broken_by_size': tie_broken,
+                    'weak_sf_undirected': False, 'mode_undirected': False,
+                    'closure': 'vetoed', 'closure_hosts': {'a_to_b': hosts_B, 'b_to_a': hosts_A},
+                })
+                continue
+            parent, child, sf_parent, sf_child = (A, B, sf_A, sf_B) if schmid_ab else (B, A, sf_B, sf_A)
+            direction = 'a_to_b' if parent == A else 'b_to_a'
+            directed_adj[parent].append((child, O_forward if parent == A else O_forward.T))
+            incoming_twin[child] += 1
+            edges_info.append({
+                'cluster_a': A, 'cluster_b': B, 'type': 'twin', 'mode': mode,
+                'direction': direction, 'sf_parent': sf_parent, 'sf_child': sf_child,
+                'parent_sf_positive': bool(sf_parent > 0), 'tie_broken_by_size': tie_broken,
+                'weak_sf_undirected': False, 'mode_undirected': False,
+                'closure': ('confirmed' if (hosts_B or hosts_A) else 'none'),
+                'closure_hosts': {'a_to_b': hosts_B, 'b_to_a': hosts_A},
             })
 
         if not all_nodes:
@@ -12946,6 +13217,54 @@ class ClusteringResult:
                         seen.add(nbr); queue.append(nbr)
             return seen, sum(sizes.get(n, 0) for n in seen)
 
+        # ---- size used for the ranking: own pixels, or pixels of the orientation group (root_group_deg) ----
+        _group_cache = {}
+
+        def _group_members(cid):
+            if root_group_deg is None or cid not in self.avg_orientations:
+                return {cid}
+            _sy = np.array(self.data.phases[phase]['symops'])
+            _sy = _sy[np.array([np.linalg.det(x) for x in _sy]) > 0]
+            Ga = np.asarray(self.avg_orientations[cid], float)
+            mem = {cid}
+            for o in all_nodes:
+                if o in self.avg_orientations:
+                    D = np.asarray(self.avg_orientations[o], float) @ Ga.T
+                    tr = np.einsum('sij,ji->s', _sy, D)
+                    if np.degrees(np.arccos(np.clip((tr.max() - 1) / 2, -1, 1))) < root_group_deg:
+                        mem.add(o)
+            return mem
+
+        _family_cache = {}
+
+        def _rsize(cid):
+            if root_family:
+                if cid not in _family_cache:
+                    mem = _group_members(cid)
+                    kids = set().union(*[schmid_children[x] for x in mem]) - mem
+                    _family_cache[cid] = _rsize_group(cid) + sum(sizes.get(k, 0) for k in kids)
+                return _family_cache[cid]
+            return _rsize_group(cid)
+
+        def _rsize_group(cid):
+            if root_group_deg is None or cid not in self.avg_orientations:
+                return sizes.get(cid, 0)
+            if cid not in _group_cache:
+                _sy = np.array(self.data.phases[phase]['symops'])
+                _sy = _sy[np.array([np.linalg.det(x) for x in _sy]) > 0]
+                Ga = np.asarray(self.avg_orientations[cid], float)
+                tot = 0
+                for o in all_nodes:
+                    if o not in self.avg_orientations:
+                        continue
+                    D = np.asarray(self.avg_orientations[o], float) @ Ga.T
+                    tr = np.einsum('sij,ji->s', _sy, D)
+                    ang = np.degrees(np.arccos(np.clip((tr.max() - 1) / 2, -1, 1)))
+                    if ang < root_group_deg:
+                        tot += sizes.get(o, 0)
+                _group_cache[cid] = tot
+            return _group_cache[cid]
+
         def _rank_ini(candidates):
             """candidates: list of (node, reach). Returns (ranked list, tied info list)."""
             if not candidates:
@@ -12954,9 +13273,9 @@ class ClusteringResult:
             thr = (1.0 - reach_rel_tol) * w_max
             tied = [(n, w) for n, w in candidates if w >= thr]
             rest = [(n, w) for n, w in candidates if w < thr]
-            tied.sort(key=lambda nw: (not _on_axis(nw[0]), -sizes.get(nw[0], 0), -nw[1]))
+            tied.sort(key=lambda nw: (not _on_axis(nw[0]), -_rsize(nw[0]), -nw[1]))
             rest.sort(key=lambda nw: -nw[1])
-            info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)),
+            info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)), 'group_size': int(_rsize(n)),
                      'on_axis': (_on_axis(n) if sample_axis is not None else None)} for n, w in tied]
             return tied + rest, info
         root_strain_record = {}
@@ -12969,10 +13288,19 @@ class ClusteringResult:
                 return ranked
             default = ranked[0][0]
             w_max = max(w for _, w in ranked)
-            s_def = sizes.get(default, 0)
+            s_def = _rsize(default)
             cands = [(n, w) for n, w in ranked
                      if n in self.avg_orientations and _on_axis(n)
-                     and (n == default or (w >= root_size_ratio * w_max and sizes.get(n, 0) >= root_size_ratio * s_def))]
+                     and (n == default or (w >= root_size_ratio * w_max and _rsize(n) >= root_size_ratio * s_def))]
+            if root_strain_min_deg is not None and default in self.avg_orientations:     # no kinks of the root
+                _sy = np.array(self.data.phases[phase]['symops'])
+                _sy = _sy[np.array([np.linalg.det(x) for x in _sy]) > 0]
+                Gd = np.asarray(self.avg_orientations[default], float)
+
+                def _dis(n):
+                    tr = np.einsum('sij,ji->s', _sy, np.asarray(self.avg_orientations[n], float) @ Gd.T)
+                    return float(np.degrees(np.arccos(np.clip((tr.max() - 1) / 2, -1, 1))))
+                cands = [(n, w) for n, w in cands if n == default or _dis(n) >= root_strain_min_deg]
             if default not in [n for n, _ in cands] and default in self.avg_orientations:
                 cands.insert(0, ranked[0])
             score = {n: self.selected_variant_strain(self.avg_orientations[n], axial_dir, sample_axis,
@@ -12983,6 +13311,7 @@ class ClusteringResult:
             root_strain_record.update({
                 'default_root': int(default), 'chosen_root': int(best if decided else default),
                 'decided_by_strain': bool(decided), 'size_ratio': root_size_ratio, 'min_gain': root_min_gain,
+                'min_deg': root_strain_min_deg,
                 'candidates': [{'cluster_id': int(n), 'reach': int(w), 'size': int(sizes.get(n, 0)),
                                 'strain': float(score[n])} for n, w in cands]})
             if decided:
@@ -13005,9 +13334,10 @@ class ClusteringResult:
                 if on:
                     tied = on
             rest = [(n, w) for n, w in candidates if (n, w) not in tied]
-            tied.sort(key=lambda nw: (not _on_axis(nw[0]), -sizes.get(nw[0], 0), -nw[1]))
+            tied.sort(key=lambda nw: (not _on_axis(nw[0]), -_rsize(nw[0]), -nw[1]))
             rest.sort(key=lambda nw: -nw[1])
-            info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)),
+            info = [{'cluster_id': n, 'reach': int(w), 'size': int(sizes.get(n, 0)), 'group_size': int(_rsize_group(n)),
+                     'family_size': (int(_rsize(n)) if root_family else None),
                      'on_axis': (_on_axis(n) if sample_axis is not None else None)} for n, w in tied]
             ranked = tied + rest
             if root_strain and ranked:
@@ -13046,6 +13376,12 @@ class ClusteringResult:
             'root_on_axis': (_on_axis(root_cluster_id) if sample_axis is not None else None),
             'root_strain': (dict(root_strain_record) if root_strain_record else None),
         }
+        root_selection['ambiguity'] = self.root_ambiguity(root_selection, root_cluster_id, phase=phase,
+                                                          group_deg=(root_group_deg or 3.0))
+        if print_result and root_selection['ambiguity'].get('ambiguous'):
+            a_ = root_selection['ambiguity']
+            print(f"Warning: root {root_cluster_id} is AMBIGUOUS: source {a_['rival']} at {a_['rival_deg']:.1f} deg "
+                  f"has {100 * a_['rival_ratio']:.0f} % of its {a_['measure']} -- check the matrix on the IPF map.")
         if sample_axis is not None and not root_selection['root_on_axis'] and print_result:
             print(f"Warning: root cluster {root_cluster_id} does not lie on the common axis "
                   f"(no on-axis source among the tied candidates).")
@@ -13153,6 +13489,10 @@ class ClusteringResult:
                 for e in weak:
                     print(f"    {e['cluster_a']}<->{e['cluster_b']}: dir={e['direction']}, "
                           f"sf_parent={e['sf_parent']:.3f}, sf_child={e['sf_child']:.3f}")
+            n_cl = collections.Counter(e['closure'] for e in edges_info if 'closure' in e)
+            if n_cl:
+                print(f"  triangle closure / veto: "
+                      + ', '.join(f"{k} {v}" for k, v in sorted(n_cl.items())))
             n_weak_und = sum(1 for e in edges_info if e.get('weak_sf_undirected'))
             if n_weak_und:
                 print(f"  {n_weak_und} twin edge(s) treated as UNDIRECTED "
@@ -26082,3 +26422,628 @@ def csl_boundary_fractions(clustering_result, phase='A', sigmas=('3', '9', '11',
     if return_pairs:
         out['pairs'] = dict(i=I, j=J, disorientation=disor, sigma=best)
     return out
+
+
+# =============================================================================
+#  DOMAINS OF A FORMER GRAIN (method paper, Sections 3.1, 3.3, 3.8-3.10)
+# =============================================================================
+#  Domain-level quantities of the method paper (matchar) that were computed in the figure scripts / pipeline notebook,
+#  moved into ebsdlib (numpy/scipy only; identical results, checked by test_domains.py):
+#
+#    3.1  rotation about an axis    rotation_about_axis (symmetry-reduced phi about d_s and residual, per cluster),
+#                                   phi_about_axis (plain rotation matrix Q, as ebsdlib (synthetic module))
+#    3.3  domain classes            IDEAL_TWINS, twin_windows, phi_class, lcv_class
+#    3.8  classification            rotation_sense, signed_rotations, classify_domains, psi_angle
+#    3.9  martensite laminate       variant_pairs_010, pair_index, laminate_strain, pair_laminate_strain, lamella_pattern
+#    3.10 Sigma from delta-phi      dphi_fold, sigma_from_dphi, brandon_limit
+#
+#  Conventions: orientation matrices G map sample -> crystal (v_c = G v_s); the crystal-frame misorientation between A and B
+#  is G_B G_A^T; d_s is a unit vector in the sample frame. Rotations phi in degrees, signed, folded into (-90, 90] (the
+#  two-fold about the <110> d_s makes phi equivalent to phi + 180).
+#
+#  Origin (reference implementations kept in micromod/figures): rotation_about_axis = grain_substructure.rotation_about_axis;
+#  twin_windows / phi_class = fig10_grain_examples.windows / phi_class; lcv_class / classify_domains =
+#  fig13_variant_map.lcv_class / grain_classes; signed_rotations = grain_examples_panels.signed_rows; psi_angle =
+#  grain_examples_panels.psi_angle; Sigma3 from delta-phi = s3_rotation_pairs.py; laminate = pipeline notebook stage
+#  trstrain_maps (_tr_pairs, _tr_pair_index, _tr_lamellae).
+_CUBIC_SYM = ScipyRotation.create_group('O').as_matrix()                 # 24 proper cubic operations
+_FAM110_UNIT = np.array([[1, 1, 0], [1, -1, 0], [1, 0, 1], [1, 0, -1], [0, 1, 1], [0, 1, -1]], float) / np.sqrt(2)
+_FAM100 = np.eye(3)
+
+
+BETA_STAR = 6.8                                          # deg, beta_M - 90 deg
+IDEAL_TWINS = {'115': 31.586, '114': 38.942, '113': 50.479, '112': 70.529}   # deg, rotation about <110> (Table 2)
+TWIN_HALF_WIDTH = 10.0       # deg, twin window half-width = 2 x the 5 deg axis tolerance of the twin test
+DOMAIN_RES_MAX = 10.0               # deg, clusters counted as rotated about d_s
+PHI_SENSE_MIN = 20.0         # deg, |phi| above which a cluster defines the rotation sense of the grain
+SIGMA_PHI_110 = {'3': 70.529, '9': 38.942, '11': 50.479, '27a': 31.586}          # CSL as rotations about <110>
+BRANDON_K = 15.0
+
+
+# ---------------------------------------------------------------- 3.1 rotation about an axis
+def phi_about_axis(Q, d):
+    """Rotation phi* (deg) about the unit axis d that comes closest to the rotation Q, and the residual r (deg)
+    (Eqs. phistar, residual). Q (..., 3, 3), d (3,) or (..., 3). No crystal symmetry."""
+    Q = np.asarray(Q, float)
+    d = np.broadcast_to(np.asarray(d, float), Q.shape[:-1])
+    q = np.stack([Q[..., 2, 1] - Q[..., 1, 2], Q[..., 0, 2] - Q[..., 2, 0], Q[..., 1, 0] - Q[..., 0, 1]], -1)
+    dQd = np.einsum('...i,...ij,...j->...', d, Q, d)
+    phi = np.degrees(np.arctan2(np.einsum('...i,...i->...', d, q), np.trace(Q, axis1=-2, axis2=-1) - dQd))
+    R = ScipyRotation.from_rotvec(np.radians(phi.reshape(-1))[:, None] * d.reshape(-1, 3)).as_matrix().reshape(Q.shape)
+    r = np.degrees(ScipyRotation.from_matrix(np.einsum('...ij,...kj->...ik', Q, R).reshape(-1, 3, 3)).magnitude()).reshape(phi.shape)
+    return phi, r
+
+
+def rotation_about_axis(Gp, Gc, d_s):
+    """Signed sample-frame rotation phi (deg) about d_s that best takes the parent (matrix) lattice Gp onto the cluster
+    lattice Gc, over the 24 cubic equivalents, folded into (-90, 90], and the residual (deg) not explained by a
+    rotation about d_s. Gc (3, 3) -> floats; Gc (n, 3, 3) -> arrays (n,). Ties within 1e-6 deg go to the smaller |phi|."""
+    Gc = np.asarray(Gc, float); single = Gc.ndim == 2
+    Gc = Gc[None] if single else Gc
+    d = np.asarray(d_s, float); d = d / np.linalg.norm(d)
+    Rm = np.einsum('nji,sjk,kl->nsil', Gc, _CUBIC_SYM, np.asarray(Gp, float))   # R = Gc^T S Gp (sample frame), (n, 24, 3, 3)
+    q = ScipyRotation.from_matrix(Rm.reshape(-1, 3, 3)).as_quat().reshape(len(Gc), 24, 4)
+    t = 2 * np.arctan2(q[..., :3] @ d, q[..., 3])
+    Rd = ScipyRotation.from_rotvec(-t.reshape(-1)[:, None] * d).as_matrix().reshape(len(Gc), 24, 3, 3)
+    res = np.degrees(ScipyRotation.from_matrix(np.einsum('nsij,nsjk->nsik', Rm, Rd).reshape(-1, 3, 3)).magnitude()).reshape(len(Gc), 24)
+    phi = (np.degrees(t) + 90.0) % 180.0 - 90.0
+    out_p, out_r = np.empty(len(Gc)), np.empty(len(Gc))
+    for n in range(len(Gc)):                      # sequential tie-break of the reference implementation
+        best = (1e9, 0.0)
+        for s in range(24):
+            if res[n, s] < best[0] - 1e-6 or (abs(res[n, s] - best[0]) < 1e-6 and abs(phi[n, s]) < abs(best[1])):
+                best = (res[n, s], phi[n, s])
+        out_r[n], out_p[n] = best
+    return (float(out_p[0]), float(out_r[0])) if single else (out_p, out_r)
+
+
+# ---------------------------------------------------------------- 3.3 domain classes
+def twin_windows(ideal=None, half_width=TWIN_HALF_WIDTH):
+    """[(mode, lo, hi)] of |phi| for the twin modes; overlapping windows are split at the midpoint of the ideal values."""
+    ideal = IDEAL_TWINS if ideal is None else ideal
+    w = [[m, a - half_width, a + half_width, a] for m, a in sorted(ideal.items(), key=lambda t: t[1])]
+    for k in range(len(w) - 1):
+        if w[k][2] > w[k + 1][1]:
+            mid = 0.5 * (w[k][3] + w[k + 1][3]); w[k][2] = w[k + 1][1] = mid
+    return [tuple(x[:3]) for x in w]
+
+
+def phi_class(phi, windows=None):
+    """twin mode ('115', '114', '113', '112') whose |phi| window contains phi, else 'kink'."""
+    a = abs(phi)
+    for m, lo, hi in (twin_windows() if windows is None else windows):
+        if lo <= a <= hi:
+            return m
+    return 'kink'
+
+
+def lcv_class(phi, windows=None):
+    """class of a cluster rotated by phi (signed, dominant sense +) about d_s: 'K+', 'K-', '+114', ..., '-115', '112'."""
+    m = phi_class(phi, windows)
+    if m == 'kink':
+        return 'K+' if phi >= 0 else 'K-'
+    if m == '112':
+        return '112'
+    return ('+' if phi >= 0 else '-') + m
+
+
+# ---------------------------------------------------------------- 3.8 classification
+def rotation_sense(phi, px, phi_sense_min=PHI_SENSE_MIN):
+    """+1 or -1: sign of the area-weighted rotations with |phi| > phi_sense_min (the dominant sense of the grain)."""
+    phi, px = np.asarray(phi, float), np.asarray(px, float)
+    m = np.abs(phi) > phi_sense_min
+    return -1.0 if np.sum(np.sign(phi[m]) * px[m]) < 0 else 1.0
+
+
+def signed_rotations(clusters, res_max=DOMAIN_RES_MAX, phi_sense_min=PHI_SENSE_MIN):
+    """clusters: dicts with 'cls' ('matrix', 'twin', 'kink', 'noOR'), 'phi', 'res', 'px'. Returns the non-matrix
+    clusters rotated about d_s (res <= res_max) with phi multiplied by the dominant sense of the grain."""
+    rot = [r for r in clusters if r['res'] <= res_max and r['cls'] != 'matrix']
+    sgn = rotation_sense([r['phi'] for r in rot], [r['px'] for r in rot], phi_sense_min)
+    return [dict(r, phi=sgn * r['phi']) for r in rot]
+
+
+def classify_domains(clusters, res_max=DOMAIN_RES_MAX, phi_sense_min=PHI_SENSE_MIN, windows=None):
+    """{cid: class} for all clusters of a grain: 'M' (matrix), lcv_class of the signed phi for clusters on d_s,
+    'off' (twin about another <110>), 'noOR' (other, off d_s)."""
+    signed = {r['cid']: r['phi'] for r in signed_rotations(clusters, res_max, phi_sense_min)}
+    out = {}
+    for r in clusters:
+        if r['cls'] == 'matrix':
+            out[r['cid']] = 'M'
+        elif r['cid'] in signed:
+            out[r['cid']] = lcv_class(signed[r['cid']], windows)
+        else:
+            out[r['cid']] = 'off' if r['cls'] == 'twin' else 'noOR'
+    return out
+
+
+def psi_angle(Gp, d_s, L):
+    """angle psi (deg) of the load axis L projected onto the plane normal to d_s, measured from the <110> in that plane
+    (0 deg) towards the <100> in that plane (90 deg); Gp sample -> crystal."""
+    dc = Gp @ d_s; dc = dc / np.linalg.norm(dc)
+    Lc = Gp @ L; Lc = Lc / np.linalg.norm(Lc)
+    p110 = _FAM110_UNIT[np.argmin(np.abs(_FAM110_UNIT @ dc))]
+    p100 = _FAM100[np.argmin(np.abs(_FAM100 @ dc))]
+    Lp = Lc - (Lc @ dc) * dc
+    return float(np.degrees(np.arctan2(abs(Lp @ p100), abs(Lp @ p110))))
+
+
+# ---------------------------------------------------------------- 3.10 Sigma from delta-phi
+def brandon_limit(sigma, k=BRANDON_K):
+    return k / np.sqrt(float(''.join(ch for ch in str(sigma) if ch.isdigit())))
+
+
+def dphi_fold(phi_a, phi_b):
+    """|phi_a - phi_b| folded into [0, 90] (supplement above 90 deg): the misorientation of two domains on d_s."""
+    d = np.abs(np.asarray(phi_a, float) - np.asarray(phi_b, float))
+    return np.where(d > 90, 180 - d, d)
+
+
+def sigma_from_dphi(phi_a, phi_b, sigmas=('3', '9', '11', '27a'), k=BRANDON_K):
+    """CSL of the boundary between two domains on d_s from their rotations about d_s: the Sigma (of `sigmas`) whose
+    rotation about <110> lies within its Brandon limit of the folded |dphi| (nearest if several), else ''. Arrays in,
+    array of labels out."""
+    d = np.atleast_1d(dphi_fold(phi_a, phi_b))
+    out = np.full(d.shape, '', dtype=object); best = np.full(d.shape, np.inf)
+    for s in sigmas:
+        dev = np.abs(d - SIGMA_PHI_110[s]); ok = (dev <= brandon_limit(s, k)) & (dev < best)
+        out[ok] = s; best[ok] = dev[ok]
+    return out if np.ndim(phi_a) or np.ndim(phi_b) else out[0]
+
+
+# ---------------------------------------------------------------- 3.9 martensite laminate
+def variant_pairs_010(CId, tol=1e-2):
+    """(6, 2) indices: for each <110>_B2 of _FAM110_UNIT, the two lattice correspondence variants whose [010]_M is parallel
+    to it (criterion of check_martensite_twin_correspondence). CId (3, 3, 12): B2 -> B19' correspondence matrices."""
+    out = []
+    for h in _FAM110_UNIT * np.sqrt(2):
+        idx = []
+        for i in range(CId.shape[2]):
+            v = CId[:, :, i].dot(h); nv = np.linalg.norm(v)
+            if nv > 1e-8 and np.linalg.norm(v - v[1] * np.array([0., 1., 0.])) / nv < tol:
+                idx.append(i)
+        assert len(idx) == 2, f'<110> {h}: {len(idx)} variants with [010]_M parallel'
+        out.append(idx)
+    return np.array(out)
+
+
+def pair_index(M, d_s):
+    """index into _FAM110_UNIT of the <110> closest to d_s for orientation(s) M (sample -> crystal)."""
+    dc = np.einsum('...ij,j->...i', M, d_s)
+    return np.argmax(np.abs(dc @ _FAM110_UNIT.T), axis=-1)
+
+
+def laminate_strain(e_l, e_s, frac_large=2 / 3):
+    """metric (rotation-free) average of a laminate of frac_large of the variant with strain e_l and 1 - frac_large of
+    the variant with strain e_s: sqrt(f (1 + e_l)^2 + (1 - f) (1 + e_s)^2) - 1."""
+    return np.sqrt(frac_large * (1 + np.asarray(e_l)) ** 2 + (1 - frac_large) * (1 + np.asarray(e_s)) ** 2) - 1
+
+
+def pair_laminate_strain(E, M, d_s, CId, frac_large=2 / 3):
+    """per pixel: laminate strain of the d_s variant pair (larger strain thick) and the maximum over all variants.
+    E (12, n) axial transformation strain of every variant (EBSDData.getTrStrain), M (n, 3, 3) orientations."""
+    pairs = variant_pairs_010(CId); k = pair_index(M, d_s); n = np.arange(E.shape[1])
+    ea, eb = E[pairs[k, 0], n], E[pairs[k, 1], n]
+    return laminate_strain(np.maximum(ea, eb), np.minimum(ea, eb), frac_large), E.max(axis=0)
+
+
+def lamella_pattern(Mp, v_l, v_s, e12, CId, roi, X, Y, period_um=1.0, frac_large=2 / 3,
+                    map2sample=np.array([[0, 1], [1, 0]])):
+    """alternating (001)_M lamellae of the pair (v_l thick, v_s thin) over the ROI, for the matrix orientation Mp:
+    per-pixel strain (NaN outside the ROI), the (001)_M normal in the map frame projected onto the section (length =
+    sine of its angle to the section normal), the trace angle (deg) and the apparent period (um)."""
+    n_c = CId[:, :, v_l].T.dot([0., 0., 1.]); n_c = n_c / np.linalg.norm(n_c)
+    n_c2 = CId[:, :, v_s].T.dot([0., 0., 1.]); assert abs(abs(n_c2 @ n_c) / np.linalg.norm(n_c2) - 1) < 1e-6
+    n_s = Mp.T.dot(n_c)
+    u = np.linalg.inv(map2sample) @ n_s[:2]
+    sin_ = float(np.linalg.norm(u))
+    xc, yc = X[roi].mean(), Y[roi].mean()
+    per = period_um / max(sin_, 1e-3)
+    s_ = ((X - xc) * u[0] + (Y - yc) * u[1]) / max(sin_, 1e-3)
+    thick = np.mod(s_ / per, 1.0) < frac_large
+    full = np.full(len(X), np.nan); full[roi] = np.where(thick[roi], e12[v_l], e12[v_s])
+    trace = float(np.degrees(np.arctan2(u[0], -u[1])) % 180.0) if sin_ > 1e-6 else np.nan
+    return full, u, trace, per
+
+
+# =============================================================================
+#  FORMER AUSTENITE GRAINS (method paper, Section 3.11)
+# =============================================================================
+#  Automatic detection of the former austenite grains of a deformed B2 map (ebsdlib).
+#
+#  All domains inherited from one former grain are rotated relative to each other about ONE common <110> axis d_s (the
+#  common [010] of the B19' variants); neighbouring clusters of different former grains share such an axis only by
+#  chance. The grains are therefore grown cluster by cluster, accepting a neighbour only if the pair is a rotation about
+#  the grain's d_s. Port of Steps 1b-7b, the automatic clean-up of Step 11 and the export of Step 12 of
+#  micromod/figs/prior_grain_detection_test.ipynb (the interactive corrections of Step 11 are not part of it):
+#
+#    1. fill        every unclustered B2 pixel goes to the neighbouring cluster closest in orientation (< fill_tol)
+#    2. grow        seeds from the largest cluster down; d_s of a seed = its <110> about which most of its boundary length
+#                   with unassigned neighbours is a rotation (res <= res_tol); breadth-first growth: a neighbour joins if
+#                   its misorientation is <= low_mis or the pair is a rotation about the <110> closest to d_s
+#                   (res <= res_tol, that <110> within axis_tol of d_s)
+#    3. second pass contacts across gaps up to gap_um: (a) same-axis merge (axes within axis_tol, contact >= min_contact_um),
+#                   (b) off-axis twins ({112}-{115} twin about another <110>, contact >= min_twin_um, size ratio
+#                   <= max_twin_ratio) attached to their host, (c) proximity merge of same-axis grains closer than prox_um
+#    4. clean-up    clusters with >= surround_share of their contact length with another grain go to that grain
+#                   (the largest cluster of each grain never moves)
+#    5. export      pixel -> grain map; with fill_map every pixel goes to the nearest exported grain (grains >= min_roi_um2,
+#                   >= min_roi_edge_um2 at the map edge), each grain keeps its largest connected part; outline polygons
+#                   (format of auto_rois.h5 / the ROIs of the pipeline)
+#
+#  Conventions: orientation matrices map sample -> crystal (v_c = G v_s), as ClusteringResult.avg_orientations and
+#  EBSDData.orientations. All lengths in um, areas in um^2 (converted with the step of the scan).
+#
+#  Usage:
+#      from ebsdlib import detect_former_grains
+#      res = detect_former_grains(XY, O, is_b2, labels, G, step)        # arrays, see the docstring
+#      res = clustering_result.detect_former_grains(phase='A')          # the same from a whole-scan ClusteringResult
+#      res['polygons'], res['grain_of_cluster'], res['axis'], res['table']
+import collections as _collections
+from scipy.spatial import cKDTree as _cKDTree
+
+
+FORMER_GRAINS_TWIN_MODES = {'112': 70.53, '113': 50.48, '114': 38.94, '115': 31.59}
+
+FORMER_GRAINS_DEFAULTS = dict(
+    fill=True, fill_tol=10.0,                            # deg, Step 1b
+    res_tol=5.0, axis_tol=10.0, low_mis=5.0,             # deg, Step 6 (growth)
+    gap_um=0.3, min_contact_um=0.5,                      # Step 7b (a)
+    twin_res_tol=2.0, twin_ang_tol=2.0, min_twin_um=3.0, max_twin_ratio=0.2,   # Step 7b (b)
+    prox_um=1.0, prox_axis_tol=5.0, min_part_um2=0.43,   # Step 7b (c)
+    surround_share=0.7, clean_max_iter=10,               # Step 11 automatic clean-up
+    min_roi_um2=5.0, min_roi_edge_um2=1.0, fill_map=True, close_um=0.2,   # Step 12 export
+)
+
+
+def _fg_misori(Ga, Gb):
+    """disorientation angle (deg) of (n,3,3) orientation pairs (cubic)."""
+    tr = np.einsum('sij,nji->ns', _CUBIC_SYM, np.einsum('nij,nkj->nik', Ga, Gb))
+    return np.degrees(np.arccos(np.clip((tr.max(1) - 1) / 2, -1, 1)))
+
+
+def _fg_axis_res(Ga, Gb):
+    """six <110> of a (sample frame), residual (deg) of the misorientation a-b from a rotation about each, the
+    rotation about each (folded to 0-90 deg) and the misorientation angle."""
+    R = np.einsum('ji,sjk,kl->sil', Gb, _CUBIC_SYM, Ga)          # Gb^T S Ga for all 24 S
+    q = ScipyRotation.from_matrix(R).as_quat()                       # x, y, z, w
+    axes = (Ga.T @ _FAM110_UNIT.T).T
+    vd, w = q[:, :3] @ axes.T, q[:, 3:4]
+    res = np.degrees(2 * np.arccos(np.clip(np.sqrt(w ** 2 + vd ** 2), -1, 1)))
+    i = np.argmin(res, axis=0)
+    phi = np.degrees(2 * np.arctan2(vd[i, range(6)], w[i, 0]))
+    return axes, res[i, range(6)], np.abs((phi + 90) % 180 - 90), np.degrees(2 * np.arccos(np.clip(np.abs(w).max(), 0, 1)))
+
+
+def _fg_pair_counts(XY, labels, dist, grid=None):
+    """{(a, b): number of pixel pairs closer than dist} for clusters a < b. grid = (step, DY): the same count on the
+    regular (square or hexagonal) scan grid by shifting a label image over the fixed neighbour offsets, memory O(N)
+    (query_pairs within 0.3 um of a 2.7 M-pixel map at 0.05 um would hold ~2e8 pairs)."""
+    K = int(labels.max()) + 1
+    if grid is None:
+        pp = _cKDTree(XY).query_pairs(dist, output_type='ndarray')
+        l1, l2 = labels[pp[:, 0]], labels[pp[:, 1]]
+    else:
+        step, DY = grid
+        ci = np.rint((XY[:, 0] - XY[:, 0].min()) / (step / 2)).astype(int)
+        ri = np.rint((XY[:, 1] - XY[:, 1].min()) / DY).astype(int)
+        img = np.zeros((ri.max() + 1, ci.max() + 1), np.int64); img[ri, ci] = labels   # 0: no pixel / unclustered
+        n_r, n_c = int(dist / DY) + 1, int(dist / (step / 2)) + 1
+        L1, L2 = [], []
+        for dr in range(0, n_r + 1):
+            for dc in range(-n_c, n_c + 1):
+                if (dr == 0 and dc <= 0) or np.hypot(dr * DY, dc * step / 2) >= dist:
+                    continue
+                a = img[:img.shape[0] - dr, max(0, -dc):img.shape[1] - max(0, dc)]
+                b = img[dr:, max(0, dc):img.shape[1] - max(0, -dc) if dc < 0 else img.shape[1]]
+                b = b[:, :a.shape[1]]
+                m = (a > 0) & (b > 0) & (a != b)
+                L1.append(a[m]); L2.append(b[m])
+        l1, l2 = np.concatenate(L1), np.concatenate(L2)
+    m = (l1 > 0) & (l2 > 0) & (l1 != l2)
+    kk, nn = np.unique(np.minimum(l1[m], l2[m]).astype(np.int64) * K + np.maximum(l1[m], l2[m]), return_counts=True)
+    return {(int(k // K), int(k % K)): int(n) for k, n in zip(kk, nn)}
+
+
+def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verbose=True, **params):
+    """
+    Parameters
+    ----------
+    XY : (N, 2) map coordinates (um); O : (N, 3, 3) pixel orientations (sample -> crystal)
+    is_b2 : (N,) bool, pixels indexed as B2
+    labels : (N,) int, whole-scan clusters (0 = not clustered), e.g. ClusteringResult.labels
+    G : {cluster: (3, 3)} cluster mean orientations (sample -> crystal); step : scan step (um)
+    cluster_phase : {cluster: phase id}, optional (pairs of different phases are not linked)
+    params : overrides of FORMER_GRAINS_DEFAULTS
+    Returns
+    -------
+    dict: polygons (list of (n, 2) arrays, ROI i = grain i + 1 of the pipeline), table (list of dicts: roi, grain,
+    area_um2, at_edge), grain_of_cluster {cluster: grain} (after the clean-up), axis {grain: d_s (sample frame) or
+    None}, labels (after filling), pixel_grain (N,) of the exported tiling (-1 outside), log (counts per step), params
+    """
+    p = dict(FORMER_GRAINS_DEFAULTS); p.update(params)
+    unknown = set(params) - set(FORMER_GRAINS_DEFAULTS)
+    if unknown:
+        raise TypeError(f'unknown parameter(s): {sorted(unknown)}')
+    XY = np.asarray(XY, float); labels = np.asarray(labels).astype(int).copy(); is_b2 = np.asarray(is_b2, bool)
+    G = {int(c): np.asarray(m, float) for c, m in G.items()}
+    phase = {c: 1 for c in G} if cluster_phase is None else {int(c): int(v) for c, v in cluster_phase.items()}
+    step = round(float(step), 6)                         # a step derived from coordinates (0.0999999) would shift the px limits
+    DY = float(np.min(np.diff(np.unique(np.round(XY[:, 1], 6)))))
+    PX_UM2 = step * DY
+    um2px = lambda a: max(1, int(np.ceil(a / PX_UM2)))
+    um2n = lambda l: max(1, int(np.ceil(l / step)))
+    log = {}
+    say = print if verbose else (lambda *a, **k: None)
+
+    # ---- 1. fill the unclustered B2 pixels
+    labels_pipe = labels.copy()
+    if p['fill']:
+        nbp = _cKDTree(XY).query_pairs(1.01 * step, output_type='ndarray'); nbp = np.r_[nbp, nbp[:, ::-1]]
+        for _ in range(500):
+            m = (labels[nbp[:, 0]] > 0) & (labels[nbp[:, 1]] == 0) & is_b2[nbp[:, 1]]
+            src, dst = nbp[m, 0], nbp[m, 1]
+            if len(dst) == 0:
+                break
+            d = _fg_misori(O[dst], np.array([G[int(c)] for c in labels[src]]))
+            ok = d < p['fill_tol']
+            if not ok.any():
+                break
+            o = np.lexsort((d[ok], dst[ok]))
+            dd, ss = dst[ok][o], src[ok][o]
+            first = np.r_[True, dd[1:] != dd[:-1]]
+            labels[dd[first]] = labels[ss[first]]
+    size = {c: int(n) for c, n in zip(*np.unique(labels[labels > 0], return_counts=True))}
+    log['unclustered_b2_pct'] = (100 * ((labels_pipe == 0) & is_b2).mean(), 100 * ((labels == 0) & is_b2).mean())
+    say('unclustered B2 pixels: %.1f %% (clustering) -> %.1f %% (filled)' % log['unclustered_b2_pct'])
+
+    # ---- 2. cluster network and growth
+    contact = _fg_pair_counts(XY, labels, 1.01 * step, grid=(step, DY))
+    nb = _collections.defaultdict(list)
+    for (a, b), n in contact.items():
+        if phase.get(a) != phase.get(b):
+            continue
+        mis = _fg_axis_res(G[a], G[b])[3]
+        nb[a].append((b, n, mis)); nb[b].append((a, n, mis))
+    cache = {}
+
+    def ares(a, b):
+        if (a, b) not in cache:
+            cache[(a, b)] = _fg_axis_res(G[a], G[b])
+        return cache[(a, b)]
+
+    comp, axis, gid = {}, {}, 0
+    for s in sorted(G, key=lambda c: -size.get(c, 0)):
+        if s in comp:
+            continue
+        gid += 1
+        votes, ax_s = np.zeros(6), (G[s].T @ _FAM110_UNIT.T).T
+        for b, n, mis in nb[s]:
+            if b not in comp:
+                votes += n * (ares(s, b)[1] <= p['res_tol'])
+        ds = ax_s[int(np.argmax(votes))] if votes.max() > 0 else None
+        comp[s], axis[gid], queue = gid, ds, [s]
+        while queue:
+            c = queue.pop()
+            for b, n, mis in nb[c]:
+                if b in comp:
+                    continue
+                ok = mis <= p['low_mis']
+                if not ok and ds is not None:
+                    axes, res, _, _ = ares(c, b); j = int(np.argmax(np.abs(axes @ ds)))
+                    ok = res[j] <= p['res_tol'] and np.degrees(np.arccos(min(1.0, abs(axes[j] @ ds)))) <= p['axis_tol']
+                if ok:
+                    comp[b] = gid; queue.append(b)
+    log['grains_growth'] = len(set(comp.values()))
+
+    # ---- 3. second pass
+    gap_px = max(1, int(round(p['gap_um'] / step)))
+    gap_pairs = _fg_pair_counts(XY, labels, (gap_px + 0.05) * step, grid=(step, DY))
+
+    def grain_px(comp):
+        gpx = _collections.Counter()
+        for c in comp:
+            gpx[comp[c]] += size.get(c, 0)
+        return gpx
+
+    def merge_same_axis(comp, axis):
+        comp, axis, gpx = dict(comp), dict(axis), grain_px(comp)
+        min_contact = um2n(p['min_contact_um'])
+        while True:
+            score = _collections.Counter()
+            for (a, b), n in gap_pairs.items():
+                ga, gb = comp.get(a), comp.get(b)
+                if ga is None or gb is None or ga == gb or phase.get(a) != phase.get(b):
+                    continue
+                da, db = axis.get(ga), axis.get(gb)
+                if da is None or db is None or np.degrees(np.arccos(min(1, abs(da @ db)))) > p['axis_tol']:
+                    continue
+                axes, res, _, mis = ares(a, b); j = int(np.argmax(np.abs(axes @ da)))
+                if mis <= p['low_mis'] or res[j] <= p['res_tol']:
+                    score[(min(ga, gb), max(ga, gb))] += n
+            best = [(g, s) for g, s in score.most_common(1) if s >= min_contact]
+            if not best:
+                return comp, axis
+            (g1, g2), _ = best[0]
+            keep, drop = (g1, g2) if gpx[g1] >= gpx[g2] else (g2, g1)
+            for c in [c for c in comp if comp[c] == drop]:
+                comp[c] = keep
+            gpx[keep] += gpx.pop(drop, 0); axis.pop(drop, None)
+
+    def attach_offaxis(comp, axis):
+        comp, axis, gpx = dict(comp), dict(axis), grain_px(comp)
+        min_len = um2n(p['min_twin_um'])
+        while True:
+            tw = _collections.Counter()
+            for (a, b), n in gap_pairs.items():
+                ga, gb = comp.get(a), comp.get(b)
+                if ga is None or gb is None or ga == gb or phase.get(a) != phase.get(b):
+                    continue
+                axes, res, phi, mis = ares(a, b); j = int(np.argmin(res))
+                if res[j] <= p['twin_res_tol'] and min(abs(phi[j] - v) for v in FORMER_GRAINS_TWIN_MODES.values()) <= p['twin_ang_tol']:
+                    tw[(ga, gb)] += n; tw[(gb, ga)] += n
+            cand = [(sm, bg) for (sm, bg), s in sorted(tw.items(), key=lambda t: -t[1])
+                    if s >= min_len and gpx[sm] <= p['max_twin_ratio'] * gpx[bg]]
+            if not cand:
+                return comp, axis
+            sm, bg = cand[0]
+            for c in [c for c in comp if comp[c] == sm]:
+                comp[c] = bg
+            gpx[bg] += gpx.pop(sm, 0); axis.pop(sm, None)
+
+    def proximity_merge(comp, axis):
+        comp, axis, gpx = dict(comp), dict(axis), grain_px(comp)
+        min_px, prox = um2px(p['min_part_um2']), p['prox_um']
+        pts = _collections.defaultdict(list)
+        for i in np.where(labels > 0)[0][::3]:
+            pts[comp[int(labels[i])]].append(i)
+        trees = {g: _cKDTree(XY[v]) for g, v in pts.items() if gpx[g] >= min_px}
+        rep = {}
+        for c, g in comp.items():
+            if g not in rep or size.get(c, 0) > size.get(rep[g], 0):
+                rep[g] = c
+        order_g = sorted(trees, key=lambda g: -gpx[g]); alive = set(order_g)
+        for i, g1 in enumerate(order_g):
+            if g1 not in alive or axis.get(g1) is None:
+                continue
+            for g2 in order_g[i + 1:]:
+                if g2 not in alive or axis.get(g2) is None:
+                    continue
+                if np.degrees(np.arccos(min(1, abs(axis[g1] @ axis[g2])))) > p['prox_axis_tol']:
+                    continue
+                if trees[g1].query(XY[pts[g2]], k=1, distance_upper_bound=prox)[0].min() > prox:
+                    continue
+                axes, res, _, _ = ares(rep[g1], rep[g2]); j = int(np.argmax(np.abs(axes @ axis[g1])))
+                if res[j] <= p['res_tol']:
+                    for c in [c for c in comp if comp[c] == g2]:
+                        comp[c] = g1
+                    alive.discard(g2)
+        return comp, axis
+
+    comp, axis = merge_same_axis(comp, axis); log['grains_same_axis'] = len(set(comp.values()))
+    comp, axis = attach_offaxis(comp, axis); log['grains_offaxis_twins'] = len(set(comp.values()))
+    comp, axis = proximity_merge(comp, axis); log['grains_proximity'] = len(set(comp.values()))
+
+    # ---- 4. automatic clean-up (Step 11, clean_geometry on the proposals)
+    csize = np.bincount(np.clip(labels, 0, None))
+    contacts = _collections.defaultdict(_collections.Counter)
+    for (a, b), n in gap_pairs.items():
+        contacts[a][b] += n; contacts[b][a] += n
+    moves = 0
+    for _ in range(p['clean_max_iter']):
+        gsz = _collections.Counter()
+        for c, g in comp.items():
+            gsz[g] += csize[c] if c < len(csize) else 0
+        main = {}
+        for c, g in comp.items():
+            if g not in main or csize[c] > csize[main[g]]:
+                main[g] = c
+        changed = 0
+        for c, g in list(comp.items()):
+            if main.get(g) == c or not contacts[c]:
+                continue
+            per = _collections.Counter()
+            for b, n in contacts[c].items():
+                gb = comp.get(b)
+                if gb is not None:
+                    per[gb] += n
+            tot = sum(per.values())
+            if tot == 0:
+                continue
+            gb, nb_ = per.most_common(1)[0]
+            if gb != g and nb_ >= p['surround_share'] * tot and gsz[gb] > csize[c]:
+                comp[c] = gb; changed += 1
+        moves += changed
+        if not changed:
+            break
+    log['clean_moves'] = moves
+    say(f"grains: growth {log['grains_growth']}, same-axis merge {log['grains_same_axis']}, off-axis twins "
+        f"{log['grains_offaxis_twins']}, proximity merge {log['grains_proximity']}; clean-up: {moves} clusters moved")
+
+    # ---- 5. export: tiling and outlines
+    polys, table, gpix = _fg_export(XY, labels, comp, step, DY, p)
+    log['rois'] = len(polys)
+    say(f"{len(polys)} ROIs ({sum(r['at_edge'] for r in table)} at the map edge)")
+    return dict(polygons=polys, table=table, grain_of_cluster=comp, axis={g: axis.get(g) for g in set(comp.values())},
+                labels=labels, pixel_grain=gpix, log=log, params=p)
+
+
+def _fg_export(XY, labels, comp, step, DY, p):
+    from scipy import ndimage
+    import contourpy
+    lut = np.full(int(labels.max()) + 1, -1)
+    for c, g in comp.items():
+        lut[c] = g
+    gpix_all = lut[labels]; gpix_all[labels <= 0] = -1
+    gpix_clu = gpix_all.copy()
+    col_i = np.rint(XY[:, 0] / (step / 2)).astype(int); row_i = np.rint(XY[:, 1] / DY).astype(int)
+    nr, nc = row_i.max() + 1, col_i.max() + 2
+    close_px = max(1, int(round(p['close_um'] / DY)))
+    px_area = step * DY
+    on_edge = ((XY[:, 0] <= XY[:, 0].min() + 1.01 * step) | (XY[:, 0] >= XY[:, 0].max() - 1.01 * step) |
+               (XY[:, 1] <= XY[:, 1].min() + 1.01 * DY) | (XY[:, 1] >= XY[:, 1].max() - 1.01 * DY))
+    edge_grains = set(np.unique(gpix_clu[on_edge & (gpix_clu >= 0)]).tolist())
+
+    def exported(g, n_px):
+        return n_px * px_area >= (p['min_roi_edge_um2'] if g in edge_grains else p['min_roi_um2'])
+
+    def raster(m):
+        img = np.zeros((nr, nc), bool); img[row_i[m], col_i[m]] = True; img[row_i[m], col_i[m] + 1] = True
+        return img
+
+    def outline(m):
+        img = raster(m)
+        if not p['fill_map']:
+            img = ndimage.binary_closing(img, iterations=close_px, border_value=0)
+        img = ndimage.binary_fill_holes(img)
+        lab_, n_ = ndimage.label(img)
+        if n_ == 0:
+            return None
+        img = lab_ == (np.argmax(np.bincount(lab_.ravel())[1:]) + 1)
+        lines = contourpy.contour_generator(z=np.pad(img, 1).astype(float)).lines(0.5)
+        ln = max(lines, key=len)
+        return np.c_[(ln[:, 0] - 1) * step / 2, (ln[:, 1] - 1) * DY]
+
+    if p['fill_map']:
+        cnt = _collections.Counter(gpix_all[gpix_all >= 0].tolist())
+        keep = {g for g, n in cnt.items() if exported(g, n)}
+        lab_f = np.where(np.isin(gpix_all, list(keep)), gpix_all, -1)
+        for _ in range(5):
+            src = np.where(lab_f >= 0)[0]; miss = np.where(lab_f < 0)[0]
+            if len(miss):
+                lab_f[miss] = lab_f[src[_cKDTree(XY[src]).query(XY[miss])[1]]]
+            changed = 0
+            for g in keep:
+                m = lab_f == g
+                lb, n_ = ndimage.label(raster(m))
+                if n_ > 1:
+                    big = np.argmax(np.bincount(lb.ravel())[1:]) + 1
+                    off = m & (lb[row_i, col_i] != big)
+                    if off.any():
+                        lab_f[off] = -1; changed += int(off.sum())
+            if not changed:
+                break
+        gpix_all = lab_f
+    polys, table = [], []
+    for g, n in _collections.Counter(gpix_all[gpix_all >= 0].tolist()).most_common():
+        if not exported(g, n):
+            continue
+        poly = outline(gpix_all == g)
+        if poly is None or len(poly) < 4:
+            continue
+        table.append(dict(roi=len(polys), grain=int(g), area_um2=n * px_area, at_edge=g in edge_grains))
+        polys.append(poly)
+    return polys, table, gpix_all
+
+
+def write_rois(path, polygons, mode='w'):
+    """write the polygons as ROIs ('rois' group, roi_<i>, attribute n_rois), the format of auto_rois.h5 read by the
+    pipeline ('<state>_auto' conditions) and by load_rois."""
+    import h5py
+    with h5py.File(path, mode) as f:
+        if 'rois' in f:
+            del f['rois']
+        g_ = f.create_group('rois'); g_.attrs['n_rois'] = len(polygons)
+        for i, q in enumerate(polygons):
+            g_.create_dataset(f'roi_{i}', data=np.asarray(q, float), compression='gzip', compression_opts=4)
