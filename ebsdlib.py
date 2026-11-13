@@ -26356,6 +26356,37 @@ def _equivalents(R, symops):
     return E[np.sort(idx)]
 
 
+def csl_sigma_pairs(Ma, Mb, symops, sigmas=('3', '9', '11', '27a', '27b'), brandon_k=15.0, chunk=500000):
+    """
+    Disorientation (deg) and CSL type of orientation pairs (a, b), criterion of csl_boundary_fractions: Brandon,
+    dev <= brandon_k * Sigma^(-1/2), dev = smallest rotation between the misorientation Mb Ma^T (crystal frame) and the
+    symmetry-equivalent CSL rotations; if several Sigmas match, the smallest dev / tolerance wins; '' = no CSL.
+    Ma, Mb (n, 3, 3) sample -> crystal; symops (k, 3, 3) proper rotations of the phase.
+    """
+    Ma = np.asarray(Ma, float); Mb = np.asarray(Mb, float); sym = np.asarray(symops, float)
+    E_all = {}
+    for s in sigmas:
+        ang, ax = CSL_CUBIC[s]
+        E = _equivalents(_axis_angle_matrix(ax, ang), sym)
+        E_all[s] = (E.reshape(len(E), 9).T, brandon_k / np.sqrt(float(''.join(ch for ch in s if ch.isdigit()))))
+    symT = sym.reshape(len(sym), 9).T
+    npairs = len(Ma)
+    disor = np.empty(npairs)
+    best = np.full(npairs, '', dtype=object)
+    for a in range(0, npairs, chunk):
+        b = min(a + chunk, npairs)
+        Df = np.einsum('pij,pkj->pik', Mb[a:b], Ma[a:b]).reshape(b - a, 9)   # crystal-frame misorientation
+        disor[a:b] = np.degrees(np.arccos(np.clip(((Df @ symT).max(axis=1) - 1) / 2, -1, 1)))
+        bb = np.full(b - a, '', dtype=object); bs = np.full(b - a, np.inf)
+        for s, (ET, tol) in E_all.items():
+            dev = np.degrees(np.arccos(np.clip(((Df @ ET).max(axis=1) - 1) / 2, -1, 1)))
+            score = dev / tol
+            hit = (score <= 1.0) & (score < bs)
+            bb[hit] = s; bs[hit] = score[hit]
+        best[a:b] = bb
+    return disor, best
+
+
 def csl_boundary_fractions(clustering_result, phase='A', sigmas=('3', '9', '11', '27a', '27b'),
                            brandon_k=15.0, min_mis_deg=(2.5, 15.0), roi=0,
                            distance_convention='OIM', return_pairs=False):
@@ -26390,28 +26421,13 @@ def csl_boundary_fractions(clustering_result, phase='A', sigmas=('3', '9', '11',
         keep = i < jj                                          # every physical pair once
         I.append(i[keep]); J.append(jj[keep])
     I = np.concatenate(I); J = np.concatenate(J)
-    # processed in chunks of pairs (large maps: millions of pairs)
-    E_all = {}
-    for s in sigmas:
-        ang, ax = CSL_CUBIC[s]
-        E = _equivalents(_axis_angle_matrix(ax, ang), sym)
-        E_all[s] = (E.reshape(len(E), 9).T, brandon_k / np.sqrt(float(''.join(ch for ch in s if ch.isdigit()))))
-    symT = sym.reshape(len(sym), 9).T
     npairs = len(I)
     disor = np.empty(npairs)
     best = np.full(npairs, '', dtype=object)
-    chunk = 500000
+    chunk = 500000                                         # chunks of pairs (large maps: millions of pairs)
     for a in range(0, npairs, chunk):
         b = min(a + chunk, npairs)
-        Df = np.einsum('pij,pkj->pik', M[J[a:b]], M[I[a:b]]).reshape(b - a, 9)   # crystal-frame misorientation
-        disor[a:b] = np.degrees(np.arccos(np.clip(((Df @ symT).max(axis=1) - 1) / 2, -1, 1)))
-        bb = np.full(b - a, '', dtype=object); bs = np.full(b - a, np.inf)
-        for s, (ET, tol) in E_all.items():
-            dev = np.degrees(np.arccos(np.clip(((Df @ ET).max(axis=1) - 1) / 2, -1, 1)))
-            score = dev / tol
-            hit = (score <= 1.0) & (score < bs)
-            bb[hit] = s; bs[hit] = score[hit]
-        best[a:b] = bb
+        disor[a:b], best[a:b] = csl_sigma_pairs(M[I[a:b]], M[J[a:b]], sym, sigmas=sigmas, brandon_k=brandon_k)
     out = dict(n_pairs=int(npairs), brandon_k=brandon_k, sigmas=list(sigmas))
     for t in np.atleast_1d(min_mis_deg):
         b = disor > t
@@ -26528,6 +26544,32 @@ def lcv_class(phi, windows=None):
 
 
 # ---------------------------------------------------------------- 3.8 classification
+# classes whose formation needs variant V2 (lattice correspondence scheme, Fig. 3 of the method paper; sense + = sense of
+# the (20-1)_M twin of V1): K+ = V1' (from V2 by (100)) or V2'' (from V1'), +{113} = (20-1) twin of V1', -{114} = of V2,
+# -{115} = of V2''. Not: K- (V2' from V1, or V1''), +{114} (V1), +{115} (V1''), -{113} (V2').
+V2_CLASSES = ('K+', '+113', '-114', '-115')
+V2_MIN_PHI = 5.0             # deg, smallest |phi| of a domain counted (smaller rotations: matrix substructure)
+
+
+def v2_evidence_share(clusters, v1_sense, res_max=DOMAIN_RES_MAX, min_phi=V2_MIN_PHI, windows=None, classes=V2_CLASSES):
+    """
+    Share of the cluster area of a grain in domains whose formation needs V2 (V2_CLASSES), i.e. the evidence that V2 was
+    present in the martensite before the deformation. clusters: dicts with 'cls', 'phi', 'res', 'px' (all clusters of
+    the grain, for the total area); v1_sense: +1 or -1, sign of the rotation about d_s of the (20-1)_M twin of V1 (the
+    class signs are taken relative to it). Domains counted: not matrix, res <= res_max, |phi| > min_phi.
+    Returns (share, {class: area share}) - shares in 0-1.
+    """
+    tot = float(sum(r['px'] for r in clusters)) or 1.0
+    per = {}
+    for r in clusters:
+        if r['cls'] == 'matrix' or r.get('res', 99) > res_max or abs(r.get('phi', 0)) <= min_phi:
+            continue
+        k = lcv_class(v1_sense * r['phi'], windows)
+        if k in classes:
+            per[k] = per.get(k, 0.0) + r['px'] / tot
+    return sum(per.values()), per
+
+
 def rotation_sense(phi, px, phi_sense_min=PHI_SENSE_MIN):
     """+1 or -1: sign of the area-weighted rotations with |phi| > phi_sense_min (the dominant sense of the grain)."""
     phi, px = np.asarray(phi, float), np.asarray(px, float)
@@ -26746,7 +26788,7 @@ def _fg_pair_counts(XY, labels, dist, grid=None):
     return {(int(k // K), int(k % K)): int(n) for k, n in zip(kk, nn)}
 
 
-def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verbose=True, **params):
+def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verbose=True, return_stages=False, **params):
     """
     Parameters
     ----------
@@ -26755,6 +26797,9 @@ def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verb
     labels : (N,) int, whole-scan clusters (0 = not clustered), e.g. ClusteringResult.labels
     G : {cluster: (3, 3)} cluster mean orientations (sample -> crystal); step : scan step (um)
     cluster_phase : {cluster: phase id}, optional (pairs of different phases are not linked)
+    return_stages : bool, optional; if True, the result also holds 'stages': {step: {cluster: grain}} after 'growth',
+        'same_axis' (merge across gaps), 'offaxis' (off-axis twins attached), 'proximity' and 'cleanup' (= grain_of_cluster),
+        e.g. to plot the steps of the detection (Fig. 8 of the method paper). Default False.
     params : overrides of FORMER_GRAINS_DEFAULTS
     Returns
     -------
@@ -26836,6 +26881,7 @@ def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verb
                 if ok:
                     comp[b] = gid; queue.append(b)
     log['grains_growth'] = len(set(comp.values()))
+    stages = {'growth': dict(comp)}
 
     # ---- 3. second pass
     gap_px = max(1, int(round(p['gap_um'] / step)))
@@ -26922,8 +26968,11 @@ def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verb
         return comp, axis
 
     comp, axis = merge_same_axis(comp, axis); log['grains_same_axis'] = len(set(comp.values()))
+    stages['same_axis'] = dict(comp)
     comp, axis = attach_offaxis(comp, axis); log['grains_offaxis_twins'] = len(set(comp.values()))
+    stages['offaxis'] = dict(comp)
     comp, axis = proximity_merge(comp, axis); log['grains_proximity'] = len(set(comp.values()))
+    stages['proximity'] = dict(comp)
 
     # ---- 4. automatic clean-up (Step 11, clean_geometry on the proposals)
     csize = np.bincount(np.clip(labels, 0, None))
@@ -26965,8 +27014,12 @@ def detect_former_grains(XY, O, is_b2, labels, G, step, cluster_phase=None, verb
     polys, table, gpix = _fg_export(XY, labels, comp, step, DY, p)
     log['rois'] = len(polys)
     say(f"{len(polys)} ROIs ({sum(r['at_edge'] for r in table)} at the map edge)")
-    return dict(polygons=polys, table=table, grain_of_cluster=comp, axis={g: axis.get(g) for g in set(comp.values())},
-                labels=labels, pixel_grain=gpix, log=log, params=p)
+    out = dict(polygons=polys, table=table, grain_of_cluster=comp, axis={g: axis.get(g) for g in set(comp.values())},
+               labels=labels, pixel_grain=gpix, log=log, params=p)
+    if return_stages:
+        stages['cleanup'] = dict(comp)
+        out['stages'] = stages
+    return out
 
 
 def _fg_export(XY, labels, comp, step, DY, p):
